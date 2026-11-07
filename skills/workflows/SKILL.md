@@ -93,10 +93,16 @@ an agent can get stuck, give it a queue such as `q_blocked` and say when to use 
    Running agents keep the definition they started with.
 
 `set_agent_count` changes one group's count immediately (it records a new
-version). `command_workflow` takes `run`, `pause` or `archive`, optionally for a
-single `agent_group`. Omit it or pass `null` for the whole workflow; an empty
-string is also accepted. Other optional tool fields accept `null` for their default.
-`pause` interrupts running agents but keeps their work; `run` resumes safe checkpoints.
+version). `command_workflow` takes `run`, `pause`, `archive` or `unarchive`;
+`run` and `pause` can target a single `agent_group`. Omit it or pass `null` for
+the whole workflow; an empty string is also accepted. Other optional tool fields
+accept `null` for their default. `pause` interrupts running agents but keeps their
+work; `run` resumes safe checkpoints.
+
+Archive one-off or test workflows so they stop cluttering the user's `/workflow`
+list; `unarchive` brings one back, paused. `rename_workflow(workflow_name, new_name)`
+renames a workflow that is paused or archived and has no unfinished agents (agent
+sessions are tied to the name). Give workflows you may reuse a descriptive name.
 
 A checkpoint with missing tool results is not automatically resumed: that tool may
 already have changed something. The worker needs attention and keeps its item.
@@ -123,12 +129,16 @@ queues with `notify_on_new`. Read `wf:<name>` for everything else.
 ## The user's commands
 
 ```text
-/workflow                                   list workflows
-/workflow miner[:grp_reverse | :q_catalog]  show a workflow, group or queue
-/workflow run miner[:grp_reverse]           take control in this session and run it
-/workflow pause miner[:grp_reverse]         pause it; no work is lost
-/workflow set miner:grp_reverse count 8     change a simple setting (see below)
-/workflow set miner:grp_reverse             list the settings there, with current values
+/workflow list                                  list workflows (archived ones are hidden)
+/workflow list archived                          list archived workflows
+/workflow view miner[:grp_reverse | :q_catalog]  show a workflow, group or queue
+/workflow run miner[:grp_reverse]                take control in this session and run it
+/workflow pause miner[:grp_reverse]              pause it; no work is lost
+/workflow rename miner reverse_catalog           rename it (paused, no unfinished agents)
+/workflow archive miner                          stop it and hide it from the list
+/workflow unarchive miner                        bring it back, paused
+/workflow set miner:grp_reverse count 8          change a simple setting (see below)
+/workflow set miner:grp_reverse                  list the settings there, with current values
 ```
 
 Settings the user can change directly: `model` and `folder` on the workflow;

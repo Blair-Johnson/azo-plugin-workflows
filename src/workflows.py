@@ -36,7 +36,7 @@ VERSION_ID = re.compile(r"def_(?P<number>\d+)")
 ACTIVE_STATES = {"starting", "running", "paused"}
 AGENT_STATES = ACTIVE_STATES | {"finished", "stopped", "attention", "restarted"}
 
-RESERVED_NAMES = {"index", "list", "run", "pause", "set"}
+RESERVED_NAMES = {"index", "list", "view", "run", "pause", "set", "rename", "archive", "unarchive", "archived"}
 
 TOP_KEYS = {"version", "folder", "model", "queues", "agents"}
 QUEUE_KEYS = {"notify_on_new"}
@@ -502,6 +502,17 @@ class WorkflowStore:
             return []
         return [json.loads(line) for line in lines if line.strip()]
 
+    def last_activity(self) -> str:
+        """Timestamp of the newest logged event, or the creation time."""
+        try:
+            lines = (self.dir / "log.jsonl").read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        for line in reversed(lines):
+            if line.strip():
+                return json.loads(line).get("at", "")
+        return self.control().get("created_at", "")
+
     # -- control ------------------------------------------------------------
 
     def control(self) -> dict:
@@ -562,6 +573,37 @@ class WorkflowStore:
             })
             self.log("created", by=by)
         return definition
+
+    def rename(self, new_name: str, *, by: str) -> "WorkflowStore":
+        """Move this workflow to a new name. Returns the store under the new name.
+
+        Worker sessions are durably bound to ``wf:<name>:<agent>``, so renaming is
+        refused while the workflow runs or still has agents that could resume.
+        """
+        target = WorkflowStore(new_name, self.root)
+        if target.name == self.name:
+            raise WorkflowError(f"{self.name} already has that name")
+        with self.lock():
+            self.require()
+            if target.exists():
+                raise WorkflowError(f'a workflow named "{target.name}" already exists; choose another name')
+            if self.control().get("state") == "running":
+                raise WorkflowError(f"{self.name} is running; pause it first with /workflow pause {self.name}")
+            unfinished = [a["id"] for a in self.agents() if a["state"] in ACTIVE_STATES | {"attention"}]
+            if unfinished:
+                raise WorkflowError(
+                    f"{', '.join(unfinished)} {'is' if len(unfinished) == 1 else 'are'} not finished, and their "
+                    f"sessions are tied to the name {self.name}. Run {self.name} until they finish, or use "
+                    "restart_agent on them, then rename it")
+            if target.dir.exists():
+                # A bare directory (at most a stale lock file) is left by lookups of missing names.
+                if {p.name for p in target.dir.iterdir()} - {".lock"}:
+                    raise WorkflowError(f"{target.dir} already exists and is not a workflow; move it aside first")
+                (target.dir / ".lock").unlink(missing_ok=True)
+                target.dir.rmdir()
+            self.log("renamed", old_name=self.name, new_name=target.name, by=by)
+            os.rename(self.dir, target.dir)
+        return target
 
     def update(self, text: str, *, reason: str, by: str, preview_only: bool = False) -> dict:
         """Replace the definition. Returns diff, effects and the new version."""
@@ -955,46 +997,53 @@ def prepare_setting(store: "WorkflowStore", kind: str, target: str | None, setti
 
 
 def render_settings(store: "WorkflowStore", kind: str, target: str | None, default_model: str = "") -> str:
+    """Markdown for the /workflow set NAME[:TARGET] popup."""
     definition = store.definition()
     control = store.control()
     label = target_label(store, kind, target)
-    lines = [f"Settings for {label}. Change one with /workflow set {label} SETTING VALUE.", ""]
+    if kind == "queue" and target == TRASH:
+        return f"{TRASH} has no settings.\n"
+    lines = [f"Change one with `/workflow set {label} SETTING VALUE`.", ""]
+    rows = []
     if kind == "workflow":
         model, source = effective_model(definition, None, default_model)
-        lines.append(f"  model   {model} ({'set on the workflow' if definition['model'] else source}); "
-                     "use default for the Agent Zoo default")
         folder = definition["folder"] or control.get("default_folder") or "the session's folder"
-        lines.append(f"  folder  {folder} ({'set on the workflow' if definition['folder'] else 'where it was created'})"
-                     "; use default to go back")
-        lines += ["", "Agent groups (set each with " + f"/workflow set {store.name}:grp_NAME ...): "
-                  + ", ".join(definition["agents"])]
+        rows.append(["`model`", f"`{model}`",
+                     ("set on the workflow" if definition["model"] else source) + "; `default` for the Agent Zoo default"])
+        rows.append(["`folder`", f"`{folder}`",
+                     ("set on the workflow" if definition["folder"] else "where it was created") + "; `default` to go back"])
+        lines += md_table(["Setting", "Value", "Notes"], rows)
+        if definition["agents"]:
+            lines += ["", "Agent groups have their own count, model, schedule and folder: "
+                      + ", ".join(f"`/workflow set {store.name}:{g}`" for g in definition["agents"])]
         if definition["queues"]:
-            lines.append("Queues (notify on or off): " + ", ".join(definition["queues"]))
+            queue = next(iter(definition["queues"]))
+            lines += ["", f"Queues can tell the controlling agent about new items, e.g. "
+                          f"`/workflow set {store.name}:{queue} notify on`."]
     elif kind == "group":
         check_group_id(target, definition["agents"])
         group = definition["agents"][target]
         model, source = effective_model(definition, group, default_model)
         folder = group["folder"] or definition["folder"] or control.get("default_folder") or "the session's folder"
-        lines.append(f"  count   {group['count']} (agents at once, 0 to 64)")
-        lines.append(f"  model   {model} ({source}); use default for the workflow's model")
+        rows.append(["`count`", str(group["count"]), "agents at once, 0 to 64"])
+        rows.append(["`model`", f"`{model}`", f"{source}; `default` for the workflow's model"])
         if group["takes_from"]:
-            lines.append(f"  every   not available: this group takes items from {group['takes_from']}")
+            rows.append(["`every`", "—", f"not available: this group takes items from `{group['takes_from']}`"])
         else:
-            lines.append(f"  every   {group['every_text'] or 'off'} (start a new agent at most this often, or off)")
-        lines.append(f"  folder  {folder} ({'set on this group' if group['folder'] else 'from the workflow'})"
-                     "; use default for the workflow's folder")
-        stale = [f"{a['id']} ({a.get('model')})" for a in store.agents(target)
+            rows.append(["`every`", group["every_text"] or "off", "start a new agent at most this often, or `off`"])
+        rows.append(["`folder`", f"`{folder}`",
+                     ("set on this group" if group["folder"] else "from the workflow") + "; `default` for the workflow's"])
+        lines += md_table(["Setting", "Value", "Notes"], rows)
+        stale = [f"`{a['id']}` ({a.get('model')})" for a in store.agents(target)
                  if a["state"] in ACTIVE_STATES and a.get("model") and a.get("model") != model]
         if stale:
-            lines += ["", "Running on a different model (started before a change): " + ", ".join(stale)]
+            lines += ["", "Still on a different model (started before a change): " + ", ".join(stale)]
     else:
-        if target == TRASH:
-            return f"{TRASH} has no settings.\n"
         check_queue_id(target, definition["queues"])
         notify = definition["queues"][target]["notify_on_new"]
-        lines.append(f"  notify  {'on' if notify else 'off'} (tell the controlling agent about new items)")
+        lines += md_table(["Setting", "Value", "Notes"],
+                          [["`notify`", "on" if notify else "off", "tell the controlling agent about new items"]])
     return "\n".join(lines) + "\n"
-
 
 def item_block(store: WorkflowStore, meta: dict) -> str:
     """The text {{item}} expands to in instructions."""
@@ -1044,22 +1093,394 @@ def queue_counts(items: list[dict]) -> dict[str, dict[str, int]]:
 
 def render_index(root: Path | None = None, viewer_session_id: str = "") -> str:
     names = list_workflow_names(root)
-    lines = ["Workflows. Open one with wf:<name>, e.g. wf:" + (names[0] if names else "miner") + "."]
+    stores = [WorkflowStore(name, root) for name in names]
+    archived = [s.name for s in stores if s.control().get("state") == "archived"]
+    current = [s for s in stores if s.name not in archived]
+    example = current[0].name if current else (names[0] if names else "miner")
+    lines = [f"Workflows. Open one with wf:<name>, e.g. wf:{example}."]
     if not names:
         lines.append("There are no workflows yet. Create one with create_workflow.")
-    for name in names:
-        store = WorkflowStore(name, root)
+    for store in current:
         control = store.control()
         active = sum(a["state"] in ACTIVE_STATES for a in store.agents())
         waiting = sum(i["state"] == "waiting" for i in store.items() if i["queue"] != TRASH)
         attention = sum(a["state"] == "attention" for a in store.agents())
-        line = (f"{name}: {state_label(control)}, controlled by {controller_label(control, viewer_session_id)}, "
-                f"def_{store.version}; {active} agents active, {waiting} items waiting")
+        line = (f"{store.name}: {state_label(control)}, controlled by "
+                f"{controller_label(control, viewer_session_id)}, def_{store.version}; "
+                f"{active} agents active, {waiting} items waiting")
         if attention:
             line += f", {attention} agents need attention"
         lines.append(line)
+    if archived:
+        lines.append(f"Archived (hidden from the user's /workflow list; command_workflow unarchive restores one): "
+                     + ", ".join(archived))
     return "\n".join(lines) + "\n"
 
+
+# -- the /workflow list popup (markdown) -----------------------------------------
+
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def relative_time(at: str, now: datetime | None = None) -> str:
+    try:
+        then = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return "unknown"
+    minutes = max(0, int(((now or datetime.now(timezone.utc)) - then).total_seconds())) // 60
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    if minutes < 24 * 60:
+        return f"{minutes // 60}h ago"
+    if minutes < 30 * 24 * 60:
+        return f"{minutes // (24 * 60)}d ago"
+    return then.astimezone().strftime("%Y-%m-%d")
+
+
+def pipeline_text(definition: dict) -> str:
+    """The agent groups in the order work flows through them, e.g. `find` → `fix` ×3, `test` → `merge`.
+
+    A group comes one stage after the earliest group that sends to the queue it takes from.
+    Groups nothing feeds (standing groups, or ones taking user-added items) start the pipeline.
+    """
+    groups = definition["agents"]
+    if not groups:
+        return "no agent groups"
+    feeders = {name: {other for other, s in groups.items()
+                      if other != name and settings["takes_from"] in s["sends_to"]}
+               for name, settings in groups.items()}
+    stage = {name: 0 for name in groups if not feeders[name]}
+    if not stage:
+        stage[next(iter(groups))] = 0
+    frontier = list(stage)
+    while frontier:
+        nxt = []
+        for name in groups:
+            if name not in stage and feeders[name] & set(frontier):
+                stage[name] = stage[frontier[0]] + 1
+                nxt.append(name)
+        frontier = nxt
+    last = max(stage.values())
+    for name in groups:  # Fed only by a cycle that never reaches a starting group.
+        stage.setdefault(name, last + 1)
+
+    def label(name):
+        settings = groups[name]
+        text = f"`{name.removeprefix('grp_')}`"
+        if settings["count"] != 1:
+            text += f" ×{settings['count']}"
+        if settings["every"]:
+            text += f" every {settings['every_text']}"
+        return text
+
+    stages = [[label(n) for n in groups if stage[n] == i] for i in range(max(stage.values()) + 1)]
+    return " → ".join(", ".join(names) for names in stages if names)
+
+
+def workflow_row(store: WorkflowStore, viewer_session_id: str = "") -> dict:
+    """One workflow's line in the /workflow list. Never raises: a damaged workflow still gets a row."""
+    def count(states, records):
+        return sum(r["state"] in states for r in records)
+
+    try:
+        control = store.control()
+        agents = store.agents()
+        items = [i for i in store.items() if i["queue"] != TRASH]
+        state = control.get("state", "paused")
+        running, paused = count({"starting", "running"}, agents), count({"paused"}, agents)
+        attention, taken = count({"attention"}, agents), count({"taken"}, items)
+        work = []
+        if running:
+            work.append(f"{plural(running, 'agent')} running")
+        if paused:
+            work.append(f"{paused} paused mid-task")
+        if taken and not running:
+            work.append(f"{taken} in progress")
+        work += [f"{count({'waiting'}, items)} waiting", f"{count({'done'}, items)} done"]
+        if attention:
+            work.append(f"⚠ {attention} {'needs' if attention == 1 else 'need'} attention")
+        name = f"`{store.name}`"
+        if state == "running":
+            name += f" ({controller_label(control, viewer_session_id)})"
+        pipeline = pipeline_text(store.definition())
+        last = store.last_activity()
+    except Exception as exc:  # Show the problem in the list instead of hiding the workflow.
+        state, name, pipeline, work, last = "paused", f"`{store.name}`", f"could not read it: {exc}", [], ""
+    return {"state": state, "last": last,
+            "cells": [name, pipeline, " · ".join(work), relative_time(last) if last else "unknown"]}
+
+
+def workflow_table(rows: list[dict]) -> list[str]:
+    ordered = sorted(rows, key=lambda r: r["last"], reverse=True)
+    return md_table(["Workflow", "Pipeline", "Work", "Last active"], [r["cells"] for r in ordered])
+
+
+LIST_COMMANDS = """\
+**Commands**
+
+- `/workflow view NAME` — groups, queues and recent activity
+- `/workflow run NAME` · `/workflow pause NAME`
+- `/workflow rename NAME NEW_NAME`
+- `/workflow archive NAME` — hide a one-off or test workflow (undo with `unarchive`)
+- `/workflow set NAME` — model, folder and other settings"""
+
+
+def render_list(root: Path | None = None, viewer_session_id: str = "", *,
+                archived: bool = False) -> tuple[str, str]:
+    """Subtitle and markdown body for /workflow list (or /workflow list archived)."""
+    rows = [workflow_row(WorkflowStore(name, root), viewer_session_id) for name in list_workflow_names(root)]
+    by_state = {state: [r for r in rows if r["state"] == state] for state in ("running", "paused", "archived")}
+    by_state["paused"] += [r for r in rows if r["state"] not in by_state]
+    subtitle = " · ".join(f"{len(by_state[s])} {s}" for s in ("running", "paused", "archived") if by_state[s])
+    hidden = len(by_state["archived"])
+
+    if archived:
+        if not hidden:
+            return subtitle, "No archived workflows.\n\nHide a one-off workflow with `/workflow archive NAME`.\n"
+        lines = ["## Archived", "", *workflow_table(by_state["archived"]), "",
+                 "Restore one with `/workflow unarchive NAME`; it comes back paused. Renaming an archived "
+                 "workflow (`/workflow rename NAME NEW_NAME`) frees its name for reuse."]
+        return subtitle, "\n".join(lines) + "\n"
+
+    lines = []
+    if not rows:
+        lines += ["No workflows yet.", "",
+                  "Ask the agent to set one up, for example *“make a workflow that fixes each failing test "
+                  "with its own agent”*. Nothing runs until you start it with `/workflow run NAME`."]
+    elif not by_state["running"] and not by_state["paused"]:
+        lines.append("No active workflows.")
+    for state, heading in (("running", "Running"), ("paused", "Paused")):
+        if by_state[state]:
+            lines += [f"## {heading}", "", *workflow_table(by_state[state]), ""]
+    if hidden:
+        lines += ["", f"{plural(hidden, 'archived workflow')} hidden — `/workflow list archived` shows "
+                      f"{'it' if hidden == 1 else 'them'}."]
+    if rows:
+        lines += ["", LIST_COMMANDS]
+    return subtitle, "\n".join(lines).strip("\n") + "\n"
+
+
+# -- the /workflow view popups (markdown) ----------------------------------------
+
+UUID_LIKE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+RECENT_EVENTS = 8
+FINISHED_SHOWN = 30
+DONE_SHOWN = 50
+
+
+def shorten_ids(text) -> str:
+    """Session IDs are long; their first 8 characters identify them in a popup."""
+    return UUID_LIKE.sub(lambda m: m[0][:8], str(text))
+
+
+def md_cell(value) -> str:
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
+def md_table(headers: list[str], rows: list[list]) -> list[str]:
+    return ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers),
+            *("| " + " | ".join(md_cell(c) for c in row) + " |" for row in rows)]
+
+
+def md_quote(text: str) -> list[str]:
+    """Quote free text so it wraps (code blocks truncate long lines), keeping each line its own paragraph."""
+    lines = []
+    for line in text.strip("\n").splitlines():
+        if lines:
+            lines.append(">")
+        if line.strip():
+            lines.append("> " + line)
+    return lines
+
+
+def clip(text: str, limit: int = 160) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def state_count(records: list[dict], *states: str) -> int:
+    return sum(r["state"] in states for r in records)
+
+
+def event_text(record: dict) -> str:
+    details = [f"{key.replace('_', ' ')} {clip(', '.join(map(str, value)) if isinstance(value, list) else value, 100)}"
+               for key, value in record.items() if key not in {"at", "event"} and value not in (None, "", [])]
+    return shorten_ids(" · ".join([f"**{record['event'].replace('_', ' ')}**", *details]))
+
+
+def agents_summary(count: int, mine: list[dict], group_paused: bool) -> str:
+    parts = [f"{state_count(mine, 'starting', 'running')} of {count} running"]
+    if paused := state_count(mine, "paused"):
+        parts.append(f"{paused} paused mid-task")
+    if attention := state_count(mine, "attention"):
+        parts.append(f"⚠ {attention} {'needs' if attention == 1 else 'need'} attention")
+    parts.append(f"{state_count(mine, 'finished')} finished")
+    if group_paused:
+        parts.append("group paused")
+    return " · ".join(parts)
+
+
+def view_footer(store: WorkflowStore, definition: dict, state: str) -> list[str]:
+    name = store.name
+    group = next(iter(definition["agents"]), "grp_GROUP")
+    queue = next(iter(definition["queues"]), "q_QUEUE")
+    lines = ["**Commands**", "",
+             f"- `/workflow view {name}:{group}` · `/workflow view {name}:{queue}` — one group or queue"]
+    if state == "archived":
+        lines.append(f"- `/workflow unarchive {name}` — bring it back, paused")
+    else:
+        lines.append(f"- `/workflow {'pause' if state == 'running' else 'run'} {name}`")
+        lines.append(f"- `/workflow set {name}` · `/workflow set {name}:{group}` — model, folder, count and schedule")
+    lines.append(f"- `/workflow rename {name} NEW_NAME`")
+    lines.append("- `/workflow list` — all workflows")
+    return lines
+
+
+def render_overview_md(store: WorkflowStore, viewer_session_id: str = "",
+                       default_model: str = "") -> tuple[str, str]:
+    """Subtitle and markdown body for /workflow view NAME."""
+    control = store.control()
+    definition = store.definition()
+    agents = store.agents()
+    counts = queue_counts(store.items())
+    state = control.get("state", "paused")
+    subtitle = [state_label(control), f"def_{store.version}"]
+    if (control.get("controller") or {}).get("session_id"):
+        subtitle.append(f"controlled by {controller_label(control, viewer_session_id)}")
+    model, _ = effective_model(definition, None, default_model)
+    folder = definition["folder"] or control.get("default_folder") or "the session's folder"
+    lines = [f"**Model** `{model}` · **Folder** `{folder}`", "", "## Agent groups", ""]
+
+    groups = definition["agents"]
+    models = {g: effective_model(definition, s, default_model)[0] for g, s in groups.items()}
+    show_models = any(m != model for m in models.values())
+    paused_groups = set(control.get("paused_groups") or []) if state == "running" else set()
+    rows = []
+    for group, settings in groups.items():
+        source = f"`{settings['takes_from']}`" if settings["takes_from"] else "standing"
+        if settings["every"]:
+            source += f", every {settings['every_text']}"
+        row = [f"`{group}`", source, ", ".join(f"`{q}`" for q in settings["sends_to"]) or "—",
+               agents_summary(settings["count"], [a for a in agents if a["group"] == group], group in paused_groups)]
+        rows.append(row + ([f"`{models[group]}`"] if show_models else []))
+    headers = ["Group", "Takes from", "Sends to", "Agents"] + (["Model"] if show_models else [])
+    lines += md_table(headers, rows) if rows else ["No agent groups."]
+
+    lines += ["", "## Queues", ""]
+    queue_names = list(definition["queues"]) + [q for q in counts if q not in definition["queues"]]
+    rows = []
+    for queue in queue_names:
+        bucket = counts.get(queue, {"waiting": 0, "taken": 0, "done": 0})
+        if queue in definition["queues"]:
+            note = "notifies the controlling agent" if definition["queues"][queue]["notify_on_new"] else ""
+        else:
+            note = "discarded items" if queue == TRASH else "not in the current definition"
+        rows.append([f"`{queue}`", bucket["waiting"], bucket["taken"], bucket["done"], note])
+    lines += md_table(["Queue", "Waiting", "In progress", "Done", "Notes"], rows) if rows else ["No queues."]
+
+    attention = [a for a in agents if a["state"] == "attention"]
+    if attention:
+        lines += ["", "## ⚠ Needs attention", ""]
+        lines += [f"- `{a['id']}` — {clip(a.get('problem') or 'unknown problem', 300)}" for a in attention]
+    recent = store.log_records()[-RECENT_EVENTS:]
+    if recent:
+        lines += ["", "## Recent activity", ""]
+        lines += md_table(["When", "Event"], [[relative_time(r["at"]), event_text(r)] for r in reversed(recent)])
+    lines += ["", *view_footer(store, definition, state)]
+    return " · ".join(subtitle), "\n".join(lines) + "\n"
+
+
+def render_group_md(store: WorkflowStore, group: str, default_model: str = "") -> tuple[str, str]:
+    """Subtitle and markdown body for /workflow view NAME:GROUP."""
+    definition = store.definition()
+    control = store.control()
+    agents = store.agents(group)
+    settings = definition["agents"].get(group)
+    if settings is None and not agents:
+        check_group_id(group, definition["agents"])
+    subtitle = describe_group(settings) if settings else "not in the current definition"
+    if group in (control.get("paused_groups") or []) and control.get("state") == "running":
+        subtitle += " · paused"
+    lines = []
+    if settings:
+        model, source = effective_model(definition, settings, default_model)
+        folder = (settings["folder"] or definition["folder"] or control.get("default_folder")
+                  or "the session's folder")
+        lines += [f"**Model** `{model}` ({source}) · **Folder** `{folder}`", ""]
+
+    lines += ["## Agents", ""]
+    current = [a for state in ("starting", "running", "paused", "attention", "stopped")
+               for a in agents if a["state"] == state]
+    ended = [a for a in agents if a["state"] in {"finished", "restarted"}]
+    shown = current + list(reversed(ended[-FINISHED_SHOWN:]))
+    rows = [[f"`{a['id']}`", ("⚠ " if a["state"] == "attention" else "") + a["state"],
+             f"`{a['item']}`" if a.get("item") else "—", f"def_{a['version']}",
+             clip(a.get("summary") or a.get("problem") or "")] for a in shown]
+    lines += md_table(["Agent", "State", "Item", "Version", "Summary"], rows) if rows else ["No agents yet."]
+    if len(ended) > FINISHED_SHOWN:
+        lines += ["", f"{len(ended) - FINISHED_SHOWN} older finished agents are not shown."]
+    if settings:
+        lines += ["", "## Instructions", "", *md_quote(settings["instructions"])]
+
+    lines += ["", "**Commands**", ""]
+    if settings:
+        lines.append(f"- `/workflow set {store.name}:{group}` — count, model, schedule and folder")
+        if settings["takes_from"]:
+            lines.append(f"- `/workflow view {store.name}:{settings['takes_from']}` — the items it takes")
+    lines.append(f"- `/workflow view {store.name}` — the whole workflow")
+    return subtitle, "\n".join(lines) + "\n"
+
+
+def render_queue_md(store: WorkflowStore, queue: str) -> tuple[str, str]:
+    """Subtitle and markdown body for /workflow view NAME:QUEUE."""
+    definition = store.definition()
+    items = store.items(queue)
+    known = queue in definition["queues"] or queue == TRASH
+    if not known and not items:
+        check_queue_id(queue, definition["queues"])
+    counts = queue_counts(items).get(queue, {"waiting": 0, "taken": 0, "done": 0})
+    subtitle = f"{counts['waiting']} waiting · {counts['taken']} in progress · {counts['done']} done"
+    takers = [f"`{g}`" for g, s in definition["agents"].items() if s["takes_from"] == queue]
+    senders = [f"`{g}`" for g, s in definition["agents"].items() if queue in s["sends_to"]]
+    if queue == TRASH:
+        lines = ["Discarded items. Move one back to a queue to restore it."]
+    else:
+        lines = [f"**Filled by** {', '.join(senders) or 'nobody; items come from you or the agent'} · "
+                 f"**Taken by** {', '.join(takers) or 'no group, so items stay here'}"]
+    if not known:
+        lines += ["", "⚠ This queue is not in the current definition; its items wait until it is added back."]
+
+    def added_by(item):
+        return shorten_ids(item["created_by"]) + (f" (from `{item['from_item']}`)" if item.get("from_item") else "")
+
+    def notes(item):
+        return plural(len(item["notes"]), "note") if item.get("notes") else ""
+
+    waiting = [i for i in items if i["state"] == "waiting"]
+    taken = [i for i in items if i["state"] == "taken"]
+    done = [i for i in items if i["state"] == "done"]
+    if taken:
+        lines += ["", "## In progress", ""]
+        lines += md_table(["Item", "Title", "Agent"],
+                          [[f"`{i['id']}`", i["title"], f"`{i['taken_by']}`"] for i in taken])
+    if waiting:
+        lines += ["", "## Waiting (oldest first)", ""]
+        lines += md_table(["Item", "Title", "Added by", "Notes"],
+                          [[f"`{i['id']}`", i["title"], added_by(i), notes(i)] for i in waiting])
+    if done:
+        heading = "## Done (newest first" + (f", last {DONE_SHOWN} of {len(done)})" if len(done) > DONE_SHOWN else ")")
+        lines += ["", heading, ""]
+        lines += md_table(["Item", "Title", "Added by", "Notes"],
+                          [[f"`{i['id']}`", i["title"], added_by(i), notes(i)] for i in reversed(done[-DONE_SHOWN:])])
+    if not items:
+        lines += ["", "No items yet."]
+    lines += ["", "**Commands**", "", f"- `/workflow view {store.name}` — the whole workflow"]
+    if takers:
+        lines.append(f"- `/workflow view {store.name}:{takers[0].strip('`')}` — the group that takes these items")
+    return subtitle, "\n".join(lines) + "\n"
 
 def render_overview(store: WorkflowStore, viewer_session_id: str = "", default_model: str = "") -> str:
     control = store.control()
@@ -1738,7 +2159,7 @@ class WorkflowController:
             store.require()
             control = store.control()
             if control.get("state") == "archived":
-                raise WorkflowError(f"{store.name} is archived and cannot run again")
+                raise WorkflowError(f"{store.name} is archived; restore it with /workflow unarchive {store.name} first")
             previous = control.get("controller")
             epoch = int(control.get("epoch", 0)) + 1
             store.update_control(controller=dict(self.me, project=self.launch["project"]), epoch=epoch)
@@ -1878,6 +2299,8 @@ class WorkflowController:
     def archive(self, name: str) -> str:
         with self.lock:
             store = WorkflowStore(name).require()
+            if store.control().get("state") == "archived":
+                raise WorkflowError(f"{name} is already archived")
             self.pause(name)
             ended = []
             for agent in store.agents():
@@ -1897,10 +2320,30 @@ class WorkflowController:
                 store.update_control(state="archived", controller=None)
                 store.log("archived", by=self.me_label())
             self.managed.pop(name, None)
-            text = f"Archived {name}. Its definition, items and history stay readable at wf:{name}."
+            text = (f"Archived {name}. It no longer appears in /workflow; its definition, items and history "
+                    f"stay readable at wf:{name}, and /workflow unarchive {name} brings it back.")
             if ended:
                 text += f" Shut down {', '.join(ended)}."
             return text
+
+    def unarchive(self, name: str) -> str:
+        with self.lock:
+            store = WorkflowStore(name).require()
+            with store.lock():
+                if store.control().get("state") != "archived":
+                    raise WorkflowError(f"{name} is not archived")
+                store.update_control(state="paused", paused_groups=[])
+                store.log("unarchived", by=self.me_label())
+            return f"Restored {name}. It is paused; start it with /workflow run {name}."
+
+    def rename(self, name: str, new_name: str) -> str:
+        with self.lock:
+            renamed = WorkflowStore(name).require().rename(new_name, by=self.me_label())
+            if name in self.managed:
+                self.managed[renamed.name] = self.managed.pop(name)
+            self.errors.pop(name, None)
+            return (f"Renamed {name} to {renamed.name}. Open it with /workflow view {renamed.name}; "
+                    f"agents read it at wf:{renamed.name}.")
 
     # -- agents -----------------------------------------------------------------
 
@@ -2524,7 +2967,14 @@ class WorkflowsPlugin:
             if agent_group:
                 raise WorkflowError("archive applies to the whole workflow; omit agent_group")
             return self.controller.archive(workflow_name)
-        raise WorkflowError(f'unknown command "{command}"; use run, pause or archive')
+        if command == "unarchive":
+            if agent_group:
+                raise WorkflowError("unarchive applies to the whole workflow; omit agent_group")
+            return self.controller.unarchive(workflow_name)
+        raise WorkflowError(f'unknown command "{command}"; use run, pause, archive or unarchive')
+
+    def rename_workflow(self, state, workflow_name, new_name):
+        return self.controller.rename(workflow_name, new_name)
 
     def set_agent_count(self, state, workflow_name, agent_group, count):
         store = WorkflowStore(workflow_name).require()
@@ -2693,14 +3143,22 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
         ["workflow_name", "definition_buffer", "reason"])
     command = function_schema(
         "command_workflow",
-        "Run, pause or archive a workflow. run: take control in this session, resume paused agents where they "
-        "left off, and start new agents up to each group's count (agents cost money; confirm with the user "
-        "first). pause: start no new agents and interrupt running ones, keeping their work. archive: stop all "
-        "agents and retire the workflow; its history stays readable.",
+        "Run, pause, archive or unarchive a workflow. run: take control in this session, resume paused agents "
+        "where they left off, and start new agents up to each group's count (agents cost money; confirm with the "
+        "user first). pause: start no new agents and interrupt running ones, keeping their work. archive: stop "
+        "all agents and hide the workflow from the user's /workflow list (e.g. one-off or test workflows); its "
+        "history stays readable. unarchive: bring an archived workflow back, paused.",
         {"workflow_name": WORKFLOW_NAME_PROPERTY,
-         "command": {"type": "string", "enum": ["run", "pause", "archive"], "description": "What to do."},
+         "command": {"type": "string", "enum": ["run", "pause", "archive", "unarchive"], "description": "What to do."},
          "agent_group": AGENT_GROUP_PROPERTY},
         ["workflow_name", "command"])
+    rename = function_schema(
+        "rename_workflow",
+        "Give a workflow a new name, keeping its definition, items, agents and history. The workflow must be "
+        "paused or archived with no unfinished agents, because agent sessions are tied to the old name.",
+        {"workflow_name": WORKFLOW_NAME_PROPERTY,
+         "new_name": text_property('New name: lowercase letters, digits and underscores, e.g. "test_failures".')},
+        ["workflow_name", "new_name"])
     count = function_schema(
         "set_agent_count",
         "Set how many agents in a group run at once. Takes effect immediately and records a new definition "
@@ -2745,6 +3203,7 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
         WorkflowTool("create_workflow", controller_schema=create, on_controller=p.create_workflow, plugin=p),
         WorkflowTool("update_workflow", controller_schema=update, on_controller=p.update_workflow, plugin=p),
         WorkflowTool("command_workflow", controller_schema=command, on_controller=p.command_workflow, plugin=p),
+        WorkflowTool("rename_workflow", controller_schema=rename, on_controller=p.rename_workflow, plugin=p),
         WorkflowTool("set_agent_count", controller_schema=count, on_controller=p.set_agent_count, plugin=p),
         WorkflowTool("message_agents", controller_schema=message, on_controller=p.message_agents, plugin=p),
         WorkflowTool("restart_agent", controller_schema=restart, on_controller=p.restart_agent, plugin=p),
@@ -2760,8 +3219,10 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
 # Slash command
 # ---------------------------------------------------------------------------
 
-USAGE = ("/workflow  |  /workflow NAME[:GROUP]  |  /workflow run NAME[:GROUP]  |  /workflow pause NAME[:GROUP]  |  "
-         "/workflow set NAME[:GROUP|:QUEUE] [SETTING VALUE]")
+USAGE = ("/workflow list [archived]  |  /workflow view NAME[:GROUP|:QUEUE]  |  /workflow run NAME[:GROUP]  |  "
+         "/workflow pause NAME[:GROUP]  |  /workflow rename NAME NEW_NAME  |  /workflow archive NAME  |  "
+         "/workflow unarchive NAME  |  /workflow set NAME[:GROUP|:QUEUE] [SETTING VALUE]")
+COMMAND_VERBS = "list, view, run, pause, set, rename, archive, unarchive"
 
 
 def parse_target(text: str, *, allow_queue: bool = False) -> tuple[str, str, str | None]:
@@ -2783,9 +3244,26 @@ def parse_command(raw_args: str) -> dict:
         tokens = shlex.split(raw_args or "")
     except ValueError as exc:
         raise WorkflowError(f"could not parse the command: {exc}") from None
-    if not tokens or tokens == ["list"]:
+    if not tokens:
         return {"action": "list"}
     action = tokens[0].lower()
+    if action == "list":
+        if tokens[1:] in ([], ["archived"]):
+            return {"action": "archived" if tokens[1:] else "list"}
+        raise WorkflowError("usage: /workflow list [archived]")
+    if action == "view":
+        if len(tokens) != 2:
+            raise WorkflowError("usage: /workflow view NAME[:GROUP|:QUEUE], e.g. /workflow view miner:grp_reverse")
+        name, kind, target = parse_target(tokens[1], allow_queue=True)
+        return {"action": "show", "name": name, "kind": kind, "target": target}
+    if action in {"archive", "unarchive"}:
+        if len(tokens) != 2 or ":" in tokens[1]:
+            raise WorkflowError(f"usage: /workflow {action} NAME ({action} applies to a whole workflow)")
+        return {"action": action, "name": check_workflow_name(tokens[1])}
+    if action == "rename":
+        if len(tokens) != 3:
+            raise WorkflowError("usage: /workflow rename NAME NEW_NAME, e.g. /workflow rename fixes_1a2b test_failures")
+        return {"action": action, "name": check_workflow_name(tokens[1]), "new_name": check_workflow_name(tokens[2])}
     if action in {"run", "pause"}:
         if len(tokens) == 3 and ":" not in tokens[1]:
             raise WorkflowError(f"name the group with a colon: /workflow {action} {tokens[1]}:{tokens[2]}")
@@ -2805,10 +3283,9 @@ def parse_command(raw_args: str) -> dict:
                                 f"see the settings with /workflow set {tokens[1]}")
         return {"action": "set", "name": name, "kind": kind, "target": target,
                 "setting": tokens[2].lower(), "value": " ".join(tokens[3:])}
-    if len(tokens) == 1:
-        name, kind, target = parse_target(tokens[0], allow_queue=True)
-        return {"action": "show", "name": name, "kind": kind, "target": target}
-    raise WorkflowError(f'unknown command "{tokens[0]}". Usage: {USAGE}')
+    if len(tokens) == 1 and tokens[0].partition(":")[0] in list_workflow_names():
+        raise WorkflowError(f'unknown command "{tokens[0]}"; to open a workflow, use /workflow view {tokens[0]}')
+    raise WorkflowError(f'unknown command "{tokens[0]}"; use one of: {COMMAND_VERBS}. Usage: {USAGE}')
 
 
 class WorkflowCommand:
@@ -2816,8 +3293,9 @@ class WorkflowCommand:
         self.plugin = plugin
 
     @staticmethod
-    def document(title: str, text: str) -> CommandResult:
-        return CommandResult(outputs=(InspectorDocument(title=title, body=text, format="text"),))
+    def document(title: str, body: str, subtitle: str = "") -> CommandResult:
+        return CommandResult(outputs=(InspectorDocument(title=title, subtitle=subtitle, body=body,
+                                                        format="markdown"),))
 
     def __call__(self, ctx, *, raw_args=""):
         controller = self.plugin.controller
@@ -2827,18 +3305,27 @@ class WorkflowCommand:
                 raise WorkflowError("workflow agents cannot control workflows")
             controller.bind(ctx.state)
             viewer = (controller.me or {}).get("session_id", "")
-            if request["action"] == "list":
-                return self.document("Workflows", render_index(None, viewer))
+            if request["action"] in {"list", "archived"}:
+                archived = request["action"] == "archived"
+                subtitle, body = render_list(None, viewer, archived=archived)
+                return self.document("Archived workflows" if archived else "Workflows", body, subtitle)
             store = WorkflowStore(request["name"]).require()
+            state = store.control().get("state")
+            if request["action"] == "archive" and state == "archived":
+                raise WorkflowError(f"{store.name} is already archived")
+            if request["action"] == "unarchive" and state != "archived":
+                raise WorkflowError(f"{store.name} is not archived")
+            if request["action"] == "rename" and WorkflowStore(request["new_name"]).exists():
+                raise WorkflowError(f'a workflow named "{request["new_name"]}" already exists; choose another name')
             if request["action"] == "show":
                 kind, target = request["kind"], request["target"]
                 if kind == "workflow":
-                    text = render_overview(store, viewer, controller.default_model())
+                    subtitle, body = render_overview_md(store, viewer, controller.default_model())
                 elif kind == "group":
-                    text = render_group(store, target, controller.default_model())
+                    subtitle, body = render_group_md(store, target, controller.default_model())
                 else:
-                    text = render_queue(store, target)
-                return self.document(target_label(store, kind, target), text)
+                    subtitle, body = render_queue_md(store, target)
+                return self.document(target_label(store, kind, target), body, subtitle)
             if request["action"] == "settings":
                 text = render_settings(store, request["kind"], request["target"], controller.default_model())
                 return self.document(f"Settings: {target_label(store, request['kind'], request['target'])}", text)
@@ -2860,6 +3347,16 @@ class WorkflowCommand:
                 return controller.change_setting(request["name"], request["kind"], request["target"],
                                                  request["setting"], request["value"])
             receipt = f"Setting {change['label']} {change['setting']} to {change['new_text']}..."
+        elif request["action"] == "rename":
+            def action():
+                return controller.rename(request["name"], request["new_name"])
+            receipt = f"Renaming {request['name']} to {request['new_name']}..."
+        elif request["action"] in {"archive", "unarchive"}:
+            method = controller.archive if request["action"] == "archive" else controller.unarchive
+
+            def action():
+                return method(request["name"])
+            receipt = f"{'Archiving' if request['action'] == 'archive' else 'Restoring'} {request['name']}..."
         else:
             method = controller.run if request["action"] == "run" else controller.pause
 
@@ -3091,7 +3588,8 @@ def register_features(builder, *, session, config):
         builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
     builder.add(Feature("workflows", components=[
         WorkflowBuffers(plugin), WorkflowNotices(plugin), *build_tools(plugin),
-        Command("/workflow", "List, show, run, pause or change workflows", WorkflowCommand(plugin), raw=True,
+        Command("/workflow", "List, show, run, pause, rename, archive or change workflows", WorkflowCommand(plugin),
+                raw=True,
                 usage=USAGE, section="Workflows"),
     ], order=[RegisterSpecialBuffers, WorkflowBuffers, Command, WorkflowNotices, InterruptDelivery,
               ToolDispatchStart]))

@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 import workflows as wf
@@ -185,10 +187,11 @@ def test_set_setting_records_version(store):
 
 def test_settings_listing(store):
     text = wf.render_settings(store, "group", "grp_reverse", "claude-sonnet-5-5")
-    assert "count   4" in text and "model   claude-sonnet-5-5 (Agent Zoo default)" in text
-    assert "every   not available" in text
-    assert "notify  on" in wf.render_settings(store, "queue", "q_catalog")
-    assert "Agent groups" in wf.render_settings(store, "workflow", None)
+    assert "| `count` | 4 |" in text and "| `model` | `claude-sonnet-5-5` | Agent Zoo default;" in text
+    assert "| `every` | — | not available" in text
+    assert "| `notify` | on |" in wf.render_settings(store, "queue", "q_catalog")
+    assert "`/workflow set miner:grp_reverse`" in wf.render_settings(store, "workflow", None)
+    assert wf.render_settings(store, "queue", "q_trash") == "q_trash has no settings.\n"
     assert "model claude-sonnet-5-5" in wf.render_overview(store, default_model="claude-sonnet-5-5")
 
 
@@ -253,3 +256,72 @@ def test_views_render(store):
     assert wf.render_view("buf_123", root=root) is None
     with pytest.raises(wf.WorkflowError, match="no workflow named"):
         wf.render_view("wf:nope", root=root)
+
+
+def test_rename_moves_everything_and_clears_a_bare_directory(store):
+    store.add_item("q_targets", "ResNet", by="user")
+    (store.root / "catalog").mkdir()
+    (store.root / "catalog" / ".lock").touch()  # Left by an earlier lookup of a missing name.
+    renamed = store.rename("catalog", by="user")
+    assert renamed.item("item_1")["title"] == "ResNet" and not store.dir.exists()
+    assert wf.list_workflow_names(store.root) == ["catalog"]
+    with pytest.raises(wf.WorkflowError, match="already has that name"):
+        renamed.rename("catalog", by="user")
+    with pytest.raises(wf.WorkflowError, match="not a valid workflow name"):
+        renamed.rename("Test Failures", by="user")
+
+
+def test_relative_time():
+    now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert wf.relative_time("2026-01-01T23:59:30+00:00", now) == "just now"
+    assert wf.relative_time("2026-01-01T23:15:00+00:00", now) == "45m ago"
+    assert wf.relative_time("2026-01-01T03:00:00+00:00", now) == "21h ago"
+    assert wf.relative_time("2025-12-30T00:00:00+00:00", now) == "3d ago"
+    assert wf.relative_time("garbage", now) == "unknown"
+
+
+def test_pipeline_text_orders_stages_through_cycles():
+    definition = wf.parse_definition("""\
+queues: { q_in: {}, q_failures: {}, q_outdated: {}, q_bugs: {}, q_merge: {}, q_done: {}, q_blocked: {} }
+agents:
+  grp_discover: { takes_from: q_in, sends_to: [q_failures, q_blocked], instructions: x }
+  grp_triage: { count: 3, takes_from: q_failures, sends_to: [q_outdated, q_bugs, q_blocked], instructions: x }
+  grp_update: { count: 2, takes_from: q_outdated, sends_to: [q_merge, q_bugs], instructions: x }
+  grp_fix: { count: 2, takes_from: q_bugs, sends_to: [q_merge, q_outdated], instructions: x }
+  grp_merge: { takes_from: q_merge, sends_to: [q_done], instructions: x }
+""")
+    assert wf.pipeline_text(definition) == "`discover` → `triage` ×3 → `update` ×2, `fix` ×2 → `merge`"
+
+
+def test_markdown_views(store):
+    store.add_item("q_targets", "ResNet | 50", by="user")
+    store.add_item("q_targets", "BERT", by="5a3c1d2e-0000-4000-8000-123456789abc")
+    store.move_items(["item_2"], wf.TRASH, by="user")
+    subtitle, body = wf.render_overview_md(store, default_model="offline")
+    assert subtitle == "paused · def_1"
+    assert "**Model** `offline` · **Folder** `/tmp/miner`" in body
+    assert "| `grp_discovery` | standing, every 30m | `q_targets` | 0 of 1 running · 0 finished |" in body
+    assert "| `q_catalog` | 0 | 0 | 0 | notifies the controlling agent |" in body
+    assert "| `q_trash` | 1 | 0 | 0 | discarded items |" in body
+    assert "Model |" not in body  # Every group uses the workflow's model.
+    assert "**item added**" in body and "`/workflow run miner`" in body
+
+    subtitle, body = wf.render_group_md(store, "grp_reverse")
+    assert subtitle == "takes from q_targets, count 4, sends to q_catalog, q_changes"
+    assert "No agents yet." in body and "## Instructions\n\n> Reverse engineer this.\n>\n> {{item}}" in body
+    assert "`/workflow view miner:q_targets`" in body
+    with pytest.raises(wf.WorkflowError, match="this workflow has: grp_discovery, grp_reverse"):
+        wf.render_group_md(store, "grp_nope")
+
+    subtitle, body = wf.render_queue_md(store, "q_targets")
+    assert subtitle == "1 waiting · 0 in progress · 0 done"
+    assert "**Filled by** `grp_discovery` · **Taken by** `grp_reverse`" in body
+    assert "| `item_1` | ResNet \\| 50 | user |  |" in body and "## Done" not in body
+    assert "| `item_2` | BERT | 5a3c1d2e |" in wf.render_queue_md(store, "q_trash")[1]
+    assert "No items yet." in wf.render_queue_md(store, "q_catalog")[1]
+    with pytest.raises(wf.WorkflowError, match="unknown queue"):
+        wf.render_queue_md(store, "q_nope")
+
+
+def test_md_quote_keeps_lines_apart():
+    assert wf.md_quote("one\ntwo\n\nthree\n") == ["> one", ">", "> two", ">", ">", "> three"]

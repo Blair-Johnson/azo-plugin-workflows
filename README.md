@@ -24,12 +24,16 @@ item `item_42`, version `def_4`. `q_trash` always exists.
 ## Commands
 
 ```text
-/workflow                                   list workflows
-/workflow miner[:grp_reverse | :q_catalog]  show a workflow, group or queue, including models and counts
-/workflow run miner[:grp_reverse]           run it from this session
-/workflow pause miner[:grp_reverse]         pause it; no work is lost
+/workflow list                                   list workflows by status (archived ones are hidden)
+/workflow list archived                          list archived workflows
+/workflow view miner[:grp_reverse | :q_catalog]  show a workflow, group or queue, including models and counts
+/workflow run miner[:grp_reverse]                run it from this session
+/workflow pause miner[:grp_reverse]              pause it; no work is lost
+/workflow rename miner reverse_catalog           rename it (paused, no unfinished agents)
+/workflow archive miner                          stop it and hide it from the list
+/workflow unarchive miner                        bring it back, paused
 /workflow set miner[:grp_reverse | :q_catalog] SETTING VALUE
-/workflow set miner:grp_reverse             list what you can set there, with current values
+/workflow set miner:grp_reverse                  list what you can set there, with current values
 ```
 
 | Target | Setting | Values | Takes effect |
@@ -53,7 +57,8 @@ Controlling session:
 ```python
 create_workflow(workflow_name, definition_buffer)
 update_workflow(workflow_name, definition_buffer, reason, preview_only=False)
-command_workflow(workflow_name, command, agent_group=None)   # run | pause | archive
+command_workflow(workflow_name, command, agent_group=None)   # run | pause | archive | unarchive
+rename_workflow(workflow_name, new_name)
 set_agent_count(workflow_name, agent_group, count)
 message_agents(workflow_name, message, agent_group=None)
 restart_agent(workflow_name, agent)

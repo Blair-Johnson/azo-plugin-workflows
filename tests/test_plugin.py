@@ -272,6 +272,41 @@ def test_archive(runtime):
         runtime.controller.run("miner")
 
 
+def test_unarchive_and_rename(runtime):
+    store = create(runtime)
+    with pytest.raises(wf.WorkflowError, match="is not archived"):
+        runtime.controller.unarchive("miner")
+    runtime.controller.archive("miner")
+    with pytest.raises(wf.WorkflowError, match="already archived"):
+        runtime.controller.archive("miner")
+    assert "Restored miner" in runtime.controller.unarchive("miner")
+    assert store.control()["state"] == "paused"
+    assert "Renamed miner to catalog" in runtime.controller.rename("miner", "catalog")
+    assert not store.exists()
+    renamed = wf.WorkflowStore("catalog")
+    assert renamed.item("item_1")["queue"] == "q_targets" and renamed.version == 1
+    assert renamed.log_records()[-1]["event"] == "renamed"
+    with pytest.raises(wf.WorkflowError, match="no workflow named"):
+        runtime.controller.rename("miner", "other")
+
+
+def test_rename_refuses_while_agents_are_tied_to_the_name(runtime):
+    store = create(runtime)
+    runtime.plugin.create_workflow(runtime.state, "other", "buf_def")
+    with pytest.raises(wf.WorkflowError, match="already exists"):
+        runtime.controller.rename("miner", "other")
+    runtime.controller.run("miner")
+    with pytest.raises(wf.WorkflowError, match="pause it first"):
+        runtime.controller.rename("miner", "catalog")
+    runtime.controller.pause("miner")
+    with pytest.raises(wf.WorkflowError, match="not finished"):
+        runtime.controller.rename("miner", "catalog")
+    assert store.exists() and "miner" in runtime.controller.managed
+    runtime.controller.archive("miner")  # Stops every agent, so the name is free to change.
+    runtime.controller.rename("miner", "catalog")
+    assert wf.WorkflowStore("catalog").control()["state"] == "archived"
+
+
 # -- worker side ------------------------------------------------------------------
 
 def worker_state(runtime, agent_id):
@@ -343,7 +378,7 @@ def test_command_parsing_and_dispatch(runtime):
     session = SimpleNamespace(state=runtime.state, inject=Mock())
     ctx = SimpleNamespace(state=runtime.state, session=session, defer=Mock())
     listing = command(ctx, raw_args="")
-    assert "miner: paused" in listing.outputs[0].body
+    assert "## Paused" in listing.outputs[0].body and "| `miner` |" in listing.outputs[0].body
     with pytest.raises(CommandError, match="usage"):
         command(ctx, raw_args=" run")
     with pytest.raises(CommandError, match="name the group with a colon: /workflow run miner:grp_reverse"):
@@ -375,17 +410,83 @@ def finish_deferred(ctx):
     return result
 
 
+def test_command_list_archive_and_rename(runtime):
+    create(runtime)
+    runtime.plugin.create_workflow(runtime.state, "scratch", "buf_def")
+    command = wf.WorkflowCommand(runtime.plugin)
+    ctx = command_context(runtime)
+    listing = command(ctx, raw_args="").outputs[0]
+    assert listing.format == "markdown" and listing.subtitle == "2 paused"
+    assert "| `discovery` every 30m → `reverse` ×2 |" in listing.body
+    assert "0 waiting" in listing.body and "3 waiting · 0 done" in listing.body
+    assert "/workflow rename NAME NEW_NAME" in listing.body
+
+    assert command(ctx, raw_args=" archive scratch").outputs[0].text == "Archiving scratch..."
+    assert finish_deferred(ctx)["ok"]
+    listing = command(ctx, raw_args="").outputs[0]
+    assert "`scratch`" not in listing.body and "1 archived workflow hidden" in listing.body
+    assert listing.subtitle == "1 paused · 1 archived"
+    archived = command(ctx, raw_args=" list archived").outputs[0]
+    assert archived.title == "Archived workflows" and "| `scratch` |" in archived.body
+    with pytest.raises(CommandError, match="already archived"):
+        command(ctx, raw_args=" archive scratch")
+    with pytest.raises(CommandError, match="not archived"):
+        command(ctx, raw_args=" unarchive miner")
+    with pytest.raises(CommandError, match="usage: /workflow archive NAME"):
+        command(ctx, raw_args=" archive miner:grp_reverse")
+
+    with pytest.raises(CommandError, match="usage: /workflow rename"):
+        command(ctx, raw_args=" rename miner")
+    with pytest.raises(CommandError, match="already exists"):
+        command(ctx, raw_args=" rename miner scratch")
+    with pytest.raises(CommandError, match="reserved"):
+        command(ctx, raw_args=" rename miner archived")
+    assert command(ctx, raw_args=" rename miner test_failures").outputs[0].text == "Renaming miner to test_failures..."
+    assert finish_deferred(ctx)["ok"]
+    assert "Renamed miner to test_failures" in ctx.session.inject.call_args.args[0]
+    assert "| `test_failures` |" in command(ctx, raw_args="").outputs[0].body
+    command(ctx, raw_args=" unarchive scratch")
+    finish_deferred(ctx)
+    assert command(ctx, raw_args="").outputs[0].subtitle == "2 paused"
+
+
+def test_list_when_empty_or_all_archived(runtime):
+    command = wf.WorkflowCommand(runtime.plugin)
+    ctx = command_context(runtime)
+    empty = command(ctx, raw_args="").outputs[0]
+    assert empty.body.startswith("No workflows yet.") and empty.subtitle == ""
+    create(runtime)
+    runtime.controller.archive("miner")
+    listing = command(ctx, raw_args="").outputs[0]
+    assert listing.body.startswith("No active workflows.") and "`/workflow list archived` shows it" in listing.body
+    assert "miner" in wf.render_index() and "Archived" in wf.render_index()
+
+
 def test_command_show_and_settings(runtime):
     create(runtime)
     command = wf.WorkflowCommand(runtime.plugin)
     ctx = command_context(runtime)
-    overview = command(ctx, raw_args=" miner").outputs[0]
-    assert "Model: offline." in overview.body and "model offline." in overview.body
-    group = command(ctx, raw_args=" miner:grp_reverse").outputs[0]
-    assert "New agents use model offline (Agent Zoo default)" in group.body
-    assert "q_targets in miner" in command(ctx, raw_args=" miner:q_targets").outputs[0].body
+    assert command(ctx, raw_args=" list").outputs[0].title == "Workflows"
+    overview = command(ctx, raw_args=" view miner").outputs[0]
+    assert overview.format == "markdown" and overview.title == "miner" and overview.subtitle == "paused · def_1"
+    assert "**Model** `offline`" in overview.body and "| `grp_reverse` | `q_targets` |" in overview.body
+    group = command(ctx, raw_args=" view miner:grp_reverse").outputs[0]
+    assert "**Model** `offline` (Agent Zoo default)" in group.body and group.subtitle.startswith("takes from")
+    queue = command(ctx, raw_args=" view miner:q_targets").outputs[0]
+    assert queue.subtitle == "3 waiting · 0 in progress · 0 done" and "| `item_1` | ResNet50 |" in queue.body
     settings = command(ctx, raw_args=" set miner:grp_reverse").outputs[0]
-    assert settings.title == "Settings: miner:grp_reverse" and "count   2" in settings.body
+    assert settings.title == "Settings: miner:grp_reverse" and "| `count` | 2 |" in settings.body
+    assert settings.format == "markdown"
+    with pytest.raises(CommandError, match="to open a workflow, use /workflow view miner:grp_reverse"):
+        command(ctx, raw_args=" miner:grp_reverse")
+    with pytest.raises(CommandError, match="use one of: list, view"):
+        command(ctx, raw_args=" frobnicate")
+    with pytest.raises(CommandError, match="usage: /workflow view"):
+        command(ctx, raw_args=" view")
+    with pytest.raises(CommandError, match="usage: /workflow list"):
+        command(ctx, raw_args=" list everything")
+    with pytest.raises(wf.WorkflowError, match="reserved"):
+        runtime.plugin.create_workflow(runtime.state, "view", "buf_def")
     ctx.defer.assert_not_called()
 
 
@@ -474,7 +575,8 @@ def test_plugin_builds_real_default_pipeline(tmp_path, monkeypatch, kind, is_wor
     session.pipeline = pipeline
     session.ensure_initialized()
     tools = {c.name for c in pipeline if isinstance(c, Tool)}
-    assert {"create_workflow", "update_workflow", "command_workflow", "set_agent_count", "message_agents",
+    assert {"create_workflow", "update_workflow", "command_workflow", "rename_workflow", "set_agent_count",
+            "message_agents",
             "restart_agent", "add_items", "move_items", "finish_task"} <= tools
     assert bool(tools & {"submit_rlm", "rlm_status", "cancel_rlm"}) == (not is_worker)
     assert any(type(c).__name__ == "WorkflowNotices" for c in pipeline)
