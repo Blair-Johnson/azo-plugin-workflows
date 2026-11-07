@@ -82,6 +82,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(wf, "process_evidence", lambda identity: liveness.get("default", "alive"))
     monkeypatch.setattr(wf, "list_live_sessions", lambda *a, **k: [])
     monkeypatch.setattr(wf.WorkflowController, "ensure_thread", lambda self: None)
+    monkeypatch.setattr(wf, "saved_model_config", lambda config: None)
     launcher = FakeLauncher()
     state = SimpleNamespace(
         _session_id="parent", _instance_id="parent-a", _session_kind="default",
@@ -90,7 +91,8 @@ def runtime(tmp_path, monkeypatch):
         buffer_manager=Buffers(buf_def=DEFINITION, buf_a="# ResNet50\nhttps://a", buf_b="BERT", buf_c="GPT-2"),
         pending_interrupts=[],
     )
-    controller = wf.WorkflowController({"llm": {"default": "offline", "models": {"offline": {}}}})
+    controller = wf.WorkflowController({"llm": {"default": "offline", "models": {
+        "offline": {"model": "a"}, "big": {"model": "b"}, "retired": {"model": "c", "enabled": False}}}})
     plugin = wf.WorkflowsPlugin(controller)
     controller.bind(state)
     return SimpleNamespace(state=state, controller=controller, plugin=plugin, launcher=launcher, sent=sent,
@@ -339,10 +341,12 @@ def test_command_parsing_and_dispatch(runtime):
     ctx = SimpleNamespace(state=runtime.state, session=session, defer=Mock())
     listing = command(ctx, raw_args="")
     assert "miner: paused" in listing.outputs[0].body
-    with pytest.raises(CommandError, match="Usage"):
+    with pytest.raises(CommandError, match="usage"):
         command(ctx, raw_args=" run")
-    with pytest.raises(CommandError, match="did you mean grp_reverse"):
-        command(ctx, raw_args=" run miner reverse")
+    with pytest.raises(CommandError, match="name the group with a colon: /workflow run miner:grp_reverse"):
+        command(ctx, raw_args=" run miner grp_reverse")
+    with pytest.raises(CommandError, match="did you mean miner:grp_reverse"):
+        command(ctx, raw_args=" run miner:reverse")
     with pytest.raises(CommandError, match="no workflow named"):
         command(ctx, raw_args=" pause nope")
     ctx.defer.assert_not_called()
@@ -354,6 +358,93 @@ def test_command_parsing_and_dispatch(runtime):
     notice = then(ctx, result)
     assert notice.outputs[0].text.startswith("Running miner from this session")
     assert "do not repeat" in session.inject.call_args.args[0]
+
+
+def command_context(runtime):
+    session = SimpleNamespace(state=runtime.state, inject=Mock())
+    return SimpleNamespace(state=runtime.state, session=session, defer=Mock())
+
+
+def finish_deferred(ctx):
+    work, then = ctx.defer.call_args.args[0], ctx.defer.call_args.kwargs["then"]
+    result = asyncio.run(work())
+    then(ctx, result)
+    return result
+
+
+def test_command_show_and_settings(runtime):
+    create(runtime)
+    command = wf.WorkflowCommand(runtime.plugin)
+    ctx = command_context(runtime)
+    overview = command(ctx, raw_args=" miner").outputs[0]
+    assert "Model: offline." in overview.body and "model offline." in overview.body
+    group = command(ctx, raw_args=" miner:grp_reverse").outputs[0]
+    assert "New agents use model offline (Agent Zoo default)" in group.body
+    assert "q_targets in miner" in command(ctx, raw_args=" miner:q_targets").outputs[0].body
+    settings = command(ctx, raw_args=" set miner:grp_reverse").outputs[0]
+    assert settings.title == "Settings: miner:grp_reverse" and "count   2" in settings.body
+    ctx.defer.assert_not_called()
+
+
+def test_command_set_validates_before_deferring(runtime):
+    create(runtime)
+    command = wf.WorkflowCommand(runtime.plugin)
+    ctx = command_context(runtime)
+    with pytest.raises(CommandError, match='unknown model profile "tiny"; enabled profiles: offline, big'):
+        command(ctx, raw_args=" set miner:grp_reverse model tiny")
+    with pytest.raises(CommandError, match='"retired" is disabled'):
+        command(ctx, raw_args=" set miner model retired")
+    with pytest.raises(CommandError, match="count is set on an agent group"):
+        command(ctx, raw_args=" set miner count 4")
+    with pytest.raises(CommandError, match="give a value"):
+        command(ctx, raw_args=" set miner:grp_reverse count")
+    assert command(ctx, raw_args=" set miner:grp_reverse count 2").outputs[0].text.endswith("nothing changed.")
+    ctx.defer.assert_not_called()
+
+
+def test_command_set_model_and_count(runtime):
+    store = create(runtime)
+    runtime.controller.run("miner")
+    runtime.controller.tick("miner")
+    command = wf.WorkflowCommand(runtime.plugin)
+    ctx = command_context(runtime)
+    receipt = command(ctx, raw_args=" set miner:grp_reverse model big")
+    assert receipt.outputs[0].text == "Setting miner:grp_reverse model to big..."
+    result = finish_deferred(ctx)
+    assert result["ok"]
+    assert "Set miner:grp_reverse model from default to big (def_2)." in result["text"]
+    assert "agt_reverse_1 (offline), agt_reverse_2 (offline) keep their current model" in result["text"]
+    assert "do not repeat" in ctx.session.inject.call_args.args[0]
+    command(ctx, raw_args=" set miner:grp_reverse count 3")
+    result = finish_deferred(ctx)
+    assert "Started agt_reverse_3 on item_3 from q_targets." in result["text"]
+    assert runtime.launcher.requests[-1].settings.model == "big"
+    command(ctx, raw_args=" set miner:grp_reverse model default")
+    finish_deferred(ctx)
+    assert store.definition()["agents"]["grp_reverse"]["model"] is None
+    command(ctx, raw_args=" set miner:q_catalog notify off")
+    assert "no longer notify" in finish_deferred(ctx)["text"]
+    command(ctx, raw_args=' set miner folder "~/work/my miner"')
+    finish_deferred(ctx)
+    assert store.definition()["folder"] == "~/work/my miner"
+    assert [store.version_meta(v)["reason"] for v in range(2, store.version + 1)] == [
+        "User set miner:grp_reverse model from default to big",
+        "User set miner:grp_reverse count from 2 to 3",
+        "User set miner:grp_reverse model from big to default",
+        "User set miner:q_catalog notify from on to off",
+        "User set miner folder from default to ~/work/my miner",
+    ]
+
+
+def test_create_and_update_check_models(runtime):
+    runtime.state.buffer_manager.texts["buf_bad"] = "model: tiny\n" + DEFINITION
+    with pytest.raises(wf.WorkflowError, match='definition: unknown model profile "tiny"'):
+        runtime.plugin.create_workflow(runtime.state, "miner", "buf_bad")
+    create(runtime)
+    runtime.state.buffer_manager.texts["buf_bad2"] = DEFINITION.replace(
+        "    count: 2\n", "    count: 2\n    model: retired\n")
+    with pytest.raises(wf.WorkflowError, match='grp_reverse: model profile "retired" is disabled'):
+        runtime.plugin.update_workflow(runtime.state, "miner", "buf_bad2", "x", preview_only=True)
 
 
 # -- real pipelines ------------------------------------------------------------------

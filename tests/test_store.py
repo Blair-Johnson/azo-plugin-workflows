@@ -70,8 +70,9 @@ def test_names_are_checked():
         wf.check_queue_id("targets")
     with pytest.raises(wf.WorkflowError, match="item_42"):
         wf.check_item_id("42")
-    with pytest.raises(wf.WorkflowError, match="reserved"):
-        wf.WorkflowStore("index")
+    for reserved in ("index", "run", "set"):
+        with pytest.raises(wf.WorkflowError, match="reserved"):
+            wf.WorkflowStore(reserved)
     with pytest.raises(wf.WorkflowError):
         wf.WorkflowStore("Bad Name")
 
@@ -117,6 +118,78 @@ def test_set_count_inserts_missing_count(tmp_path):
     s.create("queues: {}\nagents:\n  grp_a:\n    instructions: hi\n", by="user")
     s.set_count("grp_a", 5, by="user")
     assert s.definition()["agents"]["grp_a"]["count"] == 5
+
+
+def test_set_setting_text_edits_one_line():
+    text = DEFINITION
+    # Replace, insert, remove at group level; comments and instructions survive.
+    edited = wf.set_setting_text(text, "agents", "grp_reverse", "model", "claude-opus-5-5")
+    assert "    model: claude-opus-5-5\n    count: 4" in edited
+    assert wf.parse_definition(edited)["agents"]["grp_reverse"]["model"] == "claude-opus-5-5"
+    edited = wf.set_setting_text(edited, "agents", "grp_reverse", "model", "claude-sonnet-5-5")
+    assert edited.count("model:") == 1
+    assert wf.set_setting_text(edited, "agents", "grp_reverse", "model", None) == text
+    removed = wf.set_setting_text(text, "agents", "grp_discovery", "every", None)
+    assert "every" not in removed and "Find checkpoints." in removed
+    # Top level.
+    top = wf.set_setting_text(text, None, None, "model", "big")
+    assert wf.parse_definition(top)["model"] == "big"
+    assert wf.set_setting_text(top, None, None, "folder", "~/work new")
+    # Flow-style and bare queue settings.
+    flow = wf.set_setting_text(text, "queues", "q_catalog", "notify_on_new", False)
+    assert "q_catalog: { notify_on_new: false }" in flow
+    assert "q_targets: {}" in wf.set_setting_text(text.replace("q_targets: {}", "q_targets:"),
+                                                  "queues", "q_targets", "notify_on_new", None)
+    on = wf.set_setting_text(text, "queues", "q_targets", "notify_on_new", True)
+    assert wf.parse_definition(on)["queues"]["q_targets"]["notify_on_new"] is True
+
+
+def test_prepare_setting_explains_mistakes(store):
+    with pytest.raises(wf.WorkflowError, match="count is set on an agent group; for example: "
+                                               "/workflow set miner:grp_discovery count 4"):
+        wf.prepare_setting(store, "workflow", None, "count", "4")
+    with pytest.raises(wf.WorkflowError, match="every only applies to groups without takes_from"):
+        wf.prepare_setting(store, "group", "grp_reverse", "every", "1h")
+    with pytest.raises(wf.WorkflowError, match="not a duration"):
+        wf.prepare_setting(store, "group", "grp_discovery", "every", "soon")
+    with pytest.raises(wf.WorkflowError, match="0 to 64"):
+        wf.prepare_setting(store, "group", "grp_reverse", "count", "100")
+    with pytest.raises(wf.WorkflowError, match="unknown setting"):
+        wf.prepare_setting(store, "group", "grp_reverse", "size", "3")
+    with pytest.raises(wf.WorkflowError, match="this workflow has"):
+        wf.prepare_setting(store, "group", "grp_missing", "count", "3")
+
+    def check(profile):
+        if profile != "big":
+            raise wf.WorkflowError("enabled profiles: big")
+        return profile
+
+    with pytest.raises(wf.WorkflowError, match="enabled profiles: big"):
+        wf.prepare_setting(store, "group", "grp_reverse", "model", "tiny", check_model=check)
+    change = wf.prepare_setting(store, "group", "grp_reverse", "model", "big", check_model=check)
+    assert change["value"] == "big" and change["old_text"] == "default" and not change["unchanged"]
+    assert wf.prepare_setting(store, "group", "grp_reverse", "model", "default")["unchanged"]
+    assert wf.prepare_setting(store, "group", "grp_discovery", "every", "off")["value"] is None
+    assert wf.prepare_setting(store, "group", "grp_discovery", "every", "1800s")["unchanged"]
+    assert wf.prepare_setting(store, "queue", "q_catalog", "notify", "on")["unchanged"]
+
+
+def test_set_setting_records_version(store):
+    change = wf.prepare_setting(store, "group", "grp_reverse", "count", "8")
+    result = store.set_setting(change["section"], change["name"], change["key"], change["value"],
+                               reason=change["reason"], by="user")
+    assert result == {"changed": True, "version": 2}
+    assert store.version_meta(2)["reason"] == "User set miner:grp_reverse count from 4 to 8"
+    assert store.definition()["agents"]["grp_reverse"]["count"] == 8
+
+
+def test_settings_listing(store):
+    text = wf.render_settings(store, "group", "grp_reverse", "claude-sonnet-5-5")
+    assert "count   4" in text and "model   claude-sonnet-5-5 (Agent Zoo default)" in text
+    assert "every   not available" in text
+    assert "notify  on" in wf.render_settings(store, "queue", "q_catalog")
+    assert "Agent groups" in wf.render_settings(store, "workflow", None)
+    assert "model claude-sonnet-5-5" in wf.render_overview(store, default_model="claude-sonnet-5-5")
 
 
 def test_items_take_finish_move(store):

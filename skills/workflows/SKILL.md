@@ -43,7 +43,7 @@ wf:miner:log                every event, newest first
 
 ```yaml
 folder: ~/work/papers            # working directory for agents (optional)
-model: default                   # model profile for agents (optional)
+model: claude-sonnet-5-5         # model profile for agents (optional; else the saved Agent Zoo default)
 queues:
   q_papers: {}
   q_summaries: { notify_on_new: true }   # tell you when items arrive
@@ -114,6 +114,23 @@ queues with `notify_on_new`. Read `wf:<name>` for everything else.
 
 ## The user's commands
 
-`/workflow` lists workflows. `/workflow run NAME [GROUP]` takes control in the
-current session and runs it. `/workflow pause NAME [GROUP]` pauses it. When the
-user runs a workflow in a new session, it continues where it left off.
+```text
+/workflow                                   list workflows
+/workflow miner[:grp_reverse | :q_catalog]  show a workflow, group or queue
+/workflow run miner[:grp_reverse]           take control in this session and run it
+/workflow pause miner[:grp_reverse]         pause it; no work is lost
+/workflow set miner:grp_reverse count 8     change a simple setting (see below)
+/workflow set miner:grp_reverse             list the settings there, with current values
+```
+
+Settings the user can change directly: `model` and `folder` on the workflow;
+`count`, `model`, `every` and `folder` on an agent group; `notify` on a queue.
+`default` removes a model or folder setting, and `every off` removes the interval.
+Each change records a new definition version, just like your own edits.
+
+You are told when the user runs one of these. The result is marked as already
+done: do not repeat it. If you were editing a copy of the definition, your next
+`update_workflow` is rejected with a diff; copy `wf:<name>:definition` again and
+reapply your change. Model profiles must exist and be enabled; a bad name is
+rejected with the list of enabled profiles. When a workflow runs in a new
+session, it continues where it left off.

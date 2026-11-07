@@ -36,6 +36,8 @@ VERSION_ID = re.compile(r"def_(?P<number>\d+)")
 ACTIVE_STATES = {"starting", "running", "paused"}
 AGENT_STATES = ACTIVE_STATES | {"finished", "stopped", "attention", "restarted"}
 
+RESERVED_NAMES = {"index", "list", "run", "pause", "set"}
+
 TOP_KEYS = {"version", "folder", "model", "queues", "agents"}
 QUEUE_KEYS = {"notify_on_new"}
 GROUP_KEYS = {"count", "takes_from", "sends_to", "every", "instructions", "folder", "model"}
@@ -90,8 +92,9 @@ def check_workflow_name(value) -> str:
         raise WorkflowError(
             f'"{name}" is not a valid workflow name: use lowercase letters, digits and '
             f'underscores, starting with a letter' + (f' (for example "{hint}")' if hint else "") + ".")
-    if name == "index":
-        raise WorkflowError('"index" is reserved for the wf:index view; choose another workflow name')
+    if name in RESERVED_NAMES:
+        raise WorkflowError(f'"{name}" is reserved by the /workflow command and wf:index; '
+                            "choose another workflow name")
     return name
 
 
@@ -325,22 +328,75 @@ def parse_definition(text: str) -> dict:
     return {"folder": folder, "model": model, "queues": queues, "agents": groups}
 
 
-def set_group_count_text(text: str, group: str, count: int) -> str:
-    """Change one group's count in definition text, preserving formatting."""
+def yaml_scalar(value) -> str:
+    lines = yaml.safe_dump(value, default_flow_style=True, width=1 << 20).splitlines()
+    if lines and lines[-1] == "...":
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+def yaml_flow(mapping: dict) -> str:
+    if not mapping:
+        return "{}"
+    return "{ " + ", ".join(f"{key}: {yaml_scalar(value)}" for key, value in mapping.items()) + " }"
+
+
+def _mapping_get(node, key):
+    if isinstance(node, yaml.MappingNode):
+        for key_node, value_node in node.value:
+            if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
+                return key_node, value_node
+    return None, None
+
+
+def set_setting_text(text: str, section: str | None, name: str | None, key: str, value) -> str:
+    """Set (or, with value None, remove) one simple setting in definition text.
+
+    ``section`` is None for a top-level setting, or "agents"/"queues" with ``name``
+    naming the group or queue. Everything else in the text, including comments and
+    instructions, is preserved.
+    """
     root = yaml.compose(text)
-    agents = next((value for key, value in root.value if key.value == "agents"), None)
-    node = next((value for key, value in agents.value if key.value == group), None)
-    if node is None or not isinstance(node, yaml.MappingNode):
-        raise WorkflowError(f"{group} is not in the definition")
-    current = next((value for key, value in node.value if key.value == "count"), None)
+    if not isinstance(root, yaml.MappingNode):
+        raise WorkflowError("the definition is not a YAML mapping")
+    node = root
+    if section is not None:
+        _, container = _mapping_get(root, section)
+        key_node, node = _mapping_get(container, name)
+        if node is None:
+            raise WorkflowError(f"{name} is not in the definition")
+        if isinstance(node, yaml.ScalarNode) and node.tag.endswith(":null"):
+            # Written as a bare `q_name:`; give it a small flow mapping.
+            line_end = text.find("\n", key_node.end_mark.index)
+            line_end = len(text) if line_end == -1 else line_end
+            mapping = {} if value is None else {key: value}
+            return text[:key_node.end_mark.index] + ": " + yaml_flow(mapping) + text[line_end:]
+        if not isinstance(node, yaml.MappingNode):
+            raise WorkflowError(f"{name} must be a mapping of settings")
+    if node.flow_style:
+        start, end = node.start_mark.index, node.end_mark.index
+        mapping = yaml.safe_load(text[start:end]) or {}
+        if value is None:
+            mapping.pop(key, None)
+        else:
+            mapping[key] = value
+        return text[:start] + yaml_flow(mapping) + text[end:]
+    key_node, current = _mapping_get(node, key)
     if current is not None:
         start, end = current.start_mark.index, current.end_mark.index
-        return text[:start] + str(count) + text[end:]
-    if node.flow_style:
-        raise WorkflowError(f"{group} is written in flow style; edit its count with update_workflow")
+        block = isinstance(current, yaml.ScalarNode) and current.style in ("|", ">")
+        if value is None:
+            line_start = key_node.start_mark.index - key_node.start_mark.column
+            if not block:
+                newline = text.find("\n", end)
+                end = len(text) if newline == -1 else newline + 1
+            return text[:line_start] + text[end:]
+        return text[:start] + yaml_scalar(value) + ("\n" if block else "") + text[end:]
+    if value is None:
+        return text
     first = node.value[0][0].start_mark
     line_start = first.index - first.column
-    return text[:line_start] + " " * first.column + f"count: {count}\n" + text[line_start:]
+    return text[:line_start] + " " * first.column + f"{key}: {yaml_scalar(value)}\n" + text[line_start:]
 
 
 def unified_diff(old: str, new: str, old_label: str, new_label: str) -> str:
@@ -534,17 +590,26 @@ class WorkflowStore:
     def set_count(self, group: str, count: int, *, by: str) -> dict:
         if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 64:
             raise WorkflowError("count must be a whole number from 0 to 64")
+        definition = self.require().definition()
+        check_group_id(group, definition["agents"])
+        old = definition["agents"][group]["count"]
+        if old == count:
+            return {"version": self.version, "old": old, "changed": False}
+        result = self.set_setting("agents", group, "count", count,
+                                  reason=f"Set {group} count from {old} to {count}", by=by)
+        return {"version": result["version"], "old": old, "changed": result["changed"]}
+
+    def set_setting(self, section: str | None, name: str | None, key: str, value, *,
+                    reason: str, by: str) -> dict:
+        """Change one simple setting, recording a new definition version."""
         with self.lock():
             self.require()
-            definition = self.definition()
-            check_group_id(group, definition["agents"])
-            old = definition["agents"][group]["count"]
-            if old == count:
-                return {"version": self.version, "old": old, "changed": False}
-            body = set_group_count_text(self.definition_body(), group, count)
-            parse_definition(body)
-            version = self._write_version(body, f"Set {group} count from {old} to {count}", by)
-            return {"version": version, "old": old, "changed": True}
+            body = self.definition_body()
+            new_body = set_setting_text(body, section, name, key, value)
+            if new_body == body:
+                return {"changed": False, "version": self.version}
+            parse_definition(new_body)
+            return {"changed": True, "version": self._write_version(new_body, reason, by)}
 
     def update_effects(self, old: dict, new: dict) -> list[str]:
         effects = []
@@ -785,6 +850,152 @@ def describe_group(group: dict) -> str:
     return ", ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Simple settings (/workflow set)
+# ---------------------------------------------------------------------------
+
+SETTINGS = {"workflow": ("model", "folder"), "group": ("count", "model", "every", "folder"),
+            "queue": ("notify",)}
+SETTING_PLACE = {"count": "an agent group", "every": "an agent group", "notify": "a queue",
+                 "model": "the workflow or an agent group", "folder": "the workflow or an agent group"}
+
+
+def effective_model(definition: dict, group: dict | None, default_model: str = "") -> tuple[str, str]:
+    """The model a group's new agents get, and where that value comes from."""
+    if group is not None and group.get("model"):
+        return group["model"], "set on this group"
+    if definition.get("model"):
+        return definition["model"], "from the workflow"
+    return default_model or "the Agent Zoo default", "Agent Zoo default"
+
+
+def target_label(store: "WorkflowStore", kind: str, target: str | None) -> str:
+    return store.name if kind == "workflow" else f"{store.name}:{target}"
+
+
+def settings_example(store: "WorkflowStore", definition: dict, setting: str) -> str:
+    if setting == "notify":
+        queue = next(iter(definition["queues"]), "q_results")
+        return f"/workflow set {store.name}:{queue} notify on"
+    group = next(iter(definition["agents"]), "grp_name")
+    value = {"count": "4", "every": "30m", "model": "PROFILE", "folder": "PATH"}[setting]
+    return f"/workflow set {store.name}:{group} {setting} {value}"
+
+
+def prepare_setting(store: "WorkflowStore", kind: str, target: str | None, setting: str, raw: str,
+                    *, check_model=None, default_model: str = "") -> dict:
+    """Validate a /workflow set request and describe the change. Raises WorkflowError."""
+    definition = store.definition()
+    label = target_label(store, kind, target)
+    setting = setting.strip().lower()
+    known = sorted({s for names in SETTINGS.values() for s in names})
+    if setting not in known:
+        raise WorkflowError(f'unknown setting "{setting}"; you can set: count, model, every and folder on '
+                            f"agent groups, model and folder on the workflow, and notify on queues. "
+                            f"See what {label} has with /workflow set {label}")
+    if setting not in SETTINGS[kind]:
+        raise WorkflowError(f"{setting} is set on {SETTING_PLACE[setting]}; for example: "
+                            + settings_example(store, definition, setting))
+    group = queue = None
+    if kind == "group":
+        check_group_id(target, definition["agents"])
+        group = definition["agents"][target]
+    elif kind == "queue":
+        if target == TRASH:
+            raise WorkflowError(f"{TRASH} has no settings")
+        check_queue_id(target, definition["queues"])
+        queue = definition["queues"][target]
+    raw = str(raw or "").strip()
+    if not raw:
+        raise WorkflowError(f"give a value, for example: {settings_example(store, definition, setting)}")
+    word = raw.lower()
+    section, name = {"workflow": (None, None), "group": ("agents", target), "queue": ("queues", target)}[kind]
+    key = "notify_on_new" if setting == "notify" else setting
+
+    if setting == "count":
+        if not re.fullmatch(r"\d+", raw) or not 0 <= int(raw) <= 64:
+            raise WorkflowError("count must be a whole number from 0 to 64")
+        value, old_value = int(raw), group["count"]
+        old_text, new_text, unchanged = str(old_value), str(value), value == old_value
+    elif setting == "every":
+        if group["takes_from"]:
+            raise WorkflowError(f"every only applies to groups without takes_from; {target} starts one "
+                                f"agent per item from {group['takes_from']}")
+        if word == "off":
+            value = None
+        else:
+            try:
+                parse_duration(raw)
+            except ValueError:
+                raise WorkflowError(f'"{raw}" is not a duration like 45s, 30m, 2h or 1d, or off') from None
+            value = raw
+        old_text = group["every_text"] or "off"
+        new_text = value or "off"
+        unchanged = (group["every"] or None) == (parse_duration(value) if value else None)
+    elif setting == "notify":
+        if word not in {"on", "off", "true", "false", "yes", "no"}:
+            raise WorkflowError("notify must be on or off")
+        value = word in {"on", "true", "yes"}
+        old_text, new_text = ("on" if queue["notify_on_new"] else "off"), ("on" if value else "off")
+        unchanged = value == queue["notify_on_new"]
+    else:  # model or folder
+        current = (group or definition).get(setting)
+        if word == "default":
+            value = None
+        elif setting == "model":
+            value = check_model(raw) if check_model else raw
+        else:
+            value = raw
+        old_text = current or "default"
+        new_text = value or "default"
+        unchanged = (current or None) == value
+    return {"kind": kind, "target": target, "label": label, "setting": setting, "section": section,
+            "name": name, "key": key, "value": value, "old_text": old_text, "new_text": new_text,
+            "unchanged": unchanged, "reason": f"User set {label} {setting} from {old_text} to {new_text}"}
+
+
+def render_settings(store: "WorkflowStore", kind: str, target: str | None, default_model: str = "") -> str:
+    definition = store.definition()
+    control = store.control()
+    label = target_label(store, kind, target)
+    lines = [f"Settings for {label}. Change one with /workflow set {label} SETTING VALUE.", ""]
+    if kind == "workflow":
+        model, source = effective_model(definition, None, default_model)
+        lines.append(f"  model   {model} ({'set on the workflow' if definition['model'] else source}); "
+                     "use default for the Agent Zoo default")
+        folder = definition["folder"] or control.get("default_folder") or "the session's folder"
+        lines.append(f"  folder  {folder} ({'set on the workflow' if definition['folder'] else 'where it was created'})"
+                     "; use default to go back")
+        lines += ["", "Agent groups (set each with " + f"/workflow set {store.name}:grp_NAME ...): "
+                  + ", ".join(definition["agents"])]
+        if definition["queues"]:
+            lines.append("Queues (notify on or off): " + ", ".join(definition["queues"]))
+    elif kind == "group":
+        check_group_id(target, definition["agents"])
+        group = definition["agents"][target]
+        model, source = effective_model(definition, group, default_model)
+        folder = group["folder"] or definition["folder"] or control.get("default_folder") or "the session's folder"
+        lines.append(f"  count   {group['count']} (agents at once, 0 to 64)")
+        lines.append(f"  model   {model} ({source}); use default for the workflow's model")
+        if group["takes_from"]:
+            lines.append(f"  every   not available: this group takes items from {group['takes_from']}")
+        else:
+            lines.append(f"  every   {group['every_text'] or 'off'} (start a new agent at most this often, or off)")
+        lines.append(f"  folder  {folder} ({'set on this group' if group['folder'] else 'from the workflow'})"
+                     "; use default for the workflow's folder")
+        stale = [f"{a['id']} ({a.get('model')})" for a in store.agents(target)
+                 if a["state"] in ACTIVE_STATES and a.get("model") and a.get("model") != model]
+        if stale:
+            lines += ["", "Running on a different model (started before a change): " + ", ".join(stale)]
+    else:
+        if target == TRASH:
+            return f"{TRASH} has no settings.\n"
+        check_queue_id(target, definition["queues"])
+        notify = definition["queues"][target]["notify_on_new"]
+        lines.append(f"  notify  {'on' if notify else 'off'} (tell the controlling agent about new items)")
+    return "\n".join(lines) + "\n"
+
+
 def item_block(store: WorkflowStore, meta: dict) -> str:
     """The text {{item}} expands to in instructions."""
     lines = [f"{meta['id']} from {meta['queue']}: {meta['title']}"]
@@ -850,15 +1061,18 @@ def render_index(root: Path | None = None, viewer_session_id: str = "") -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_overview(store: WorkflowStore, viewer_session_id: str = "") -> str:
+def render_overview(store: WorkflowStore, viewer_session_id: str = "", default_model: str = "") -> str:
     control = store.control()
     definition = store.definition()
     agents = store.agents()
     items = store.items()
     counts = queue_counts(items)
     name = store.name
+    model, _ = effective_model(definition, None, default_model)
+    folder = definition["folder"] or control.get("default_folder") or "the session's folder"
     lines = [f"Workflow {name}: {state_label(control)}, controlled by "
-             f"{controller_label(control, viewer_session_id)}, definition def_{store.version}.", "",
+             f"{controller_label(control, viewer_session_id)}, definition def_{store.version}.",
+             f"Model: {model}. Folder: {folder}. Change these with /workflow set {name} model|folder VALUE.", "",
              "Agent groups"]
     paused_groups = set(control.get("paused_groups") or [])
     for group, settings in definition["agents"].items():
@@ -871,7 +1085,8 @@ def render_overview(store: WorkflowStore, viewer_session_id: str = "") -> str:
         status += f", {states['finished']} finished"
         if group in paused_groups:
             status += " (group paused)"
-        lines.append(f"  {group}: {status}. {describe_group(settings)}.")
+        group_model, _ = effective_model(definition, settings, default_model)
+        lines.append(f"  {group}: {status}. {describe_group(settings)}, model {group_model}.")
     lines += ["", "Queues"]
     queue_names = list(definition["queues"]) + [q for q in counts if q not in definition["queues"]]
     for queue in queue_names:
@@ -929,7 +1144,7 @@ def render_queue(store: WorkflowStore, queue: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_group(store: WorkflowStore, group: str) -> str:
+def render_group(store: WorkflowStore, group: str, default_model: str = "") -> str:
     definition = store.definition()
     agents = store.agents(group)
     settings = definition["agents"].get(group)
@@ -937,6 +1152,9 @@ def render_group(store: WorkflowStore, group: str) -> str:
         return f"{group} is not in {store.name}'s definition and has no agents.\n"
     lines = [f"{group} in {store.name}: " + (describe_group(settings) + "." if settings
                                              else "not in the current definition.")]
+    if settings:
+        model, source = effective_model(definition, settings, default_model)
+        lines.append(f"New agents use model {model} ({source}). Settings: /workflow set {store.name}:{group}")
     if group in (store.control().get("paused_groups") or []):
         lines.append("This group is paused.")
     for state in ("starting", "running", "paused", "attention", "stopped", "finished", "restarted"):
@@ -961,6 +1179,8 @@ def render_agent(store: WorkflowStore, agent_id: str, transcript=None) -> str:
         lines.append(f"Item: {agent['item']} (wf:{store.name}:{agent['item']})")
     lines.append(f"Can send to: {', '.join(agent.get('sends_to') or []) or 'nothing'}")
     lines.append(f"Folder: {agent.get('folder')}")
+    if agent.get("model"):
+        lines.append(f"Model: {agent['model']}")
     if agent.get("session_id"):
         lines.append(f"Session: {agent['session_id']}")
     if agent.get("problem"):
@@ -1012,7 +1232,7 @@ def render_log(store: WorkflowStore) -> str:
 
 
 def render_view(buffer_id: str, *, viewer_session_id: str = "", transcript=None,
-                root: Path | None = None) -> str | None:
+                root: Path | None = None, default_model: str = "") -> str | None:
     """Text for a wf: buffer, or None when the ID is not a workflow view."""
     parts = buffer_id.split(":")
     if not parts or parts[0] != "wf" or len(parts) not in (2, 3):
@@ -1021,7 +1241,7 @@ def render_view(buffer_id: str, *, viewer_session_id: str = "", transcript=None,
         return render_index(root, viewer_session_id)
     store = WorkflowStore(parts[1], root).require()
     if len(parts) == 2:
-        return render_overview(store, viewer_session_id)
+        return render_overview(store, viewer_session_id, default_model)
     view = parts[2]
     if view == "definition":
         return store.definition_text()
@@ -1034,7 +1254,7 @@ def render_view(buffer_id: str, *, viewer_session_id: str = "", transcript=None,
     if QUEUE_ID.fullmatch(view):
         return render_queue(store, view)
     if GROUP_ID.fullmatch(view):
-        return render_group(store, view)
+        return render_group(store, view, default_model)
     if AGENT_ID.fullmatch(view):
         return render_agent(store, view, transcript)
     if ITEM_ID.fullmatch(view):
@@ -1063,7 +1283,9 @@ from agent_utils.files.buffer_manager import ReadonlyBufferView
 from agent_utils.session_cwd import get_session_cwd
 from agent_utils.session_repository import SessionRepository
 from agent_utils.skills import SkillSource
+from agents.llm import enabled_llm_models, require_model_enabled
 from agents.system_prompt import SystemPromptSkillList
+from agent_zoo.config_loader import CONFIG_PATH, load_layered_config
 from agent_zoo.live_session_registry import list_live_sessions
 from agent_zoo.projects import resolve_state_root
 from agent_zoo.runtime.commands import Command, CommandError, CommandResult
@@ -1100,6 +1322,59 @@ def saved_checkpoint(project: str, session_id: str, revision_id: str | None = No
     if not saved.commit_id:
         raise WorkflowError("the saved checkpoint has no committed revision")
     return saved
+
+
+def saved_model_config(config) -> dict | None:
+    """Saved config layers only: never the session's model change or CLI --set overrides."""
+    path = ((config or {}).get("_runtime_launch", {}) or {}).get("config_path")
+    try:
+        if path and Path(path).resolve() == CONFIG_PATH.resolve():
+            path = None
+        return load_layered_config(state_root=resolve_state_root(), config_path=path or None)
+    except Exception:
+        LOG.warning("Cannot read saved Agent Zoo model settings", exc_info=True)
+        return None
+
+
+def saved_default_model(config) -> str:
+    for source in (saved_model_config(config), config):
+        model = str(((source or {}).get("llm", {}) or {}).get("default") or "")
+        if model:
+            return model
+    return ""
+
+
+def check_model(config, profile: str) -> str:
+    """The profile must be configured in llm.models and enabled."""
+    profile = str(profile or "").strip()
+    models = ((config or {}).get("llm", {}) or {}).get("models", {}) or {}
+    if not models:
+        return profile  # Nothing to check against.
+    try:
+        enabled = list(enabled_llm_models(config))
+    except Exception:
+        enabled = sorted(models)
+    choices = ", ".join(enabled) or "none"
+    if profile not in models:
+        raise WorkflowError(f'unknown model profile "{profile}"; enabled profiles: {choices}')
+    try:
+        require_model_enabled(config, profile)
+    except ValueError:
+        raise WorkflowError(f'model profile "{profile}" is disabled; enabled profiles: {choices}') from None
+    return profile
+
+
+def check_definition_models(definition: dict, config) -> None:
+    problems = []
+    for owner, model in [("definition", definition.get("model"))] + [
+            (group, settings.get("model")) for group, settings in definition["agents"].items()]:
+        if model:
+            try:
+                check_model(config, model)
+            except WorkflowError as exc:
+                problems.append(f"{owner}: {exc}")
+    if problems:
+        raise WorkflowError("The definition has problems:\n" + "\n".join(f"- {p}" for p in problems))
 
 
 def process_evidence(identity: dict | None) -> str:
@@ -1371,7 +1646,6 @@ class WorkflowController:
                 "config_path": str(provenance.get("config_path") or ""),
                 "config_sets": tuple(provenance.get("config_sets") or ()),
                 "env_name": str(((self.config or {}).get("pilot", {}) or {}).get("_env_name") or ""),
-                "default_model": str(((self.config or {}).get("llm", {}) or {}).get("default") or ""),
                 "cwd": get_session_cwd(state),
             }
 
@@ -1384,14 +1658,17 @@ class WorkflowController:
         if self.launch is None or self.launcher is None:
             raise WorkflowError("this session cannot launch agents (it has no project or runtime launcher)")
 
+    def default_model(self) -> str:
+        return saved_default_model(self.config)
+
+    def check_model(self, profile: str) -> str:
+        return check_model(self.config, profile)
+
     def model_for(self, definition: dict, group: dict) -> str:
-        model = group.get("model") or definition.get("model") or self.launch["default_model"]
-        models = ((self.config or {}).get("llm", {}) or {}).get("models", {}) or {}
+        model = group.get("model") or definition.get("model") or self.default_model()
         if not model:
-            raise WorkflowError("no model is configured; set model: in the definition")
-        if models and model not in models:
-            raise WorkflowError(f'unknown model "{model}"; configured models: {", ".join(sorted(models))}')
-        return model
+            raise WorkflowError("no model is configured; set one with /workflow set NAME model PROFILE")
+        return self.check_model(model)
 
     def settings_for(self, folder: str, model: str) -> RuntimeSettings:
         launch = self.launch
@@ -1916,6 +2193,56 @@ class WorkflowController:
                 text += f" This session does not control {name}; run it to start new agents."
             return text
 
+    def change_setting(self, name: str, kind: str, target: str | None, setting: str, raw: str) -> str:
+        """Apply one /workflow set change and describe its effect."""
+        with self.lock:
+            store = WorkflowStore(name).require()
+            change = prepare_setting(store, kind, target, setting, raw, check_model=self.check_model,
+                                     default_model=self.default_model())
+            label, setting = change["label"], change["setting"]
+            if change["unchanged"]:
+                return f"{label} {setting} is already {change['new_text']}; nothing changed."
+            result = store.set_setting(change["section"], change["name"], change["key"], change["value"],
+                                       reason=change["reason"], by="user")
+            text = (f"Set {label} {setting} from {change['old_text']} to {change['new_text']} "
+                    f"(def_{result['version']}).")
+            definition = store.definition()
+            active = [a for a in store.agents() if a["state"] in ACTIVE_STATES]
+            if setting == "count":
+                if change["value"] < int(change["old_text"]):
+                    text += " Extra running agents finish their current item first."
+                elif name in self.managed:
+                    started = self.tick(name)
+                    text += (" " + " ".join(started)) if started else ""
+                elif store.control().get("state") == "running":
+                    text += " The session controlling it will start agents shortly."
+                else:
+                    text += f" {name} is paused; agents start when it runs."
+            elif setting == "model":
+                stale = []
+                for agent in active:
+                    group = definition["agents"].get(agent["group"])
+                    if kind == "group" and agent["group"] != target or group is None:
+                        continue
+                    model, _ = effective_model(definition, group, self.default_model())
+                    if agent.get("model") and agent["model"] != model:
+                        stale.append(f"{agent['id']} ({agent['model']})")
+                text += " New agents use it."
+                if stale:
+                    text += (f" {', '.join(stale)} keep their current model; restart them with restart_agent "
+                             "or let them finish to switch.")
+            elif setting == "folder":
+                scope = [a["id"] for a in active if kind == "workflow" or a["group"] == target]
+                text += " New agents start there."
+                if scope:
+                    text += f" {', '.join(scope)} keep their current folder."
+            elif setting == "every":
+                text += " It applies from the group's next start."
+            elif setting == "notify":
+                text += (f" The controlling agent will be told about new items in {target}."
+                         if change["value"] else f" New items in {target} no longer notify anyone.")
+            return text
+
     # -- startup adoption ---------------------------------------------------------
 
     def adopt(self, state) -> None:
@@ -2046,6 +2373,7 @@ class WorkflowsPlugin:
     def create_workflow(self, state, workflow_name, definition_buffer):
         store = WorkflowStore(workflow_name)
         text = buffer_text(state, definition_buffer)
+        check_definition_models(parse_definition(split_version(text)[1]), self.controller.config)
         definition = store.create(text, by=self.controller.me_label())
         store.update_control(default_folder=get_session_cwd(state))
         groups = "\n".join(f"  {g}: {describe_group(s)}" for g, s in definition["agents"].items())
@@ -2061,6 +2389,7 @@ class WorkflowsPlugin:
         if not str(reason or "").strip():
             raise WorkflowError("reason is required: one sentence saying why the definition changed")
         text = buffer_text(state, definition_buffer)
+        check_definition_models(parse_definition(split_version(text)[1]), self.controller.config)
         result = store.update(text, reason=str(reason).strip(), by=self.controller.me_label(),
                               preview_only=bool(preview_only))
         effects = "\n".join(f"- {e}" for e in result["effects"])
@@ -2317,7 +2646,22 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
 # Slash command
 # ---------------------------------------------------------------------------
 
-USAGE = "/workflow | /workflow run NAME [GROUP] | /workflow pause NAME [GROUP]"
+USAGE = ("/workflow  |  /workflow NAME[:GROUP]  |  /workflow run NAME[:GROUP]  |  /workflow pause NAME[:GROUP]  |  "
+         "/workflow set NAME[:GROUP|:QUEUE] [SETTING VALUE]")
+
+
+def parse_target(text: str, *, allow_queue: bool = False) -> tuple[str, str, str | None]:
+    """Parse ``miner``, ``miner:grp_reverse`` or (if allowed) ``miner:q_catalog``."""
+    name, _, part = str(text).partition(":")
+    name = check_workflow_name(name)
+    if not part:
+        return name, "workflow", None
+    if allow_queue and part.startswith("q_"):
+        return name, "queue", check_queue_id(part)
+    if part.startswith("grp_"):
+        return name, "group", check_group_id(part)
+    kinds = "an agent group (grp_...) or a queue (q_...)" if allow_queue else "an agent group (grp_...)"
+    raise WorkflowError(f'"{part}" is not {kinds}; did you mean {name}:{suggest_id("grp_", part)}?')
 
 
 def parse_command(raw_args: str) -> dict:
@@ -2328,18 +2672,38 @@ def parse_command(raw_args: str) -> dict:
     if not tokens or tokens == ["list"]:
         return {"action": "list"}
     action = tokens[0].lower()
-    if action not in {"run", "pause"}:
-        raise WorkflowError(f'unknown action "{tokens[0]}". Usage: {USAGE}')
-    if len(tokens) not in (2, 3):
-        raise WorkflowError(f"Usage: {USAGE}")
-    name = check_workflow_name(tokens[1])
-    group = check_group_id(tokens[2]) if len(tokens) == 3 else None
-    return {"action": action, "name": name, "group": group}
+    if action in {"run", "pause"}:
+        if len(tokens) == 3 and ":" not in tokens[1]:
+            raise WorkflowError(f"name the group with a colon: /workflow {action} {tokens[1]}:{tokens[2]}")
+        if len(tokens) != 2:
+            raise WorkflowError(f"usage: /workflow {action} NAME[:GROUP], e.g. /workflow {action} miner:grp_reverse")
+        name, kind, target = parse_target(tokens[1])
+        return {"action": action, "name": name, "group": target}
+    if action == "set":
+        if len(tokens) < 2:
+            raise WorkflowError("usage: /workflow set NAME[:GROUP|:QUEUE] SETTING VALUE, e.g. "
+                                "/workflow set miner:grp_reverse count 4")
+        name, kind, target = parse_target(tokens[1], allow_queue=True)
+        if len(tokens) == 2:
+            return {"action": "settings", "name": name, "kind": kind, "target": target}
+        if len(tokens) == 3:
+            raise WorkflowError(f"give a value, e.g. /workflow set {tokens[1]} {tokens[2]} VALUE; "
+                                f"see the settings with /workflow set {tokens[1]}")
+        return {"action": "set", "name": name, "kind": kind, "target": target,
+                "setting": tokens[2].lower(), "value": " ".join(tokens[3:])}
+    if len(tokens) == 1:
+        name, kind, target = parse_target(tokens[0], allow_queue=True)
+        return {"action": "show", "name": name, "kind": kind, "target": target}
+    raise WorkflowError(f'unknown command "{tokens[0]}". Usage: {USAGE}')
 
 
 class WorkflowCommand:
     def __init__(self, plugin: WorkflowsPlugin):
         self.plugin = plugin
+
+    @staticmethod
+    def document(title: str, text: str) -> CommandResult:
+        return CommandResult(outputs=(InspectorDocument(title=title, body=text, format="text"),))
 
     def __call__(self, ctx, *, raw_args=""):
         controller = self.plugin.controller
@@ -2348,26 +2712,57 @@ class WorkflowCommand:
             if worker_identity(ctx.state):
                 raise WorkflowError("workflow agents cannot control workflows")
             controller.bind(ctx.state)
+            viewer = (controller.me or {}).get("session_id", "")
             if request["action"] == "list":
-                text = render_index(None, (controller.me or {}).get("session_id", ""))
-                return CommandResult(outputs=(InspectorDocument(title="Workflows", body=text, format="text"),))
-            WorkflowStore(request["name"]).require()
+                return self.document("Workflows", render_index(None, viewer))
+            store = WorkflowStore(request["name"]).require()
+            if request["action"] == "show":
+                kind, target = request["kind"], request["target"]
+                if kind == "workflow":
+                    text = render_overview(store, viewer, controller.default_model())
+                elif kind == "group":
+                    text = render_group(store, target, controller.default_model())
+                else:
+                    text = render_queue(store, target)
+                return self.document(target_label(store, kind, target), text)
+            if request["action"] == "settings":
+                text = render_settings(store, request["kind"], request["target"], controller.default_model())
+                return self.document(f"Settings: {target_label(store, request['kind'], request['target'])}", text)
+            if request["action"] == "set":
+                # Validate now so mistakes are reported without touching the workflow.
+                change = prepare_setting(store, request["kind"], request["target"], request["setting"],
+                                         request["value"], check_model=controller.check_model,
+                                         default_model=controller.default_model())
+                if change["unchanged"]:
+                    return CommandResult.notice(
+                        f"{change['label']} {change['setting']} is already {change['new_text']}; nothing changed.")
             if request["action"] == "run":
                 controller.require_launch()
         except WorkflowError as exc:
             raise CommandError(str(exc)) from exc
-        action = controller.run if request["action"] == "run" else controller.pause
+
+        if request["action"] == "set":
+            def action():
+                return controller.change_setting(request["name"], request["kind"], request["target"],
+                                                 request["setting"], request["value"])
+            receipt = f"Setting {change['label']} {change['setting']} to {change['new_text']}..."
+        else:
+            method = controller.run if request["action"] == "run" else controller.pause
+
+            def action():
+                return method(request["name"], request["group"])
+            verb = "Running" if request["action"] == "run" else "Pausing"
+            scope = f"{request['name']}:{request['group']}" if request["group"] else request["name"]
+            receipt = f"{verb} {scope}..."
 
         async def work():
             try:
-                return {"ok": True, "text": await asyncio.to_thread(action, request["name"], request["group"])}
+                return {"ok": True, "text": await asyncio.to_thread(action)}
             except Exception as exc:
                 return {"ok": False, "text": f"Workflow {request['name']}: {exc}"}
 
         ctx.defer(work, then=self.complete)
-        verb = "Running" if request["action"] == "run" else "Pausing"
-        scope = f"{request['group']} in {request['name']}" if request["group"] else request["name"]
-        return CommandResult.notice(f"{verb} {scope}...")
+        return CommandResult.notice(receipt)
 
     @staticmethod
     def complete(ctx, result):
@@ -2387,14 +2782,19 @@ class WorkflowBuffers:
     writes = {"buffer_manager"}
     optional_reads = {"_session_id", "_agent_zoo_context"}
 
+    def __init__(self, plugin: "WorkflowsPlugin | None" = None):
+        self.plugin = plugin
+
     def __call__(self, state):
         state.buffer_manager.register_special_buffer_namespace("wf:", self.render, replace=True)
         return state
 
-    @staticmethod
-    def render(state, buffer_id):
+    def render(self, state, buffer_id):
         if not buffer_id.startswith("wf:"):
             return None
+        default_model = ""
+        if self.plugin is not None and not worker_identity(state):
+            default_model = self.plugin.controller.default_model()
 
         def transcript(session_id):
             parts = buffer_id.split(":")
@@ -2402,7 +2802,7 @@ class WorkflowBuffers:
             return saved_transcript(agent.get("project") or "default", session_id)
 
         text = render_view(buffer_id, viewer_session_id=str(getattr(state, "_session_id", "") or ""),
-                           transcript=transcript)
+                           transcript=transcript, default_model=default_model)
         if text is None:
             return None
         return ReadonlyBufferView(id=buffer_id, path=f"workflow://{buffer_id[3:]}", text=text)
@@ -2502,7 +2902,7 @@ class WorkflowNotices(InterruptCheck):
 
     def __call__(self, state):
         if getattr(state, "buffer_manager", None) is not None:
-            WorkflowBuffers()(state)  # Paused startups skip ordinary components.
+            WorkflowBuffers(self.plugin)(state)  # Paused startups skip ordinary components.
         if worker_identity(state):
             self.remind_worker(state)
             return state
@@ -2575,8 +2975,8 @@ def register_features(builder, *, session, config):
         feature = builder._features["rlm"]
         builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
     builder.add(Feature("workflows", components=[
-        WorkflowBuffers(), WorkflowNotices(plugin), *build_tools(plugin),
-        Command("/workflow", "List, run or pause workflows", WorkflowCommand(plugin), raw=True,
+        WorkflowBuffers(plugin), WorkflowNotices(plugin), *build_tools(plugin),
+        Command("/workflow", "List, show, run, pause or change workflows", WorkflowCommand(plugin), raw=True,
                 usage=USAGE, section="Workflows"),
     ], order=[RegisterSpecialBuffers, WorkflowBuffers, Command, WorkflowNotices, InterruptDelivery,
               ToolDispatchStart]))

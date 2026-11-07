@@ -24,10 +24,27 @@ item `item_42`, version `def_4`. `q_trash` always exists.
 ## Commands
 
 ```text
-/workflow                           list workflows and what each one is doing
-/workflow run NAME [GROUP]          run it from this session
-/workflow pause NAME [GROUP]        pause it; no work is lost
+/workflow                                   list workflows
+/workflow miner[:grp_reverse | :q_catalog]  show a workflow, group or queue, including models and counts
+/workflow run miner[:grp_reverse]           run it from this session
+/workflow pause miner[:grp_reverse]         pause it; no work is lost
+/workflow set miner[:grp_reverse | :q_catalog] SETTING VALUE
+/workflow set miner:grp_reverse             list what you can set there, with current values
 ```
+
+| Target | Setting | Values | Takes effect |
+|---|---|---|---|
+| `miner` | `model` | a model profile, or `default` | agents started afterward |
+| `miner` | `folder` | a path, or `default` | agents started afterward |
+| `miner:grp_*` | `count` | 0–64 | immediately |
+| `miner:grp_*` | `model` | a model profile, or `default` | agents started afterward |
+| `miner:grp_*` | `every` | a duration like `30m`, or `off` | the next start |
+| `miner:grp_*` | `folder` | a path, or `default` | agents started afterward |
+| `miner:q_*` | `notify` | `on` or `off` | immediately |
+
+Each change records a new definition version. Model profiles must exist in
+`llm.models` and be enabled. Without a `model:` setting, agents use your saved
+Agent Zoo default (not a session's model change or a `--set` override).
 
 ## Agent tools
 
