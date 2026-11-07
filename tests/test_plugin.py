@@ -378,7 +378,7 @@ def test_command_parsing_and_dispatch(runtime):
     session = SimpleNamespace(state=runtime.state, inject=Mock())
     ctx = SimpleNamespace(state=runtime.state, session=session, defer=Mock())
     listing = command(ctx, raw_args="")
-    assert listing.outputs[0].body.startswith("- `miner` · paused · 3 waiting · 0 done · just now\n")
+    assert listing.outputs[0].body.startswith("| Workflow | Description | Status | Waiting | Done | Updated |")
     with pytest.raises(CommandError, match="usage"):
         command(ctx, raw_args=" run")
     with pytest.raises(CommandError, match="name the group with a colon: /workflow run miner:grp_reverse"):
@@ -417,10 +417,14 @@ def test_command_list_archive_and_rename(runtime):
     ctx = command_context(runtime)
     listing = command(ctx, raw_args="").outputs[0]
     assert listing.format == "markdown" and listing.subtitle == "2 paused"
-    assert ("- `miner` · paused · 3 waiting · 0 done · just now\n"
-            "  - discovery every 30m → reverse ×2\n") in listing.body
-    assert "- `scratch` · paused · 0 waiting · 0 done · just now\n" in listing.body
-    assert "/workflow rename NAME NEW_NAME" in listing.body.splitlines()[-1]
+    now = wf.unbroken("just now")
+    assert f"| `miner` | — | paused | 3 | 0 | {now} |" in listing.body
+    assert f"| `scratch` | — | paused | 0 | 0 | {now} |" in listing.body
+    assert "discovery" not in listing.body
+    assert '`/workflow set NAME description "..."`' in listing.body
+    command(ctx, raw_args=' set scratch description "Throwaway test of archiving"')
+    assert "It shows in /workflow list" in finish_deferred(ctx)["text"]
+    assert "| `scratch` | Throwaway test of archiving | paused |" in command(ctx, raw_args="").outputs[0].body
 
     assert command(ctx, raw_args=" archive scratch").outputs[0].text == "Archiving scratch..."
     assert finish_deferred(ctx)["ok"]
@@ -429,7 +433,8 @@ def test_command_list_archive_and_rename(runtime):
     assert listing.subtitle == "1 paused · 1 archived"
     archived = command(ctx, raw_args=" list archived").outputs[0]
     assert archived.title == "Archived workflows"
-    assert archived.body.startswith("- `scratch` · 0 waiting · 0 done · just now\n")
+    assert archived.body.startswith("| Workflow | Description | Waiting | Done | Updated |")
+    assert f"| `scratch` | Throwaway test of archiving | 0 | 0 | {now} |" in archived.body
     with pytest.raises(CommandError, match="already archived"):
         command(ctx, raw_args=" archive scratch")
     with pytest.raises(CommandError, match="not archived"):
@@ -446,7 +451,7 @@ def test_command_list_archive_and_rename(runtime):
     assert command(ctx, raw_args=" rename miner test_failures").outputs[0].text == "Renaming miner to test_failures..."
     assert finish_deferred(ctx)["ok"]
     assert "Renamed miner to test_failures" in ctx.session.inject.call_args.args[0]
-    assert "- `test_failures` · paused" in command(ctx, raw_args="").outputs[0].body
+    assert "| `test_failures` | — | paused |" in command(ctx, raw_args="").outputs[0].body
     command(ctx, raw_args=" unarchive scratch")
     finish_deferred(ctx)
     assert command(ctx, raw_args="").outputs[0].subtitle == "2 paused"
@@ -460,7 +465,8 @@ def test_list_when_empty_or_all_archived(runtime):
     create(runtime)
     runtime.controller.archive("miner")
     listing = command(ctx, raw_args="").outputs[0]
-    assert listing.body.startswith("No active workflows.") and "1 archived workflow hidden · `/workflow list archived`" in listing.body
+    assert listing.body.startswith("No active workflows.")
+    assert "1 archived workflow hidden: `/workflow list archived`" in listing.body
     assert "miner" in wf.render_index() and "Archived" in wf.render_index()
 
 
@@ -471,7 +477,7 @@ def test_command_show_and_settings(runtime):
     assert command(ctx, raw_args=" list").outputs[0].title == "Workflows"
     overview = command(ctx, raw_args=" view miner").outputs[0]
     assert overview.format == "markdown" and overview.title == "miner" and overview.subtitle == "paused · def_1"
-    assert "**Model** `offline`" in overview.body and "| `grp_reverse` | `q_targets` |" in overview.body
+    assert "**Model** `offline`" in overview.body and "| `grp_reverse` | q_targets | q_catalog |" in overview.body
     group = command(ctx, raw_args=" view miner:grp_reverse").outputs[0]
     assert "**Model** `offline` (Agent Zoo default)" in group.body and group.subtitle.startswith("takes from")
     queue = command(ctx, raw_args=" view miner:q_targets").outputs[0]

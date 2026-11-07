@@ -38,6 +38,7 @@ item `item_42`, version `def_4`. `q_trash` always exists.
 
 | Target | Setting | Values | Takes effect |
 |---|---|---|---|
+| `miner` | `description` | one line of text, or `none` | immediately; shown in `/workflow list` |
 | `miner` | `model` | a model profile, or `default` | agents started afterward |
 | `miner` | `folder` | a path, or `default` | agents started afterward |
 | `miner:grp_*` | `count` | 0–64 | immediately |

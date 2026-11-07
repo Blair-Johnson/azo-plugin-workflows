@@ -279,18 +279,18 @@ def test_relative_time():
     assert wf.relative_time("2025-12-30T00:00:00+00:00", now) == "3d ago"
     assert wf.relative_time("garbage", now) == "unknown"
 
-
-def test_pipeline_text_orders_stages_through_cycles():
-    definition = wf.parse_definition("""\
-queues: { q_in: {}, q_failures: {}, q_outdated: {}, q_bugs: {}, q_merge: {}, q_done: {}, q_blocked: {} }
-agents:
-  grp_discover: { takes_from: q_in, sends_to: [q_failures, q_blocked], instructions: x }
-  grp_triage: { count: 3, takes_from: q_failures, sends_to: [q_outdated, q_bugs, q_blocked], instructions: x }
-  grp_update: { count: 2, takes_from: q_outdated, sends_to: [q_merge, q_bugs], instructions: x }
-  grp_fix: { count: 2, takes_from: q_bugs, sends_to: [q_merge, q_outdated], instructions: x }
-  grp_merge: { takes_from: q_merge, sends_to: [q_done], instructions: x }
-""")
-    assert wf.pipeline_text(definition) == "discover → triage ×3 → update ×2, fix ×2 → merge"
+def test_description_is_optional_text_and_settable(store):
+    assert wf.parse_definition(DEFINITION)["description"] is None
+    with pytest.raises(wf.WorkflowError, match="description must be text"):
+        wf.parse_definition("description: 3\n" + DEFINITION)
+    change = wf.prepare_setting(store, "workflow", None, "description", "Catalog model checkpoints")
+    assert change["old_text"] == "none" and change["new_text"] == "Catalog model checkpoints"
+    store.set_setting(None, None, "description", change["value"], reason=change["reason"], by="user")
+    assert store.definition()["description"] == "Catalog model checkpoints"
+    assert "Catalog model checkpoints" in wf.render_index(store.root)
+    assert wf.prepare_setting(store, "workflow", None, "description", "none")["value"] is None
+    with pytest.raises(wf.WorkflowError, match="description is set on the workflow"):
+        wf.prepare_setting(store, "group", "grp_reverse", "description", "x")
 
 
 def test_list_puts_running_first_then_newest(store):
@@ -301,8 +301,14 @@ def test_list_puts_running_first_then_newest(store):
         log.write('{"at": "2999-01-01T00:00:00+00:00", "event": "x"}\n')
     subtitle, body = wf.render_list(store.root)
     assert subtitle == "1 running · 1 paused"
-    assert body.splitlines()[0].startswith("- `miner` · running in session abcdef01 · 0 waiting")
-    assert body.splitlines()[2].startswith("- `older` · paused")
+    rows = [line for line in body.splitlines() if line.startswith("| `")]
+    assert rows[0].startswith("| `miner` | — | running |")
+    assert rows[1].startswith("| `older` | — | paused |")
+    other.update_agent(other.new_agent("grp_reverse", version=1, item_id=None, sends_to=[], folder="/tmp",
+                                       model=None)["id"], state="attention", problem="stuck")
+    store.update_control(state="paused")
+    rows = [line for line in wf.render_list(store.root)[1].splitlines() if line.startswith("| `")]
+    assert rows[0].startswith(f"| `older` | — | {wf.unbroken('⚠ attention')} |")
 
 
 def test_markdown_views(store):
@@ -312,7 +318,7 @@ def test_markdown_views(store):
     subtitle, body = wf.render_overview_md(store, default_model="offline")
     assert subtitle == "paused · def_1"
     assert "**Model** `offline` · **Folder** `/tmp/miner`" in body
-    assert "| `grp_discovery` | standing, every 30m | `q_targets` | 0 of 1 running · 0 finished |" in body
+    assert "| `grp_discovery` | standing, every 30m | q_targets | 0 of 1 running · 0 finished |" in body
     assert "| `q_catalog` | 0 | 0 | 0 | notifies the controlling agent |" in body
     assert "| `q_trash` | 1 | 0 | 0 | discarded items |" in body
     assert "Model |" not in body  # Every group uses the workflow's model.

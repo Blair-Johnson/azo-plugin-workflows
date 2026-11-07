@@ -42,6 +42,7 @@ wf:miner:log                every event, newest first
 ## Writing a definition
 
 ```yaml
+description: Summarize new sparse-attention papers   # one line, shown in the user's /workflow list
 folder: ~/work/papers            # working directory for agents (optional)
 model: claude-sonnet-5-5         # model profile for agents (optional; else the saved Agent Zoo default)
 queues:
@@ -65,6 +66,8 @@ agents:
       {{item}}
 ```
 
+Always give a workflow a short `description`: it is how the user recognizes it in
+`/workflow list`.
 Group settings: `count` (agents at once, default 1), `takes_from`, `sends_to`,
 `every` (only without `takes_from`), `instructions` (required), `folder`, `model`.
 Queue settings: `notify_on_new`.
@@ -141,9 +144,10 @@ queues with `notify_on_new`. Read `wf:<name>` for everything else.
 /workflow set miner:grp_reverse                  list the settings there, with current values
 ```
 
-Settings the user can change directly: `model` and `folder` on the workflow;
+Settings the user can change directly: `description`, `model` and `folder` on the workflow;
 `count`, `model`, `every` and `folder` on an agent group; `notify` on a queue.
-`default` removes a model or folder setting, and `every off` removes the interval.
+`default` removes a model or folder setting, `none` removes the description, and
+`every off` removes the interval.
 Each change records a new definition version, just like your own edits.
 
 You are told when the user runs one of these. The result is marked as already

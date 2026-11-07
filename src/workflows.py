@@ -38,11 +38,12 @@ AGENT_STATES = ACTIVE_STATES | {"finished", "stopped", "attention", "restarted"}
 
 RESERVED_NAMES = {"index", "list", "view", "run", "pause", "set", "rename", "archive", "unarchive", "archived"}
 
-TOP_KEYS = {"version", "folder", "model", "queues", "agents"}
+TOP_KEYS = {"version", "description", "folder", "model", "queues", "agents"}
 QUEUE_KEYS = {"notify_on_new"}
 GROUP_KEYS = {"count", "takes_from", "sends_to", "every", "instructions", "folder", "model"}
 
 EXAMPLE_DEFINITION = """\
+description: Summarize new sparse-attention papers   # one line, shown in /workflow list
 folder: ~/work/papers            # working directory for agents (optional)
 queues:
   q_papers: {}
@@ -323,9 +324,10 @@ def parse_definition(text: str) -> dict:
         }
     folder = optional_text("definition", "folder", raw.get("folder"))
     model = optional_text("definition", "model", raw.get("model"))
+    description = optional_text("definition", "description", raw.get("description"))
     if problems:
         raise WorkflowError("The definition has problems:\n" + "\n".join(f"- {p}" for p in problems))
-    return {"folder": folder, "model": model, "queues": queues, "agents": groups}
+    return {"description": description, "folder": folder, "model": model, "queues": queues, "agents": groups}
 
 
 def yaml_scalar(value) -> str:
@@ -896,9 +898,10 @@ def describe_group(group: dict) -> str:
 # Simple settings (/workflow set)
 # ---------------------------------------------------------------------------
 
-SETTINGS = {"workflow": ("model", "folder"), "group": ("count", "model", "every", "folder"),
+SETTINGS = {"workflow": ("description", "model", "folder"), "group": ("count", "model", "every", "folder"),
             "queue": ("notify",)}
 SETTING_PLACE = {"count": "an agent group", "every": "an agent group", "notify": "a queue",
+                 "description": "the workflow",
                  "model": "the workflow or an agent group", "folder": "the workflow or an agent group"}
 
 
@@ -919,6 +922,8 @@ def settings_example(store: "WorkflowStore", definition: dict, setting: str) -> 
     if setting == "notify":
         queue = next(iter(definition["queues"]), "q_results")
         return f"/workflow set {store.name}:{queue} notify on"
+    if setting == "description":
+        return f'/workflow set {store.name} description "What this workflow is for"'
     group = next(iter(definition["agents"]), "grp_name")
     value = {"count": "4", "every": "30m", "model": "PROFILE", "folder": "PATH"}[setting]
     return f"/workflow set {store.name}:{group} {setting} {value}"
@@ -933,7 +938,7 @@ def prepare_setting(store: "WorkflowStore", kind: str, target: str | None, setti
     known = sorted({s for names in SETTINGS.values() for s in names})
     if setting not in known:
         raise WorkflowError(f'unknown setting "{setting}"; you can set: count, model, every and folder on '
-                            f"agent groups, model and folder on the workflow, and notify on queues. "
+                            f"agent groups, description, model and folder on the workflow, and notify on queues. "
                             f"See what {label} has with /workflow set {label}")
     if setting not in SETTINGS[kind]:
         raise WorkflowError(f"{setting} is set on {SETTING_PLACE[setting]}; for example: "
@@ -980,16 +985,17 @@ def prepare_setting(store: "WorkflowStore", kind: str, target: str | None, setti
         value = word in {"on", "true", "yes"}
         old_text, new_text = ("on" if queue["notify_on_new"] else "off"), ("on" if value else "off")
         unchanged = value == queue["notify_on_new"]
-    else:  # model or folder
+    else:  # description, model or folder
         current = (group or definition).get(setting)
-        if word == "default":
+        unset = "none" if setting == "description" else "default"
+        if word == unset:
             value = None
         elif setting == "model":
             value = check_model(raw) if check_model else raw
         else:
             value = raw
-        old_text = current or "default"
-        new_text = value or "default"
+        old_text = current or unset
+        new_text = value or unset
         unchanged = (current or None) == value
     return {"kind": kind, "target": target, "label": label, "setting": setting, "section": section,
             "name": name, "key": key, "value": value, "old_text": old_text, "new_text": new_text,
@@ -1008,6 +1014,8 @@ def render_settings(store: "WorkflowStore", kind: str, target: str | None, defau
     if kind == "workflow":
         model, source = effective_model(definition, None, default_model)
         folder = definition["folder"] or control.get("default_folder") or "the session's folder"
+        rows.append(["`description`", definition["description"] or "none",
+                     "shown in `/workflow list`; `none` removes it"])
         rows.append(["`model`", f"`{model}`",
                      ("set on the workflow" if definition["model"] else source) + "; `default` for the Agent Zoo default"])
         rows.append(["`folder`", f"`{folder}`",
@@ -1110,7 +1118,8 @@ def render_index(root: Path | None = None, viewer_session_id: str = "") -> str:
                 f"{active} agents active, {waiting} items waiting")
         if attention:
             line += f", {attention} agents need attention"
-        lines.append(line)
+        description = store.definition().get("description")
+        lines.append(line + (f". {description}" if description else ""))
     if archived:
         lines.append(f"Archived (hidden from the user's /workflow list; command_workflow unarchive restores one): "
                      + ", ".join(archived))
@@ -1140,120 +1149,78 @@ def relative_time(at: str, now: datetime | None = None) -> str:
     return then.astimezone().strftime("%Y-%m-%d")
 
 
-def pipeline_text(definition: dict) -> str:
-    """The agent groups in the order work flows through them, e.g. find → fix ×3, test → merge.
-
-    A group comes one stage after the earliest group that sends to the queue it takes from.
-    Groups nothing feeds (standing groups, or ones taking user-added items) start the pipeline.
-    """
-    groups = definition["agents"]
-    if not groups:
-        return "no agent groups"
-    feeders = {name: {other for other, s in groups.items()
-                      if other != name and settings["takes_from"] in s["sends_to"]}
-               for name, settings in groups.items()}
-    stage = {name: 0 for name in groups if not feeders[name]}
-    if not stage:
-        stage[next(iter(groups))] = 0
-    frontier = list(stage)
-    while frontier:
-        nxt = []
-        for name in groups:
-            if name not in stage and feeders[name] & set(frontier):
-                stage[name] = stage[frontier[0]] + 1
-                nxt.append(name)
-        frontier = nxt
-    last = max(stage.values())
-    for name in groups:  # Fed only by a cycle that never reaches a starting group.
-        stage.setdefault(name, last + 1)
-
-    def label(name):
-        settings = groups[name]
-        text = name.removeprefix("grp_")
-        if settings["count"] != 1:
-            text += f" ×{settings['count']}"
-        if settings["every"]:
-            text += f" every {settings['every_text']}"
-        return text
-
-    stages = [[label(n) for n in groups if stage[n] == i] for i in range(max(stage.values()) + 1)]
-    return " → ".join(", ".join(names) for names in stages if names)
+NBSP = "\u00a0"  # The TUI wraps table cells only at ordinary spaces.
 
 
-def workflow_entry(store: WorkflowStore, viewer_session_id: str = "") -> dict:
-    """One workflow in the /workflow list. Never raises: a damaged workflow still gets an entry."""
-    def count(states, records):
-        return sum(r["state"] in states for r in records)
+def unbroken(text: str) -> str:
+    return str(text).replace(" ", NBSP)
 
+
+def workflow_row(store: WorkflowStore) -> dict:
+    """One workflow in the /workflow list. Never raises: a damaged workflow still gets a row."""
     try:
         control = store.control()
         agents = store.agents()
         items = [i for i in store.items() if i["queue"] != TRASH]
         state = control.get("state", "paused")
-        running, paused = count({"starting", "running"}, agents), count({"paused"}, agents)
-        attention, taken = count({"attention"}, agents), count({"taken"}, items)
-        status = [f"running in {controller_label(control, viewer_session_id)}" if state == "running" else state]
-        if running:
-            status.append(f"{plural(running, 'agent')} working")
-        if paused:
-            status.append(f"{paused} paused mid-task")
-        if taken and not running:
-            status.append(f"{taken} in progress")
-        status += [f"{count({'waiting'}, items)} waiting", f"{count({'done'}, items)} done"]
-        if attention:
-            status.append(f"⚠ {attention} {'needs' if attention == 1 else 'need'} attention")
-        pipeline = pipeline_text(store.definition())
+        attention = state_count(agents, "attention")
+        description = store.definition().get("description") or "—"
         last = store.last_activity()
+        counts = [state_count(agents, "starting", "running"), state_count(items, "waiting"),
+                  state_count(items, "done")]
     except Exception as exc:  # Show the problem in the list instead of hiding the workflow.
-        state, status, pipeline, last = "paused", ["unreadable"], f"could not read it: {exc}", ""
-    status.append(relative_time(last) if last else "never active")
-    return {"name": store.name, "state": state, "last": last, "status": status, "pipeline": pipeline}
+        state, attention, description, last, counts = "paused", 0, f"Could not read it: {exc}", "", ["?"] * 3
+    return {"name": store.name, "state": state, "last": last, "attention": attention,
+            "cells": [f"`{store.name}`", description, unbroken("⚠ attention" if attention else state), *counts,
+                      unbroken(relative_time(last) if last else "never")]}
 
 
-def workflow_entries(entries: list[dict], *, show_state: bool = True) -> list[str]:
-    """Two lines each: name and status, then the pipeline. Running first, then most recent."""
-    ordered = sorted(entries, key=lambda e: e["last"], reverse=True)
-    ordered.sort(key=lambda e: e["state"] != "running")
-    lines = []
-    for entry in ordered:
-        status = entry["status"] if show_state else entry["status"][1:]
-        lines += [f"- `{entry['name']}` · " + " · ".join(status), f"  - {entry['pipeline']}"]
-    return lines
-
-
-LIST_COMMANDS = ("`/workflow view|run|pause|archive NAME` · `/workflow rename NAME NEW_NAME` · "
-                 "`/workflow set NAME`")
+def workflow_table(rows: list[dict], *, show_status: bool = True) -> list[str]:
+    """Running first, then most recently active. Only Description is free text; it absorbs the width."""
+    ordered = sorted(rows, key=lambda r: r["last"], reverse=True)
+    ordered.sort(key=lambda r: (r["state"] != "running", not r["attention"]))
+    headers = ["Workflow", "Description", "Status", "Agents", "Waiting", "Done", "Updated"]
+    cells = [list(r["cells"]) for r in ordered]
+    # Agent counts only matter while something runs; a column of zeros is noise.
+    hidden = {2} if not show_status else set()
+    if all(c[3] == 0 for c in cells):
+        hidden.add(3)
+    return md_table([h for i, h in enumerate(headers) if i not in hidden],
+                    [[v for i, v in enumerate(c) if i not in hidden] for c in cells])
 
 
 def render_list(root: Path | None = None, viewer_session_id: str = "", *,
                 archived: bool = False) -> tuple[str, str]:
     """Subtitle and markdown body for /workflow list (or /workflow list archived)."""
-    entries = [workflow_entry(WorkflowStore(name, root), viewer_session_id) for name in list_workflow_names(root)]
-    shelved = [e for e in entries if e["state"] == "archived"]
-    current = [e for e in entries if e["state"] != "archived"]
-    tally = {state: sum(e["state"] == state for e in current) for state in ("running", "paused")}
-    tally["paused"] = len(current) - tally["running"]
-    tally["archived"] = len(shelved)
+    rows = [workflow_row(WorkflowStore(name, root)) for name in list_workflow_names(root)]
+    shelved = [r for r in rows if r["state"] == "archived"]
+    current = [r for r in rows if r["state"] != "archived"]
+    running = sum(r["state"] == "running" for r in current)
+    tally = {"running": running, "paused": len(current) - running, "archived": len(shelved)}
     subtitle = " · ".join(f"{n} {state}" for state, n in tally.items() if n)
 
     if archived:
         if not shelved:
             return subtitle, "No archived workflows. Hide a one-off workflow with `/workflow archive NAME`.\n"
-        lines = [*workflow_entries(shelved, show_state=False), "",
-                 "`/workflow unarchive NAME` brings one back, paused. "
-                 "`/workflow rename NAME NEW_NAME` frees its name."]
+        lines = [*workflow_table(shelved, show_status=False), "",
+                 "Bring one back with `/workflow unarchive NAME`."]
         return subtitle, "\n".join(lines) + "\n"
 
-    if not entries:
+    if not rows:
         return subtitle, ("No workflows yet. Ask the agent to set one up, for example *“make a workflow that fixes "
                           "each failing test with its own agent”*. Nothing runs until you start it with "
                           "`/workflow run NAME`.\n")
-    lines = workflow_entries(current) if current else ["No active workflows."]
+    lines = workflow_table(current) if current else ["No active workflows."]
     lines.append("")
+    if any(r["attention"] for r in current):
+        lines.append("⚠ Some agents need attention; `/workflow view NAME` shows what happened.")
+    if any(r["cells"][1] == "—" for r in current):
+        lines.append('Add a description with `/workflow set NAME description "..."`.')
+    lines.append("Open one with `/workflow view NAME`. Other commands: run, pause, set, rename, archive.")
     if shelved:
-        lines.append(f"{plural(len(shelved), 'archived workflow')} hidden · `/workflow list archived`")
-    lines.append(LIST_COMMANDS)
+        lines.append(f"{plural(len(shelved), 'archived workflow')} hidden: `/workflow list archived`.")
     return subtitle, "\n".join(lines) + "\n"
+
 
 # -- the /workflow view popups (markdown) ----------------------------------------
 
@@ -1269,7 +1236,7 @@ def shorten_ids(text) -> str:
 
 
 def md_cell(value) -> str:
-    return " ".join(str(value).split()).replace("|", "\\|")
+    return re.sub(r"[ \t\r\n]+", " ", str(value)).strip().replace("|", "\\|")
 
 
 def md_table(headers: list[str], rows: list[list]) -> list[str]:
@@ -1352,10 +1319,11 @@ def render_overview_md(store: WorkflowStore, viewer_session_id: str = "",
     paused_groups = set(control.get("paused_groups") or []) if state == "running" else set()
     rows = []
     for group, settings in groups.items():
-        source = f"`{settings['takes_from']}`" if settings["takes_from"] else "standing"
+        # Plain text: the TUI pads inline code with spaces, which reads badly before a comma.
+        source = settings["takes_from"] or "standing"
         if settings["every"]:
             source += f", every {settings['every_text']}"
-        row = [f"`{group}`", source, ", ".join(f"`{q}`" for q in settings["sends_to"]) or "—",
+        row = [f"`{group}`", source, ", ".join(settings["sends_to"]) or "—",
                agents_summary(settings["count"], [a for a in agents if a["group"] == group], group in paused_groups)]
         rows.append(row + ([f"`{models[group]}`"] if show_models else []))
     headers = ["Group", "Takes from", "Sends to", "Agents"] + (["Model"] if show_models else [])
@@ -2778,6 +2746,8 @@ class WorkflowController:
                     text += f" {', '.join(scope)} keep their current folder."
             elif setting == "every":
                 text += " It applies from the group's next start."
+            elif setting == "description":
+                text += " It shows in /workflow list."
             elif setting == "notify":
                 text += (f" The controlling agent will be told about new items in {target}."
                          if change["value"] else f" New items in {target} no longer notify anyone.")
