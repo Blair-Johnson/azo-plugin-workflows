@@ -163,7 +163,9 @@ def test_crashed_agent_resumes_from_checkpoint(runtime, monkeypatch):
     store = create(runtime)
     runtime.controller.run("miner")
     runtime.controller.tick("miner")
-    monkeypatch.setattr(wf, "saved_checkpoint", lambda project, sid, revision=None: SimpleNamespace(commit_id="c1"))
+    monkeypatch.setattr(wf, "saved_checkpoint", lambda project, sid, revision=None: SimpleNamespace(
+        commit_id="c1", document={"core": {"done": False}, "entries": [
+            {"messages": [{"role": "user", "content": "Continue the task"}], "tool_calls": []}]}))
     runtime.launcher.handles[1].status = "exited"
     runtime.controller.tick("miner")
     resumed = runtime.launcher.requests[-1]
@@ -171,7 +173,8 @@ def test_crashed_agent_resumes_from_checkpoint(runtime, monkeypatch):
     assert resumed.source.checkpoint.revision_id == "c1"
     assert store.agent("agt_reverse_1")["resumes"] == 1
     runtime.controller.tick("miner")
-    assert runtime.sent[-1][1] == "message" and "restarted" in runtime.sent[-1][2]
+    assert runtime.sent[-1][1] == "continue"
+    assert not any(action == "message" for _, action, _ in runtime.sent)
     assert store.agent("agt_reverse_1")["state"] == "running"
 
 

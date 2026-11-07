@@ -94,8 +94,16 @@ an agent can get stuck, give it a queue such as `q_blocked` and say when to use 
 
 `set_agent_count` changes one group's count immediately (it records a new
 version). `command_workflow` takes `run`, `pause` or `archive`, optionally for a
-single `agent_group`. `pause` interrupts running agents but keeps their work;
-`run` resumes them where they left off.
+single `agent_group`. Omit it or pass `null` for the whole workflow; an empty
+string is also accepted. Other optional tool fields accept `null` for their default.
+`pause` interrupts running agents but keeps their work; `run` resumes safe checkpoints.
+
+A checkpoint with missing tool results is not automatically resumed: that tool may
+already have changed something. The worker needs attention and keeps its item.
+Inspect `wf:<name>:<agt_agent>` and existing artifacts/processes before choosing
+`restart_agent`, which discards progress and requeues the item. Completed tool
+results resume via `/continue`, without adding a new user assignment. Recovery
+cannot guarantee exactly-once side effects or completion of background commands.
 
 ## Items and agents
 

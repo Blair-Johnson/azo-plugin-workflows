@@ -88,14 +88,20 @@ holds the definition versions, items, agent records, an append-only log, and a
 control record naming the controlling session. Writes are atomic and use a lock per
 workflow.
 
-- **Taking control:** `/workflow run` takes control in the current session. The
-  previous controller notices and stops scheduling.
-- **Running agents:** live agents are reattached.
-- **Stopped agents:** agents that stopped without finishing resume from their saved
-  checkpoints. Agents that can't resume are flagged for attention, and
-  `restart_agent` hands their item to a fresh agent.
-- **Restarts:** after a reload or restart, a session that was running a workflow
-  picks it up again on its own.
+`/workflow run` takes control in the current session. The previous controller stops
+scheduling, but keeps reaping processes it launched. Live workers are reattached;
+a reload or restart of the controlling session adopts its running workflows.
+
+Stopped workers resume the exact saved checkpoint when its tool results are complete.
+A pending reply continues without inserting a new user turn. Missing or malformed
+tool results instead put the worker into attention, leaving its item reserved and
+its checkpoint intact. Inspect the transcript and external artifacts before using
+`restart_agent`, which deliberately discards progress and requeues the item.
+
+Checkpoint recovery is not exactly-once execution. A crash can occur between an
+external side effect and its saved result; background work can also outlive a tool
+call. The guard blocks visibly unresolved checkpoints, not every possible external
+side effect. Agents must verify existing work before retrying it.
 
 ## Install and test
 

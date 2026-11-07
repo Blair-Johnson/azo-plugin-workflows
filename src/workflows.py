@@ -1324,6 +1324,47 @@ def saved_checkpoint(project: str, session_id: str, revision_id: str | None = No
     return saved
 
 
+def checkpoint_recovery(document: dict) -> tuple[str, str]:
+    """Classify durable evidence, never infer that a missing result means no effect."""
+    if not isinstance(document, dict):
+        return "uncertain", "checkpoint document is malformed"
+    core = document.get("core")
+    entries = document.get("entries")
+    if not isinstance(core, dict) or not isinstance(entries, list) or not entries:
+        return "uncertain", "checkpoint is missing canonical core/entries"
+    if core.get("done"):
+        return "done", "checkpoint is already done; reconcile the worker record before restarting"
+    latest_role = None
+    latest_calls = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("messages"), list):
+            return "uncertain", "checkpoint contains a malformed entry"
+        calls = entry.get("tool_calls") or []
+        if not isinstance(calls, list):
+            return "uncertain", "checkpoint contains malformed tool calls"
+        messages = entry["messages"]
+        if any(not isinstance(m, dict) for m in messages):
+            return "uncertain", "checkpoint contains a malformed message"
+        results = {m["tool_call_id"] for m in messages
+                   if m.get("role") == "tool" and isinstance(m.get("tool_call_id"), str)}
+        for call in calls:
+            if not isinstance(call, dict) or not isinstance(call.get("id"), str) or not call["id"]:
+                return "uncertain", "checkpoint contains a tool call without an identity"
+            if call.get("result") is None or call["id"] not in results:
+                return "uncertain", f"unresolved tool call {call['id']} ({call.get('name', 'unknown tool')})"
+        # Canonical entries carry parsed calls as well as provider messages.
+        if any(m.get("tool_calls") for m in messages) and not calls:
+            return "uncertain", "checkpoint has tool-call messages without canonical call records"
+        for message in messages:
+            if message.get("role") in {"user", "assistant"}:
+                latest_role, latest_calls = message["role"], calls
+    if latest_role == "user" or latest_role == "assistant" and latest_calls:
+        return "continue", "checkpoint has a pending reply with complete tool results"
+    if latest_role == "assistant":
+        return "message", "worker ended its turn without finishing its task"
+    return "uncertain", "checkpoint has no resumable user or assistant turn"
+
+
 def saved_model_config(config) -> dict | None:
     """Saved config layers only: never the session's model change or CLI --set overrides."""
     path = ((config or {}).get("_runtime_launch", {}) or {}).get("config_path")
@@ -1609,7 +1650,9 @@ class WorkflowController:
     def __init__(self, config, session=None):
         self.config, self.session = config, session
         self.lock = threading.RLock()
-        self.handles: dict[str, object] = {}
+        # Keep each owned process until poll() reaps it, even after a workflow
+        # is archived/transferred or the same logical agent has been relaunched.
+        self.handles: dict[tuple[str, str, str], object] = {}
         self.managed: dict[str, dict] = {}
         self.me: dict | None = None
         self.launch: dict | None = None
@@ -1726,6 +1769,21 @@ class WorkflowController:
                     if self.errors.get(name) != message:
                         self.errors[name] = message
                         self.notice(message)
+            self.reap_children()
+
+    def reap_children(self) -> None:
+        """Reap owned children independently of workflow scheduling ownership."""
+        with self.lock:
+            for key, handle in list(self.handles.items()):
+                try:
+                    if handle.poll().status == "exited":
+                        self.handles.pop(key, None)
+                except Exception:
+                    # Keep the handle: unknown is not evidence of process exit.
+                    LOG.exception("Could not poll workflow child %s", key)
+
+    def handle_key(self, store: WorkflowStore, agent: dict) -> tuple[str, str, str]:
+        return store.name, agent["id"], agent.get("instance_id", "")
 
     def run(self, name: str, group: str | None = None) -> str:
         with self.lock:
@@ -1823,7 +1881,7 @@ class WorkflowController:
             self.pause(name)
             ended = []
             for agent in store.agents():
-                if agent["state"] not in ACTIVE_STATES:
+                if agent["state"] not in ACTIVE_STATES | {"attention"}:
                     continue
                 try:
                     if self.liveness(store, agent) == "alive":
@@ -1867,7 +1925,7 @@ class WorkflowController:
         run_async(lambda: send_to_agent(target, action, message), timeout=30)
 
     def liveness(self, store: WorkflowStore, agent: dict) -> str:
-        handle = self.handles.get(agent["id"])
+        handle = self.handles.get(self.handle_key(store, agent))
         if handle is not None and getattr(handle, "ref", None) is not None \
                 and handle.ref.instance_id == agent.get("instance_id"):
             status = handle.poll().status
@@ -1877,7 +1935,8 @@ class WorkflowController:
                 return "alive"
         return process_evidence(agent.get("process_identity"))
 
-    def launch_agent(self, store: WorkflowStore, agent: dict, message: str, checkpoint=None) -> None:
+    def launch_agent(self, store: WorkflowStore, agent: dict, message: str, checkpoint=None,
+                     recovery_action: str | None = None) -> None:
         """Start (or resume) one agent's session. Persists identity before spawning."""
         session_id = agent.get("session_id") or str(uuid.uuid4())
         target = InstanceRef.new_instance(session_id)
@@ -1894,13 +1953,14 @@ class WorkflowController:
                                      env=dict(os.environ, AZO_WORKFLOW=store.name, AZO_WORKFLOW_AGENT=agent["id"]))
         store.update_agent(agent["id"], session_id=session_id, instance_id=target.instance_id, state="starting",
                            project=self.launch["project"], launch_started=time.time(), websocket_url=None,
-                           process_identity=None, release="resume" if checkpoint else None)
+                           process_identity=None, release="resume" if checkpoint else None,
+                           recovery_action=recovery_action)
         try:
             handle = self.launcher.start(plan)
         except Exception:
             store.update_agent(agent["id"], process_identity=None, problem="launch did not complete")
             raise
-        self.handles[agent["id"]] = handle
+        self.handles[(store.name, agent["id"], target.instance_id)] = handle
         identity = capture_process_identity(handle.process.pid)
         store.update_agent(agent["id"], pid=handle.process.pid,
                            process_identity=identity.to_dict() if identity else None)
@@ -1926,8 +1986,13 @@ class WorkflowController:
             return f"{agent['id']} has no saved checkpoint to resume from"
         except Exception as exc:
             return f"{agent['id']}'s checkpoint could not be read: {exc}"
+        action, reason = checkpoint_recovery(saved.document)
+        if action in {"uncertain", "done"}:
+            return (f"{agent['id']} checkpoint {saved.commit_id}: {reason}. "
+                    "External work may already have happened; inspect its transcript and artifacts before retrying")
         try:
-            self.launch_agent(store, agent, "", checkpoint=CheckpointRef(agent["session_id"], saved.commit_id))
+            self.launch_agent(store, agent, "", checkpoint=CheckpointRef(agent["session_id"], saved.commit_id),
+                              recovery_action=action)
         except Exception as exc:
             return f"{agent['id']} could not be relaunched: {exc}"
         store.update_agent(agent["id"], resumes=int(agent.get("resumes", 0)) + 1, last_resume=time.time())
@@ -1941,13 +2006,17 @@ class WorkflowController:
             alive = self.liveness(store, agent)
             if alive == "alive" and agent.get("websocket_url"):
                 try:
-                    self.send(store, agent, "continue")
-                    store.update_agent(agent["id"], state="running")
-                    resumed.append(agent["id"])
+                    if agent.get("release") in {"resume", "continue"}:
+                        self.release_ready(store, agent, True)
+                    else:
+                        self.send(store, agent, "continue")
+                        store.update_agent(agent["id"], state="running")
+                    if store.agent(agent["id"])["state"] == "running":
+                        resumed.append(agent["id"])
                 except Exception as exc:
                     problems.append(f"Could not resume {agent['id']}: {exc}")
             elif alive == "alive":
-                store.update_agent(agent["id"], state="starting")
+                store.update_agent(agent["id"], state="starting", release=agent.get("release") or "continue")
                 resumed.append(agent["id"])
             elif alive == "dead":
                 problem = self.resume_agent(store, agent)
@@ -1987,9 +2056,6 @@ class WorkflowController:
         definition = store.definition()
         paused_groups = set(control.get("paused_groups") or [])
         running = control.get("state") == "running"
-        for agent_id in list(self.handles):
-            if not store.agent_path(agent_id).exists() or store.agent(agent_id)["state"] not in ACTIVE_STATES:
-                self.handles.pop(agent_id, None)
         for agent in store.agents():
             if agent["state"] in {"starting", "running"}:
                 self.observe(store, agent, definition, running and agent["group"] not in paused_groups)
@@ -1998,30 +2064,64 @@ class WorkflowController:
         if running:
             started = self.start_agents(store, definition, paused_groups)
         self.report_new_items(store, definition)
+        self.reap_children()
         return started
+
+    def release_ready(self, store: WorkflowStore, agent: dict, should_run: bool) -> None:
+        """Release a ready process before claiming it is running; pause wins."""
+        agent = store.agent(agent["id"])
+        if agent["state"] not in ACTIVE_STATES:
+            return
+        control = store.control()
+        mine = self.managed.get(store.name)
+        if (mine is None or control.get("epoch") != mine["epoch"]
+                or (control.get("controller") or {}).get("instance_id") != self.me["instance_id"]):
+            return
+        should_run = (should_run and control.get("state") == "running"
+                      and agent["group"] not in control.get("paused_groups", []))
+        try:
+            release = agent.get("release")
+            if not should_run:
+                if release in {"resume", "continue"}:
+                    store.update_agent(agent["id"], state="paused")
+                else:
+                    problem = self.pause_one(store, agent)
+                    if problem:
+                        raise WorkflowError(problem)
+                return
+            if release in {"resume", "continue"}:
+                action = "continue" if release == "continue" else agent.get("recovery_action")
+                if action not in {"continue", "message"}:
+                    self.mark_attention(store, agent, "recovery action is missing; checkpoint must be reviewed")
+                    return
+                message = ("Your session was restarted from a checkpoint after an interruption. "
+                           "Inspect saved results and existing processes/artifacts before continuing. "
+                           "Do not repeat a command just because its output is missing; if its outcome is "
+                           "uncertain, report that uncertainty instead of retrying it. "
+                           "Continue from confirmed progress and call finish_task when done.")
+                self.send(store, agent, action, message if action == "message" else "")
+            with store.lock():
+                current = store.agent(agent["id"])
+                if current["state"] in ACTIVE_STATES and current.get("instance_id") == agent.get("instance_id"):
+                    current.update(state="running", release=None)
+                    store.save_agent(current)
+        except Exception as exc:
+            self.mark_attention(store, agent,
+                                f"could not confirm recovery release: {exc}; inspect the live session before retrying")
 
     def observe(self, store: WorkflowStore, agent: dict, definition: dict, should_run: bool) -> None:
         agent = store.agent(agent["id"])
         if agent["state"] not in {"starting", "running"}:
             return
-        handle = self.handles.get(agent["id"])
+        handle = self.handles.get(self.handle_key(store, agent))
         if agent["state"] == "starting":
             observation = handle.poll() if handle is not None else None
             if observation is not None and observation.status == "ready":
                 ready = observation.ready or {}
-                agent = store.update_agent(agent["id"], state="running", websocket_url=ready.get("websocket_url"),
+                agent = store.update_agent(agent["id"], websocket_url=ready.get("websocket_url"),
                                            instance_id=ready.get("instance_id", agent["instance_id"]),
                                            process_identity=ready.get("process_identity") or agent.get("process_identity"))
-                try:
-                    if agent.get("release") == "resume":
-                        self.send(store, agent, "message",
-                                  "Your session was restarted after an interruption. Continue your task where you "
-                                  "left off, and call finish_task when it is done.")
-                        store.update_agent(agent["id"], release=None)
-                    if not should_run:
-                        self.pause_one(store, store.agent(agent["id"]))
-                except Exception as exc:
-                    LOG.warning("Could not release %s: %s", agent["id"], exc)
+                self.release_ready(store, agent, should_run)
                 return
             if observation is not None and observation.status == "starting":
                 if time.time() - float(agent.get("launch_started") or 0) > READY_TIMEOUT_SECONDS:
@@ -2035,9 +2135,8 @@ class WorkflowController:
                     if time.time() - float(agent.get("launch_started") or 0) > READY_TIMEOUT_SECONDS:
                         self.mark_attention(store, agent, "is running but cannot be reached")
                     return
-                store.update_agent(agent["id"], state="running")
-                if not should_run:
-                    self.pause_one(store, store.agent(agent["id"]))
+                agent = store.agent(agent["id"])
+                self.release_ready(store, agent, should_run)
                 return
         status = self.liveness(store, agent)
         if status != "dead":
@@ -2045,7 +2144,7 @@ class WorkflowController:
         agent = store.agent(agent["id"])
         if agent["state"] not in {"starting", "running"}:
             return  # It finished (or was changed) while we looked.
-        self.handles.pop(agent["id"], None)
+        self.handles.pop(self.handle_key(store, agent), None)
         if not should_run:
             store.update_agent(agent["id"], state="paused")
             return
@@ -2062,6 +2161,13 @@ class WorkflowController:
         planned = []
         with store.lock():
             control = store.control()
+            mine = self.managed.get(store.name)
+            if (mine is None or control.get("epoch") != mine["epoch"]
+                    or (control.get("controller") or {}).get("instance_id") != self.me["instance_id"]
+                    or control.get("state") != "running"):
+                return []
+            definition = store.definition()
+            paused_groups = set(control.get("paused_groups") or [])
             last_started = dict(control.get("last_started") or {})
             for group, settings in definition["agents"].items():
                 if group in paused_groups or settings["count"] <= 0:
@@ -2180,7 +2286,6 @@ class WorkflowController:
                     self.send(store, agent, "shutdown")
                 except Exception as exc:
                     LOG.warning("Could not shut down %s: %s", agent_id, exc)
-            self.handles.pop(agent_id, None)
             with store.lock():
                 if agent.get("item"):
                     store.return_item(agent["item"], agent_id, by="restart_agent")
@@ -2271,6 +2376,13 @@ class WorkflowController:
 # ---------------------------------------------------------------------------
 
 def function_schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    # Strict providers may require every property. Null preserves omission semantics.
+    properties = deepcopy(properties)
+    for key, prop in properties.items():
+        if key not in required:
+            kinds = prop["type"] if isinstance(prop["type"], list) else [prop["type"]]
+            prop["type"] = list(dict.fromkeys([*kinds, "null"]))
+            prop["description"] = prop.get("description", "") + " Omit or pass null to use the default."
     return {"type": "function", "function": {
         "name": name, "description": description,
         "parameters": {"type": "object", "properties": properties, "required": required},
@@ -2403,6 +2515,7 @@ class WorkflowsPlugin:
 
     def command_workflow(self, state, workflow_name, command, agent_group=None):
         command = str(command or "").strip().lower()
+        agent_group = None if agent_group in (None, "") else agent_group
         if command == "run":
             return self.controller.run(workflow_name, agent_group)
         if command == "pause":
@@ -2431,6 +2544,7 @@ class WorkflowsPlugin:
         return text
 
     def message_agents(self, state, workflow_name, message, agent_group=None):
+        agent_group = None if agent_group in (None, "") else agent_group
         return self.controller.message_agents(workflow_name, str(message), agent_group)
 
     def restart_agent(self, state, workflow_name, agent):
@@ -2880,7 +2994,8 @@ class WorkflowSkillRegistration(RenderTransformRegistrar):
         else:
             relative = Path("skills/workflows/SKILL.md")
             installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN_NAME / relative
-            package = installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
+            bundled = Path(__file__).resolve().parent.parent / relative
+            package = bundled if bundled.is_file() else installed
             if package.is_file():
                 registry.add_sources(SkillSource(package, kind=PLUGIN_NAME, scope="bundled",
                                                  precedence=-5000, native=True, always_list=True))
