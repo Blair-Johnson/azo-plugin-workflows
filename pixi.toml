@@ -7,8 +7,9 @@ platforms = ["linux-64", "osx-arm64", "osx-64"]
 # Runtime dependencies (including PyYAML) are supplied by the Agent Zoo host.
 [tool.agent-zoo.plugin]
 name = "azo-plugin-workflows"
-common = ["src/workflows.py"]
-default = []
+# Workers and controllers both run the default pipeline; RLM sub-agents do not need workflows.
+common = []
+default = ["src/workflows.py"]
 rlm = []
 
 [tasks]
