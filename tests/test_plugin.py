@@ -378,7 +378,7 @@ def test_command_parsing_and_dispatch(runtime):
     session = SimpleNamespace(state=runtime.state, inject=Mock())
     ctx = SimpleNamespace(state=runtime.state, session=session, defer=Mock())
     listing = command(ctx, raw_args="")
-    assert "## Paused" in listing.outputs[0].body and "| `miner` |" in listing.outputs[0].body
+    assert listing.outputs[0].body.startswith("- `miner` · paused · 3 waiting · 0 done · just now\n")
     with pytest.raises(CommandError, match="usage"):
         command(ctx, raw_args=" run")
     with pytest.raises(CommandError, match="name the group with a colon: /workflow run miner:grp_reverse"):
@@ -417,9 +417,10 @@ def test_command_list_archive_and_rename(runtime):
     ctx = command_context(runtime)
     listing = command(ctx, raw_args="").outputs[0]
     assert listing.format == "markdown" and listing.subtitle == "2 paused"
-    assert "| `discovery` every 30m → `reverse` ×2 |" in listing.body
-    assert "0 waiting" in listing.body and "3 waiting · 0 done" in listing.body
-    assert "/workflow rename NAME NEW_NAME" in listing.body
+    assert ("- `miner` · paused · 3 waiting · 0 done · just now\n"
+            "  - discovery every 30m → reverse ×2\n") in listing.body
+    assert "- `scratch` · paused · 0 waiting · 0 done · just now\n" in listing.body
+    assert "/workflow rename NAME NEW_NAME" in listing.body.splitlines()[-1]
 
     assert command(ctx, raw_args=" archive scratch").outputs[0].text == "Archiving scratch..."
     assert finish_deferred(ctx)["ok"]
@@ -427,7 +428,8 @@ def test_command_list_archive_and_rename(runtime):
     assert "`scratch`" not in listing.body and "1 archived workflow hidden" in listing.body
     assert listing.subtitle == "1 paused · 1 archived"
     archived = command(ctx, raw_args=" list archived").outputs[0]
-    assert archived.title == "Archived workflows" and "| `scratch` |" in archived.body
+    assert archived.title == "Archived workflows"
+    assert archived.body.startswith("- `scratch` · 0 waiting · 0 done · just now\n")
     with pytest.raises(CommandError, match="already archived"):
         command(ctx, raw_args=" archive scratch")
     with pytest.raises(CommandError, match="not archived"):
@@ -444,7 +446,7 @@ def test_command_list_archive_and_rename(runtime):
     assert command(ctx, raw_args=" rename miner test_failures").outputs[0].text == "Renaming miner to test_failures..."
     assert finish_deferred(ctx)["ok"]
     assert "Renamed miner to test_failures" in ctx.session.inject.call_args.args[0]
-    assert "| `test_failures` |" in command(ctx, raw_args="").outputs[0].body
+    assert "- `test_failures` · paused" in command(ctx, raw_args="").outputs[0].body
     command(ctx, raw_args=" unarchive scratch")
     finish_deferred(ctx)
     assert command(ctx, raw_args="").outputs[0].subtitle == "2 paused"
@@ -458,7 +460,7 @@ def test_list_when_empty_or_all_archived(runtime):
     create(runtime)
     runtime.controller.archive("miner")
     listing = command(ctx, raw_args="").outputs[0]
-    assert listing.body.startswith("No active workflows.") and "`/workflow list archived` shows it" in listing.body
+    assert listing.body.startswith("No active workflows.") and "1 archived workflow hidden · `/workflow list archived`" in listing.body
     assert "miner" in wf.render_index() and "Archived" in wf.render_index()
 
 

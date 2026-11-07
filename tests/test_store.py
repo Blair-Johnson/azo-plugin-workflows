@@ -290,7 +290,19 @@ agents:
   grp_fix: { count: 2, takes_from: q_bugs, sends_to: [q_merge, q_outdated], instructions: x }
   grp_merge: { takes_from: q_merge, sends_to: [q_done], instructions: x }
 """)
-    assert wf.pipeline_text(definition) == "`discover` → `triage` ×3 → `update` ×2, `fix` ×2 → `merge`"
+    assert wf.pipeline_text(definition) == "discover → triage ×3 → update ×2, fix ×2 → merge"
+
+
+def test_list_puts_running_first_then_newest(store):
+    other = wf.WorkflowStore("older", store.root)
+    other.create(DEFINITION, by="user")
+    store.update_control(state="running", controller={"session_id": "abcdef0123456789"})
+    with open(other.dir / "log.jsonl", "a") as log:  # Make "older" the most recently active.
+        log.write('{"at": "2999-01-01T00:00:00+00:00", "event": "x"}\n')
+    subtitle, body = wf.render_list(store.root)
+    assert subtitle == "1 running · 1 paused"
+    assert body.splitlines()[0].startswith("- `miner` · running in session abcdef01 · 0 waiting")
+    assert body.splitlines()[2].startswith("- `older` · paused")
 
 
 def test_markdown_views(store):

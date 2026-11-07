@@ -1141,7 +1141,7 @@ def relative_time(at: str, now: datetime | None = None) -> str:
 
 
 def pipeline_text(definition: dict) -> str:
-    """The agent groups in the order work flows through them, e.g. `find` → `fix` ×3, `test` → `merge`.
+    """The agent groups in the order work flows through them, e.g. find → fix ×3, test → merge.
 
     A group comes one stage after the earliest group that sends to the queue it takes from.
     Groups nothing feeds (standing groups, or ones taking user-added items) start the pipeline.
@@ -1169,7 +1169,7 @@ def pipeline_text(definition: dict) -> str:
 
     def label(name):
         settings = groups[name]
-        text = f"`{name.removeprefix('grp_')}`"
+        text = name.removeprefix("grp_")
         if settings["count"] != 1:
             text += f" ×{settings['count']}"
         if settings["every"]:
@@ -1180,8 +1180,8 @@ def pipeline_text(definition: dict) -> str:
     return " → ".join(", ".join(names) for names in stages if names)
 
 
-def workflow_row(store: WorkflowStore, viewer_session_id: str = "") -> dict:
-    """One workflow's line in the /workflow list. Never raises: a damaged workflow still gets a row."""
+def workflow_entry(store: WorkflowStore, viewer_session_id: str = "") -> dict:
+    """One workflow in the /workflow list. Never raises: a damaged workflow still gets an entry."""
     def count(states, records):
         return sum(r["state"] in states for r in records)
 
@@ -1192,76 +1192,68 @@ def workflow_row(store: WorkflowStore, viewer_session_id: str = "") -> dict:
         state = control.get("state", "paused")
         running, paused = count({"starting", "running"}, agents), count({"paused"}, agents)
         attention, taken = count({"attention"}, agents), count({"taken"}, items)
-        work = []
+        status = [f"running in {controller_label(control, viewer_session_id)}" if state == "running" else state]
         if running:
-            work.append(f"{plural(running, 'agent')} running")
+            status.append(f"{plural(running, 'agent')} working")
         if paused:
-            work.append(f"{paused} paused mid-task")
+            status.append(f"{paused} paused mid-task")
         if taken and not running:
-            work.append(f"{taken} in progress")
-        work += [f"{count({'waiting'}, items)} waiting", f"{count({'done'}, items)} done"]
+            status.append(f"{taken} in progress")
+        status += [f"{count({'waiting'}, items)} waiting", f"{count({'done'}, items)} done"]
         if attention:
-            work.append(f"⚠ {attention} {'needs' if attention == 1 else 'need'} attention")
-        name = f"`{store.name}`"
-        if state == "running":
-            name += f" ({controller_label(control, viewer_session_id)})"
+            status.append(f"⚠ {attention} {'needs' if attention == 1 else 'need'} attention")
         pipeline = pipeline_text(store.definition())
         last = store.last_activity()
     except Exception as exc:  # Show the problem in the list instead of hiding the workflow.
-        state, name, pipeline, work, last = "paused", f"`{store.name}`", f"could not read it: {exc}", [], ""
-    return {"state": state, "last": last,
-            "cells": [name, pipeline, " · ".join(work), relative_time(last) if last else "unknown"]}
+        state, status, pipeline, last = "paused", ["unreadable"], f"could not read it: {exc}", ""
+    status.append(relative_time(last) if last else "never active")
+    return {"name": store.name, "state": state, "last": last, "status": status, "pipeline": pipeline}
 
 
-def workflow_table(rows: list[dict]) -> list[str]:
-    ordered = sorted(rows, key=lambda r: r["last"], reverse=True)
-    return md_table(["Workflow", "Pipeline", "Work", "Last active"], [r["cells"] for r in ordered])
+def workflow_entries(entries: list[dict], *, show_state: bool = True) -> list[str]:
+    """Two lines each: name and status, then the pipeline. Running first, then most recent."""
+    ordered = sorted(entries, key=lambda e: e["last"], reverse=True)
+    ordered.sort(key=lambda e: e["state"] != "running")
+    lines = []
+    for entry in ordered:
+        status = entry["status"] if show_state else entry["status"][1:]
+        lines += [f"- `{entry['name']}` · " + " · ".join(status), f"  - {entry['pipeline']}"]
+    return lines
 
 
-LIST_COMMANDS = """\
-**Commands**
-
-- `/workflow view NAME` — groups, queues and recent activity
-- `/workflow run NAME` · `/workflow pause NAME`
-- `/workflow rename NAME NEW_NAME`
-- `/workflow archive NAME` — hide a one-off or test workflow (undo with `unarchive`)
-- `/workflow set NAME` — model, folder and other settings"""
+LIST_COMMANDS = ("`/workflow view|run|pause|archive NAME` · `/workflow rename NAME NEW_NAME` · "
+                 "`/workflow set NAME`")
 
 
 def render_list(root: Path | None = None, viewer_session_id: str = "", *,
                 archived: bool = False) -> tuple[str, str]:
     """Subtitle and markdown body for /workflow list (or /workflow list archived)."""
-    rows = [workflow_row(WorkflowStore(name, root), viewer_session_id) for name in list_workflow_names(root)]
-    by_state = {state: [r for r in rows if r["state"] == state] for state in ("running", "paused", "archived")}
-    by_state["paused"] += [r for r in rows if r["state"] not in by_state]
-    subtitle = " · ".join(f"{len(by_state[s])} {s}" for s in ("running", "paused", "archived") if by_state[s])
-    hidden = len(by_state["archived"])
+    entries = [workflow_entry(WorkflowStore(name, root), viewer_session_id) for name in list_workflow_names(root)]
+    shelved = [e for e in entries if e["state"] == "archived"]
+    current = [e for e in entries if e["state"] != "archived"]
+    tally = {state: sum(e["state"] == state for e in current) for state in ("running", "paused")}
+    tally["paused"] = len(current) - tally["running"]
+    tally["archived"] = len(shelved)
+    subtitle = " · ".join(f"{n} {state}" for state, n in tally.items() if n)
 
     if archived:
-        if not hidden:
-            return subtitle, "No archived workflows.\n\nHide a one-off workflow with `/workflow archive NAME`.\n"
-        lines = ["## Archived", "", *workflow_table(by_state["archived"]), "",
-                 "Restore one with `/workflow unarchive NAME`; it comes back paused. Renaming an archived "
-                 "workflow (`/workflow rename NAME NEW_NAME`) frees its name for reuse."]
+        if not shelved:
+            return subtitle, "No archived workflows. Hide a one-off workflow with `/workflow archive NAME`.\n"
+        lines = [*workflow_entries(shelved, show_state=False), "",
+                 "`/workflow unarchive NAME` brings one back, paused. "
+                 "`/workflow rename NAME NEW_NAME` frees its name."]
         return subtitle, "\n".join(lines) + "\n"
 
-    lines = []
-    if not rows:
-        lines += ["No workflows yet.", "",
-                  "Ask the agent to set one up, for example *“make a workflow that fixes each failing test "
-                  "with its own agent”*. Nothing runs until you start it with `/workflow run NAME`."]
-    elif not by_state["running"] and not by_state["paused"]:
-        lines.append("No active workflows.")
-    for state, heading in (("running", "Running"), ("paused", "Paused")):
-        if by_state[state]:
-            lines += [f"## {heading}", "", *workflow_table(by_state[state]), ""]
-    if hidden:
-        lines += ["", f"{plural(hidden, 'archived workflow')} hidden — `/workflow list archived` shows "
-                      f"{'it' if hidden == 1 else 'them'}."]
-    if rows:
-        lines += ["", LIST_COMMANDS]
-    return subtitle, "\n".join(lines).strip("\n") + "\n"
-
+    if not entries:
+        return subtitle, ("No workflows yet. Ask the agent to set one up, for example *“make a workflow that fixes "
+                          "each failing test with its own agent”*. Nothing runs until you start it with "
+                          "`/workflow run NAME`.\n")
+    lines = workflow_entries(current) if current else ["No active workflows."]
+    lines.append("")
+    if shelved:
+        lines.append(f"{plural(len(shelved), 'archived workflow')} hidden · `/workflow list archived`")
+    lines.append(LIST_COMMANDS)
+    return subtitle, "\n".join(lines) + "\n"
 
 # -- the /workflow view popups (markdown) ----------------------------------------
 
