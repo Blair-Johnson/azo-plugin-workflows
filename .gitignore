@@ -1,0 +1,5 @@
+.agents/
+.pixi/
+__pycache__/
+.pytest_cache/
+*.pyc
