@@ -2,8 +2,8 @@
 
 A workflow definition (YAML) declares queues (``q_*``) and agent groups
 (``grp_*``). A group with ``takes_from`` starts one agent per item taken from
-that queue; a group without it keeps ``count`` agents running from the same
-instructions. Agents send results to the queues in their group's ``sends_to``.
+that queue, or per batch when ``takes_from`` maps queues to batch sizes; a
+group without it keeps ``count`` agents running from the same instructions. Agents send results to the queues in their group's ``sends_to``.
 The scheduler runs inside the session that controls the workflow.
 
 The first half of this module is a harness-free store; the Agent Zoo plugin
@@ -41,6 +41,7 @@ RESERVED_NAMES = {"index", "list", "view", "run", "pause", "set", "rename", "arc
 TOP_KEYS = {"version", "description", "folder", "model", "queues", "agents"}
 QUEUE_KEYS = {"notify_on_new"}
 GROUP_KEYS = {"count", "takes_from", "sends_to", "every", "instructions", "folder", "model"}
+MAX_BATCH = 100
 
 EXAMPLE_DEFINITION = """\
 description: Summarize new sparse-attention papers   # one line, shown in /workflow list
@@ -48,6 +49,7 @@ folder: ~/work/papers            # working directory for agents (optional)
 queues:
   q_papers: {}
   q_summaries: { notify_on_new: true }   # wake the controlling agent on new items
+  q_topics: {}
 agents:
   grp_finder:                    # no takes_from: keeps `count` agents running
     count: 1
@@ -62,6 +64,11 @@ agents:
     sends_to: [q_summaries]
     instructions: |
       Summarize this paper in one page.
+      {{item}}
+  grp_survey:                    # one agent per batch: 5 summaries and 1 topic
+    takes_from: { q_summaries: 5, q_topics: 1 }
+    instructions: |
+      Write a short survey of these papers on the topic.
       {{item}}
 """
 
@@ -284,12 +291,30 @@ def parse_definition(text: str) -> dict:
         if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 64:
             problems.append(f"{name}: count must be a whole number from 0 to 64")
             count = 0
-        takes_from = settings.get("takes_from")
-        if takes_from is not None:
-            takes_from = queue_ref(name, "takes_from", takes_from)
-            if takes_from == TRASH:
+        # takes_from: q_a takes one item; {q_a: 2, q_b: 1} takes a batch from each queue.
+        raw_takes = settings.get("takes_from")
+        if isinstance(raw_takes, dict):
+            pairs = list(raw_takes.items())
+            if not pairs:
+                problems.append(f"{name}: takes_from needs at least one queue, e.g. {{q_items: 2}}")
+        elif isinstance(raw_takes, list):
+            problems.append(f"{name}: takes_from is one queue (takes_from: q_items) or a mapping of queues to "
+                            "items per agent (takes_from: {q_a: 2, q_b: 1})")
+            pairs = []
+        else:
+            pairs = [] if raw_takes is None else [(raw_takes, 1)]
+        takes_from = {}
+        for queue, size in pairs:
+            queue = queue_ref(name, "takes_from", queue)
+            if queue is None:
+                continue
+            if queue == TRASH:
                 problems.append(f"{name}: cannot take items from {TRASH}")
-                takes_from = None
+            elif isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= MAX_BATCH:
+                problems.append(f"{name}: takes_from {queue} must be a whole number of items from 1 to {MAX_BATCH}")
+            else:
+                takes_from[queue] = size
+        takes_from = takes_from or None
         sends_to = settings.get("sends_to") or []
         if isinstance(sends_to, str):
             sends_to = [sends_to]
@@ -331,7 +356,7 @@ def parse_definition(text: str) -> dict:
 
 
 def yaml_scalar(value) -> str:
-    lines = yaml.safe_dump(value, default_flow_style=True, width=1 << 20).splitlines()
+    lines = yaml.safe_dump(value, default_flow_style=True, width=1 << 20, sort_keys=False).splitlines()
     if lines and lines[-1] == "...":
         lines = lines[:-1]
     return "\n".join(lines)
@@ -681,7 +706,8 @@ class WorkflowStore:
             if before["count"] != after["count"]:
                 changes.append(f"count {before['count']} → {after['count']}")
             if before["takes_from"] != after["takes_from"]:
-                changes.append(f"takes_from {before['takes_from'] or 'nothing'} → {after['takes_from'] or 'nothing'}")
+                changes.append(f"takes_from {takes_text(before['takes_from']) or 'nothing'} → "
+                               f"{takes_text(after['takes_from']) or 'nothing'}")
             if before["sends_to"] != after["sends_to"]:
                 changes.append(f"sends_to [{', '.join(before['sends_to'])}] → [{', '.join(after['sends_to'])}]")
             if before["every"] != after["every"]:
@@ -701,7 +727,7 @@ class WorkflowStore:
             if orphaned:
                 effects.append(f"{agent['id']} can still send to {', '.join(orphaned)}, which will no longer "
                                "be in the definition; those items will wait until the queue is added back.")
-        taken = {g["takes_from"] for g in new["agents"].values() if g["takes_from"]}
+        taken = {q for g in new["agents"].values() for q in g["takes_from"] or {}}
         for queue in sorted(new["queues"]):
             if waiting.get(queue) and queue not in taken:
                 effects.append(f"{queue} has {waiting[queue]} waiting items and no group takes from it.")
@@ -737,7 +763,7 @@ class WorkflowStore:
         write_json(self.item_paths(meta["id"])[1], meta)
 
     def add_item(self, queue: str, text: str, *, by: str, note: str | None = None,
-                 from_item: str | None = None, allowed: set | None = None) -> dict:
+                 from_items: list[str] | None = None, allowed: set | None = None) -> dict:
         queue = check_queue_id(queue)
         if allowed is not None and queue not in allowed:
             raise WorkflowError(f"you can only send to: {', '.join(sorted(allowed))}")
@@ -750,7 +776,7 @@ class WorkflowStore:
             at = now_iso()
             meta = {
                 "id": item_id, "title": item_title(text), "queue": queue, "state": "waiting",
-                "created_at": at, "created_by": by, "from_item": from_item, "taken_by": None,
+                "created_at": at, "created_by": by, "from_items": list(from_items or []), "taken_by": None,
                 "notes": [{"text": note, "by": by, "at": at}] if note else [],
                 "history": [{"at": at, "event": "added", "queue": queue, "by": by}],
             }
@@ -784,15 +810,21 @@ class WorkflowStore:
                 self.log("item_moved", item=meta["id"], queue=to_queue, by=by)
         return metas
 
-    def take_next(self, queue: str, agent_id: str) -> dict | None:
-        """Lease the oldest waiting item in ``queue`` to ``agent_id``. Caller holds the lock."""
-        for meta in self.items(queue):
-            if meta["state"] == "waiting":
-                meta.update(state="taken", taken_by=agent_id)
-                meta["history"].append({"at": now_iso(), "event": "taken", "queue": queue, "by": agent_id})
-                self._save_item(meta)
-                return meta
-        return None
+    def take_batch(self, takes: dict[str, int], agent_id: str) -> list[dict]:
+        """Lease the oldest ``size`` waiting items of each queue to ``agent_id``, or nothing
+        if any queue is short. Caller holds the lock."""
+        batch = []
+        for queue, size in takes.items():
+            waiting = [m for m in self.items(queue) if m["state"] == "waiting"][:size]
+            if len(waiting) < size:
+                return []
+            batch += waiting
+        at = now_iso()
+        for meta in batch:
+            meta.update(state="taken", taken_by=agent_id)
+            meta["history"].append({"at": at, "event": "taken", "queue": meta["queue"], "by": agent_id})
+            self._save_item(meta)
+        return batch
 
     def finish_item(self, item_id: str, agent_id: str) -> None:
         """Caller holds the lock."""
@@ -836,13 +868,13 @@ class WorkflowStore:
         record["updated_at"] = now_iso()
         write_json(self.agent_path(record["id"]), record)
 
-    def new_agent(self, group: str, *, version: int, item_id: str | None, sends_to: list[str],
+    def new_agent(self, group: str, *, version: int, item_ids: list[str], sends_to: list[str],
                   folder: str, model: str | None) -> dict:
         """Allocate an agent record. Caller holds the lock."""
         number = self.next_number("agent", group)
         record = {
             "id": f"agt_{group_short(group)}_{number}", "group": group, "number": number,
-            "version": version, "item": item_id, "sends_to": sends_to, "folder": folder,
+            "version": version, "items": list(item_ids), "sends_to": sends_to, "folder": folder,
             "model": model, "state": "starting", "session_id": None, "instance_id": None,
             "created_at": now_iso(), "finished_at": None, "summary": None, "outputs": [],
             "problem": None, "reminders": 0, "resumes": 0,
@@ -869,23 +901,68 @@ class WorkflowStore:
                 check_queue_id(queue)
                 if queue not in allowed:
                     raise WorkflowError(f"you can only send to: {', '.join(sorted(allowed))}")
-        created = [self.add_item(queue, text, by=agent_id, from_item=record.get("item"),
+        created = [self.add_item(queue, text, by=agent_id, from_items=agent_items(record),
                                  allowed=allowed) for queue, text in outputs]
         with self.lock():
             record = self.agent(agent_id)
-            if record.get("item"):
-                self.finish_item(record["item"], agent_id)
+            for item_id in agent_items(record):
+                self.finish_item(item_id, agent_id)
             record.update(state="finished", summary=summary, finished_at=now_iso(),
                           outputs=record.get("outputs", []) + [m["id"] for m in created],
                           problem=None)
             self.save_agent(record)
-            self.log("agent_finished", agent=agent_id, item=record.get("item"),
+            self.log("agent_finished", agent=agent_id, items=agent_items(record),
                      outputs=[m["id"] for m in created], summary=summary)
         return {"agent": record, "created": created}
 
 
+def and_list(parts: list[str]) -> str:
+    return " and ".join(parts) if len(parts) < 3 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def takes_text(takes: dict | None) -> str:
+    """``q_a`` for one item per agent, else e.g. ``2 from q_a and 1 from q_b``."""
+    if not takes:
+        return ""
+    if list(takes.values()) == [1]:
+        return next(iter(takes))
+    return and_list([f"{size} from {queue}" for queue, size in takes.items()])
+
+
+def takers(definition: dict, queue: str) -> list[str]:
+    """Groups that take items from ``queue``."""
+    return [g for g, s in definition["agents"].items() if queue in (s["takes_from"] or {})]
+
+
+def agent_items(record: dict) -> list[str]:
+    """Item IDs an agent took; records from before batches have a single ``item``."""
+    if "items" in record:
+        return list(record["items"] or [])
+    return [record["item"]] if record.get("item") else []
+
+
+def item_origins(meta: dict) -> list[str]:
+    """Items whose agent made this item; older items have a single ``from_item``."""
+    if "from_items" in meta:
+        return list(meta["from_items"] or [])
+    return [meta["from_item"]] if meta.get("from_item") else []
+
+
+def batch_text(items: list[dict]) -> str:
+    """e.g. ``item_1, item_2 from q_a and item_3 from q_b``."""
+    by_queue: dict[str, list[str]] = {}
+    for meta in items:
+        by_queue.setdefault(meta["queue"], []).append(meta["id"])
+    return and_list([f"{', '.join(ids)} from {queue}" for queue, ids in by_queue.items()])
+
+
 def describe_group(group: dict) -> str:
-    parts = [f"takes from {group['takes_from']}" if group["takes_from"] else "standing"]
+    takes = group["takes_from"]
+    if takes:
+        source = f"takes {'from ' if list(takes.values()) == [1] else ''}{takes_text(takes)}"
+    else:
+        source = "standing"
+    parts = [source]
     parts.append(f"count {group['count']}")
     if group["every"]:
         parts.append(f"every {group['every_text']}")
@@ -966,8 +1043,8 @@ def prepare_setting(store: "WorkflowStore", kind: str, target: str | None, setti
         old_text, new_text, unchanged = str(old_value), str(value), value == old_value
     elif setting == "every":
         if group["takes_from"]:
-            raise WorkflowError(f"every only applies to groups without takes_from; {target} starts one "
-                                f"agent per item from {group['takes_from']}")
+            raise WorkflowError(f"every only applies to groups without takes_from; {target} starts agents as "
+                                f"items arrive in {', '.join(group['takes_from'])}")
         if word == "off":
             value = None
         else:
@@ -1036,7 +1113,8 @@ def render_settings(store: "WorkflowStore", kind: str, target: str | None, defau
         rows.append(["`count`", str(group["count"]), "agents at once, 0 to 64"])
         rows.append(["`model`", f"`{model}`", f"{source}; `default` for the workflow's model"])
         if group["takes_from"]:
-            rows.append(["`every`", "—", f"not available: this group takes items from `{group['takes_from']}`"])
+            rows.append(["`every`", "—", "not available: this group takes items from "
+                         + ", ".join(f"`{q}`" for q in group["takes_from"])])
         else:
             rows.append(["`every`", group["every_text"] or "off", "start a new agent at most this often, or `off`"])
         rows.append(["`folder`", f"`{folder}`",
@@ -1057,8 +1135,8 @@ def item_block(store: WorkflowStore, meta: dict) -> str:
     """The text {{item}} expands to in instructions."""
     lines = [f"{meta['id']} from {meta['queue']}: {meta['title']}"]
     origin = meta.get("created_by") or "unknown"
-    if meta.get("from_item"):
-        origin += f" while working on {meta['from_item']}"
+    if item_origins(meta):
+        origin += f" while working on {', '.join(item_origins(meta))}"
     lines.append(f"Added by {origin}.")
     if meta.get("notes"):
         lines.append("Notes:")
@@ -1320,7 +1398,7 @@ def render_overview_md(store: WorkflowStore, viewer_session_id: str = "",
     rows = []
     for group, settings in groups.items():
         # Plain text: the TUI pads inline code with spaces, which reads badly before a comma.
-        source = settings["takes_from"] or "standing"
+        source = takes_text(settings["takes_from"]) or "standing"
         if settings["every"]:
             source += f", every {settings['every_text']}"
         row = [f"`{group}`", source, ", ".join(settings["sends_to"]) or "—",
@@ -1377,9 +1455,9 @@ def render_group_md(store: WorkflowStore, group: str, default_model: str = "") -
     ended = [a for a in agents if a["state"] in {"finished", "restarted"}]
     shown = current + list(reversed(ended[-FINISHED_SHOWN:]))
     rows = [[f"`{a['id']}`", ("⚠ " if a["state"] == "attention" else "") + a["state"],
-             f"`{a['item']}`" if a.get("item") else "—", f"def_{a['version']}",
+             ", ".join(f"`{i}`" for i in agent_items(a)) or "—", f"def_{a['version']}",
              clip(a.get("summary") or a.get("problem") or "")] for a in shown]
-    lines += md_table(["Agent", "State", "Item", "Version", "Summary"], rows) if rows else ["No agents yet."]
+    lines += md_table(["Agent", "State", "Items", "Version", "Summary"], rows) if rows else ["No agents yet."]
     if len(ended) > FINISHED_SHOWN:
         lines += ["", f"{len(ended) - FINISHED_SHOWN} older finished agents are not shown."]
     if settings:
@@ -1388,8 +1466,8 @@ def render_group_md(store: WorkflowStore, group: str, default_model: str = "") -
     lines += ["", "**Commands**", ""]
     if settings:
         lines.append(f"- `/workflow set {store.name}:{group}` — count, model, schedule and folder")
-        if settings["takes_from"]:
-            lines.append(f"- `/workflow view {store.name}:{settings['takes_from']}` — the items it takes")
+        for queue in settings["takes_from"] or {}:
+            lines.append(f"- `/workflow view {store.name}:{queue}` — the items it takes")
     lines.append(f"- `/workflow view {store.name}` — the whole workflow")
     return subtitle, "\n".join(lines) + "\n"
 
@@ -1403,18 +1481,19 @@ def render_queue_md(store: WorkflowStore, queue: str) -> tuple[str, str]:
         check_queue_id(queue, definition["queues"])
     counts = queue_counts(items).get(queue, {"waiting": 0, "taken": 0, "done": 0})
     subtitle = f"{counts['waiting']} waiting · {counts['taken']} in progress · {counts['done']} done"
-    takers = [f"`{g}`" for g, s in definition["agents"].items() if s["takes_from"] == queue]
+    taken_by = [f"`{g}`" for g in takers(definition, queue)]
     senders = [f"`{g}`" for g, s in definition["agents"].items() if queue in s["sends_to"]]
     if queue == TRASH:
         lines = ["Discarded items. Move one back to a queue to restore it."]
     else:
         lines = [f"**Filled by** {', '.join(senders) or 'nobody; items come from you or the agent'} · "
-                 f"**Taken by** {', '.join(takers) or 'no group, so items stay here'}"]
+                 f"**Taken by** {', '.join(taken_by) or 'no group, so items stay here'}"]
     if not known:
         lines += ["", "⚠ This queue is not in the current definition; its items wait until it is added back."]
 
     def added_by(item):
-        return shorten_ids(item["created_by"]) + (f" (from `{item['from_item']}`)" if item.get("from_item") else "")
+        origins = ", ".join(f"`{i}`" for i in item_origins(item))
+        return shorten_ids(item["created_by"]) + (f" (from {origins})" if origins else "")
 
     def notes(item):
         return plural(len(item["notes"]), "note") if item.get("notes") else ""
@@ -1438,8 +1517,8 @@ def render_queue_md(store: WorkflowStore, queue: str) -> tuple[str, str]:
     if not items:
         lines += ["", "No items yet."]
     lines += ["", "**Commands**", "", f"- `/workflow view {store.name}` — the whole workflow"]
-    if takers:
-        lines.append(f"- `/workflow view {store.name}:{takers[0].strip('`')}` — the group that takes these items")
+    if taken_by:
+        lines.append(f"- `/workflow view {store.name}:{taken_by[0].strip('`')}` — the group that takes these items")
     return subtitle, "\n".join(lines) + "\n"
 
 def render_overview(store: WorkflowStore, viewer_session_id: str = "", default_model: str = "") -> str:
@@ -1502,11 +1581,10 @@ def render_queue(store: WorkflowStore, queue: str) -> str:
     if queue not in definition["queues"] and queue != TRASH and not items:
         return f"{queue} is not in {store.name}'s definition and has no items.\n"
     counts = queue_counts(items).get(queue, {"waiting": 0, "taken": 0, "done": 0})
-    takers = [g for g, s in definition["agents"].items() if s["takes_from"] == queue]
     senders = [g for g, s in definition["agents"].items() if queue in s["sends_to"]]
     lines = [f"{queue} in {store.name}: {counts['waiting']} waiting, {counts['taken']} being worked on, "
              f"{counts['done']} done."]
-    lines.append(f"Taken from by: {', '.join(takers) or 'no group'}. Sent to by: {', '.join(senders) or 'no group'}.")
+    lines.append(f"Taken from by: {', '.join(takers(definition, queue)) or 'no group'}. Sent to by: {', '.join(senders) or 'no group'}.")
     if queue not in definition["queues"] and queue != TRASH:
         lines.append("This queue is not in the current definition; its items wait until it is added back.")
 
@@ -1544,7 +1622,7 @@ def render_group(store: WorkflowStore, group: str, default_model: str = "") -> s
             continue
         lines += ["", state.capitalize()]
         for agent in (reversed(mine[-30:]) if state in {"finished", "restarted"} else mine):
-            item = f" on {agent['item']}" if agent.get("item") else ""
+            item = f" on {', '.join(agent_items(agent))}" if agent_items(agent) else ""
             note = f": {agent['summary']}" if agent.get("summary") else (
                 f": {agent['problem']}" if agent.get("problem") else "")
             lines.append(f"  {agent['id']}{item} (def_{agent['version']}){note}")
@@ -1556,8 +1634,8 @@ def render_group(store: WorkflowStore, group: str, default_model: str = "") -> s
 def render_agent(store: WorkflowStore, agent_id: str, transcript=None) -> str:
     agent = store.agent(agent_id)
     lines = [f"{agent['id']} in {store.name} ({agent['group']}, def_{agent['version']}): {agent['state']}."]
-    if agent.get("item"):
-        lines.append(f"Item: {agent['item']} (wf:{store.name}:{agent['item']})")
+    if agent_items(agent):
+        lines.append("Items: " + ", ".join(f"{i} (wf:{store.name}:{i})" for i in agent_items(agent)))
     lines.append(f"Can send to: {', '.join(agent.get('sends_to') or []) or 'nothing'}")
     lines.append(f"Folder: {agent.get('folder')}")
     if agent.get("model"):
@@ -1585,10 +1663,10 @@ def render_item(store: WorkflowStore, item_id: str) -> str:
              f"Queue: {meta['queue']}; " + (f"being worked on by {meta['taken_by']}"
                                             if meta["state"] == "taken" else meta["state"]) + "."]
     origin = f"Added by {meta['created_by']}"
-    if meta.get("from_item"):
-        origin += f" while working on {meta['from_item']}"
+    if item_origins(meta):
+        origin += f" while working on {', '.join(item_origins(meta))}"
     lines.append(origin + ".")
-    made = [i["id"] for i in store.items() if i.get("from_item") == meta["id"]]
+    made = [i["id"] for i in store.items() if meta["id"] in item_origins(i)]
     if made:
         lines.append(f"Items made from it: {', '.join(made)}")
     if meta.get("notes"):
@@ -1997,11 +2075,11 @@ def _content_text(value):
 # Instructions
 # ---------------------------------------------------------------------------
 
-def render_instructions(store: WorkflowStore, group: dict, agent: dict, item: dict | None,
+def render_instructions(store: WorkflowStore, group: dict, agent: dict, items: list[dict],
                         viewer_session_id: str = "") -> str:
     text = group["instructions"]
-    item_text = item_block(store, item) if item else "(this agent did not take an item)"
-    if item and "{{item}}" not in text:
+    item_text = "\n\n".join(item_block(store, i) for i in items) or "(this agent did not take an item)"
+    if items and "{{item}}" not in text:
         text = text.rstrip("\n") + "\n\n{{item}}\n"
     text = text.replace("{{item}}", item_text)
     text = text.replace("{{agent}}", agent["id"]).replace("{{workflow_name}}", store.name)
@@ -2209,10 +2287,14 @@ class WorkflowController:
                 continue
             if settings["count"] == 0:
                 reasons.append(f"{name} has count 0")
-            elif settings["takes_from"]:
-                waiting = sum(i["state"] == "waiting" for i in store.items(settings["takes_from"]))
-                if not waiting:
-                    reasons.append(f"{settings['takes_from']} is empty, so {name} has nothing to take")
+            else:
+                for queue, size in (settings["takes_from"] or {}).items():
+                    waiting = sum(i["state"] == "waiting" for i in store.items(queue))
+                    if size == 1 and not waiting:
+                        reasons.append(f"{queue} is empty, so {name} has nothing to take")
+                    elif waiting < size:
+                        reasons.append(f"{name} takes {size} items from {queue} at a time and "
+                                       f"{queue} has {waiting} waiting")
         return "; ".join(reasons) + "." if reasons else "all groups are at their count."
 
     def pause(self, name: str, group: str | None = None) -> str:
@@ -2272,8 +2354,8 @@ class WorkflowController:
                 except Exception as exc:
                     LOG.warning("Could not shut down %s: %s", agent["id"], exc)
                 with store.lock():
-                    if agent.get("item"):
-                        store.return_item(agent["item"], agent["id"], by="archive")
+                    for item_id in agent_items(agent):
+                        store.return_item(item_id, agent["id"], by="archive")
                 store.update_agent(agent["id"], state="stopped", problem="workflow archived")
                 ended.append(agent["id"])
             with store.lock():
@@ -2578,12 +2660,12 @@ class WorkflowController:
                 active = sum(a["state"] in ACTIVE_STATES for a in store.agents(group))
                 room = settings["count"] - active
                 while room > 0:
-                    item = None
+                    items = []
                     if settings["takes_from"]:
                         number = store.counters().get("agents", {}).get(group, 0) + 1
                         provisional = f"agt_{group_short(group)}_{number}"
-                        item = store.take_next(settings["takes_from"], provisional)
-                        if item is None:
+                        items = store.take_batch(settings["takes_from"], provisional)
+                        if not items:
                             break
                     elif settings["every"]:
                         last = float(last_started.get(group) or 0)
@@ -2591,31 +2673,31 @@ class WorkflowController:
                             break
                     folder_template = (settings["folder"] or definition["folder"]
                                        or control.get("default_folder") or self.launch["cwd"])
-                    agent = store.new_agent(group, version=store.version, item_id=item["id"] if item else None,
+                    agent = store.new_agent(group, version=store.version, item_ids=[i["id"] for i in items],
                                             sends_to=list(settings["sends_to"]), folder="", model=None)
                     agent["folder"] = render_folder(store, folder_template, agent)
                     store.save_agent(agent)
                     last_started[group] = time.time()
-                    planned.append((agent, settings, item))
+                    planned.append((agent, settings, items))
                     room -= 1
             store.update_control(last_started=last_started)
         started = []
-        for agent, settings, item in planned:
+        for agent, settings, items in planned:
             try:
                 model = self.model_for(definition, settings)
                 agent = store.update_agent(agent["id"], model=model)
-                message = render_instructions(store, settings, agent, item, self.me["session_id"])
+                message = render_instructions(store, settings, agent, items, self.me["session_id"])
                 self.launch_agent(store, agent, message)
-                store.log("agent_started", agent=agent["id"], item=item["id"] if item else None)
-                started.append(f"Started {agent['id']}" + (f" on {item['id']} from {item['queue']}." if item else "."))
+                store.log("agent_started", agent=agent["id"], items=[i["id"] for i in items])
+                started.append(f"Started {agent['id']}" + (f" on {batch_text(items)}." if items else "."))
             except Exception as exc:
-                self.launch_failed(store, agent, item, settings, exc)
+                self.launch_failed(store, agent, items, settings, exc)
         return started
 
-    def launch_failed(self, store, agent, item, settings, exc) -> None:
+    def launch_failed(self, store, agent, items, settings, exc) -> None:
         group = agent["group"]
         with store.lock():
-            if item:
+            for item in items:
                 store.return_item(item["id"], agent["id"], by="scheduler")
             control = store.control()
             paused = set(control.get("paused_groups") or []) | {group}
@@ -2689,14 +2771,17 @@ class WorkflowController:
                     self.send(store, agent, "shutdown")
                 except Exception as exc:
                     LOG.warning("Could not shut down %s: %s", agent_id, exc)
+            item_ids = agent_items(agent)
             with store.lock():
-                if agent.get("item"):
-                    store.return_item(agent["item"], agent_id, by="restart_agent")
+                for item_id in item_ids:
+                    store.return_item(item_id, agent_id, by="restart_agent")
             store.update_agent(agent_id, state="restarted", problem=None)
             store.log("agent_restarted", agent=agent_id)
             text = f"Stopped {agent_id} and discarded its progress."
-            if agent.get("item"):
-                text += f" {agent['item']} is back in {store.item(agent['item'])['queue']} for a fresh agent."
+            if len(item_ids) == 1:
+                text += f" {item_ids[0]} is back in {store.item(item_ids[0])['queue']} for a fresh agent."
+            elif item_ids:
+                text += f" {', '.join(item_ids)} are back in their queues for a fresh agent."
             if name not in self.managed:
                 text += f" This session does not control {name}; run it to start new agents."
             return text
@@ -2880,7 +2965,7 @@ class WorkflowsPlugin:
             try:
                 cached = store.agent(identity["agent"])
             except WorkflowError:
-                cached = {"id": identity["agent"], "group": "", "sends_to": [], "item": None, "state": "unknown"}
+                cached = {"id": identity["agent"], "group": "", "sends_to": [], "items": [], "state": "unknown"}
             cached["workflow"] = identity["workflow"]
             self.controller.worker_record = cached
         return cached
@@ -2986,12 +3071,12 @@ class WorkflowsPlugin:
     def taker_hint(store, queue) -> str:
         if queue == TRASH:
             return " Move them back out of q_trash to restore them."
-        takers = [g for g, s in store.definition()["agents"].items() if s["takes_from"] == queue]
-        if not takers:
+        groups = takers(store.definition(), queue)
+        if not groups:
             return f" No agent group takes from {queue}."
         if store.control().get("state") != "running":
-            return f" {', '.join(takers)} will take them when {store.name} runs."
-        return f" {', '.join(takers)} will take them."
+            return f" {', '.join(groups)} will take them when {store.name} runs."
+        return f" {', '.join(groups)} will take them."
 
     # -- worker handlers ------------------------------------------------------------
 
@@ -3024,7 +3109,7 @@ class WorkflowsPlugin:
         if not buffers:
             raise WorkflowError("from_buffers is empty")
         texts = [buffer_text(state, b) for b in buffers]
-        created = [store.add_item(queue, text, by=context["id"], note=note, from_item=context.get("item"),
+        created = [store.add_item(queue, text, by=context["id"], note=note, from_items=agent_items(context),
                                   allowed=allowed) for text in texts]
         ids = [m["id"] for m in created]
         record = store.agent(context["id"])
@@ -3057,7 +3142,7 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
     def finish_schema(context):
         return function_schema(
             "finish_task",
-            "Finish your assigned task and end this session. Your item is marked done whatever you send. "
+            "Finish your assigned task and end this session. The items you took are marked done whatever you send. "
             + allowed_text(context),
             {"summary": text_property("A few sentences on what you did and found, for whoever runs the workflow."),
              "outputs": outputs_property},
@@ -3088,8 +3173,9 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
         "create_workflow",
         "Create a new workflow from a YAML definition stored in a buffer. Nothing runs until it is started "
         "with command_workflow or /workflow run. Queues are named q_*, agent groups grp_*. A group with "
-        "takes_from starts one agent per item from that queue; a group without it keeps `count` agents "
-        "running. Example definition:\n" + EXAMPLE_DEFINITION,
+        "takes_from starts one agent per item from that queue; takes_from: {q_a: 2, q_b: 1} instead gives each "
+        "agent a batch (2 items from q_a and 1 from q_b) and starts it only once the whole batch is waiting. "
+        "A group without takes_from keeps `count` agents running. Example definition:\n" + EXAMPLE_DEFINITION,
         {"workflow_name": text_property('New workflow name: lowercase letters, digits and underscores, e.g. "miner".'),
          "definition_buffer": text_property("Buffer holding the YAML definition.")},
         ["workflow_name", "definition_buffer"])

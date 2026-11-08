@@ -11,6 +11,8 @@ and every workflow can be resumed from a later session.
 - **Queues** (`q_*`) hold items. An item is text plus its notes and history.
 - **Agent groups** (`grp_*`) start agents.
   - A group with `takes_from` starts one agent per item from that queue.
+    `takes_from: { q_a: 2, q_b: 1 }` instead gives each agent a batch (2 items from
+    `q_a` and 1 from `q_b`), started only once the whole batch is waiting.
   - A group without it keeps `count` agents running from the same instructions,
     optionally starting a new one at most once per `every` interval.
 - **Wiring** lives on agent groups (`takes_from`, `sends_to`), so rewiring is a
@@ -76,7 +78,7 @@ move_items(item_ids, to_queue, note=None)
 ```
 
 Workers only touch their own workflow, and only the queues in their group's
-`sends_to`. `finish_task` marks their item done and ends the session. Workers lose
+`sends_to`. `finish_task` marks their items done and ends the session. Workers lose
 the agent-facing RLM tools.
 
 ## Buffers

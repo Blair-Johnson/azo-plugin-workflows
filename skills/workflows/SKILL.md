@@ -66,14 +66,27 @@ agents:
       {{item}}
 ```
 
+To give each agent a batch instead of a single item, map queues to batch sizes:
+
+```yaml
+  grp_compare:
+    takes_from: { q_candidates: 2, q_references: 1 }   # each agent gets 2 + 1 items
+```
+
+An agent starts only when every listed queue has its full share waiting; items are
+taken oldest first and all at once. `{{item}}` expands to every item in the batch,
+each labeled with its ID and queue. A short tail (e.g. 1 item left when the batch
+size is 2) waits until more items arrive; `wf:<name>` explains why nothing starts,
+and you can lower the batch size with `update_workflow` to drain it.
+
 Always give a workflow a short `description`: it is how the user recognizes it in
 `/workflow list`.
 Group settings: `count` (agents at once, default 1), `takes_from`, `sends_to`,
 `every` (only without `takes_from`), `instructions` (required), `folder`, `model`.
 Queue settings: `notify_on_new`.
 
-In `instructions` and `folder`: `{{item}}` expands to the item the agent took
-(ID, title, notes, origin and text), `{{agent}}` to the agent ID,
+In `instructions` and `folder`: `{{item}}` expands to the items the agent took
+(ID, title, notes, origin and text of each), `{{agent}}` to the agent ID,
 `{{workflow_name}}` to the workflow name, and `{{buffer://wf:...}}` to a workflow
 view at launch time.
 

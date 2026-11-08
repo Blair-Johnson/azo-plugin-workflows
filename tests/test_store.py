@@ -37,7 +37,7 @@ def store(tmp_path):
 def test_parse_valid_definition():
     d = wf.parse_definition(DEFINITION)
     assert d["agents"]["grp_discovery"]["every"] == 1800
-    assert d["agents"]["grp_reverse"]["takes_from"] == "q_targets"
+    assert d["agents"]["grp_reverse"]["takes_from"] == {"q_targets": 1}
     assert d["queues"]["q_catalog"]["notify_on_new"] is True
 
 
@@ -200,15 +200,15 @@ def test_items_take_finish_move(store):
     b = store.add_item("q_targets", "BERT", by="user")
     assert a["id"] == "item_1" and a["title"] == "ResNet50"
     with store.lock():
-        agent = store.new_agent("grp_reverse", version=1, item_id=None, sends_to=["q_catalog", "q_changes"],
+        agent = store.new_agent("grp_reverse", version=1, item_ids=[], sends_to=["q_catalog", "q_changes"],
                                 folder="/tmp", model=None)
-        taken = store.take_next("q_targets", agent["id"])
-    assert taken["id"] == "item_1" and agent["id"] == "agt_reverse_1"
+        taken = store.take_batch({"q_targets": 1}, agent["id"])
+    assert [m["id"] for m in taken] == ["item_1"] and agent["id"] == "agt_reverse_1"
     with pytest.raises(wf.WorkflowError, match="restart_agent"):
         store.move_items(["item_1"], "q_trash", by="user")
-    store.update_agent(agent["id"], item="item_1", state="running")
+    store.update_agent(agent["id"], items=["item_1"], state="running")
     out = store.finish_agent(agent["id"], summary="done", outputs=[("q_catalog", "graph.mlir")])
-    assert out["created"][0]["from_item"] == "item_1"
+    assert out["created"][0]["from_items"] == ["item_1"]
     assert store.item("item_1")["state"] == "done"
     with pytest.raises(wf.WorkflowError, match="only send to"):
         store.add_item("q_targets", "x", by=agent["id"], allowed={"q_catalog"})
@@ -218,9 +218,79 @@ def test_items_take_finish_move(store):
     assert "from list" in block and "https://example" in block
 
 
+BATCH_DEFINITION = """\
+queues:
+  q_a: {}
+  q_b: {}
+  q_out: {}
+agents:
+  grp_pair:
+    count: 2
+    takes_from: { q_a: 2, q_b: 1 }
+    sends_to: [q_out]
+    instructions: Compare these.
+"""
+
+
+def test_parse_batches():
+    group = wf.parse_definition(BATCH_DEFINITION)["agents"]["grp_pair"]
+    assert group["takes_from"] == {"q_a": 2, "q_b": 1}
+    assert wf.describe_group(group) == "takes 2 from q_a and 1 from q_b, count 2, sends to q_out"
+    assert wf.describe_group({**group, "takes_from": {"q_a": 1}}).startswith("takes from q_a,")
+    bad = BATCH_DEFINITION.replace("{ q_a: 2, q_b: 1 }", "{ q_a: 0, q_b: true, q_c: 1, q_trash: 1 }")
+    with pytest.raises(wf.WorkflowError) as error:
+        wf.parse_definition(bad)
+    message = str(error.value)
+    assert "takes_from q_a must be a whole number of items from 1 to 100" in message
+    assert "takes_from q_b must be a whole number" in message
+    assert 'takes_from "q_c" is not listed under queues:' in message
+    assert "cannot take items from q_trash" in message
+    for value, problem in (("[q_a, q_b]", "mapping of queues"), ("{}", "at least one queue")):
+        with pytest.raises(wf.WorkflowError, match=problem):
+            wf.parse_definition(BATCH_DEFINITION.replace("{ q_a: 2, q_b: 1 }", value))
+
+
+def test_take_batch_is_all_or_nothing(tmp_path):
+    store = wf.WorkflowStore("pairs", tmp_path / "workflows")
+    store.create(BATCH_DEFINITION, by="user")
+    for text in ("a1", "a2", "a3"):
+        store.add_item("q_a", text, by="user")
+    with store.lock():
+        assert store.take_batch({"q_a": 2, "q_b": 1}, "agt_pair_1") == []
+    assert all(m["state"] == "waiting" for m in store.items())
+    store.add_item("q_b", "b1", by="user")
+    with store.lock():
+        batch = store.take_batch({"q_a": 2, "q_b": 1}, "agt_pair_1")
+        agent = store.new_agent("grp_pair", version=1, item_ids=[m["id"] for m in batch], sends_to=["q_out"],
+                                folder="/tmp", model=None)
+    assert [m["id"] for m in batch] == ["item_1", "item_2", "item_4"]
+    assert wf.batch_text(batch) == "item_1, item_2 from q_a and item_4 from q_b"
+    store.update_agent(agent["id"], state="running")
+    out = store.finish_agent(agent["id"], summary="done", outputs=[("q_out", "verdict")])
+    assert out["created"][0]["from_items"] == ["item_1", "item_2", "item_4"]
+    assert [store.item(i)["state"] for i in ("item_1", "item_2", "item_3", "item_4")] == \
+        ["done", "done", "waiting", "done"]
+    assert "Items made from it: item_5" in wf.render_item(store, "item_4")
+    assert "while working on item_1, item_2, item_4" in wf.render_item(store, "item_5")
+
+
+def test_settings_edit_keeps_batch_queue_order(tmp_path):
+    store = wf.WorkflowStore("pairs", tmp_path / "workflows")
+    store.create(BATCH_DEFINITION.replace(
+        "  grp_pair:\n    count: 2\n    takes_from: { q_a: 2, q_b: 1 }\n    sends_to: [q_out]\n"
+        "    instructions: Compare these.\n",
+        "  grp_pair: { takes_from: { q_b: 1, q_a: 2 }, count: 2, instructions: Compare these. }\n"), by="user")
+    store.set_count("grp_pair", 3, by="user")
+    group = store.definition()["agents"]["grp_pair"]
+    assert group["count"] == 3 and list(group["takes_from"]) == ["q_b", "q_a"]
+
+def test_records_from_before_batches_still_read():
+    assert wf.agent_items({"item": "item_3"}) == ["item_3"] and wf.agent_items({"item": None}) == []
+    assert wf.item_origins({"from_item": "item_3"}) == ["item_3"] and wf.item_origins({"from_item": None}) == []
+
 def test_finish_rejects_unallowed_queue(store):
     with store.lock():
-        agent = store.new_agent("grp_reverse", version=1, item_id=None, sends_to=["q_catalog"],
+        agent = store.new_agent("grp_reverse", version=1, item_ids=[], sends_to=["q_catalog"],
                                 folder="/tmp", model=None)
     with pytest.raises(wf.WorkflowError, match="only send to"):
         store.finish_agent(agent["id"], summary="", outputs=[("q_targets", "x")])
@@ -228,7 +298,7 @@ def test_finish_rejects_unallowed_queue(store):
 
 def test_effects_mention_running_agents(store):
     with store.lock():
-        agent = store.new_agent("grp_reverse", version=1, item_id=None, sends_to=["q_catalog", "q_changes"],
+        agent = store.new_agent("grp_reverse", version=1, item_ids=[], sends_to=["q_catalog", "q_changes"],
                                 folder="/tmp", model=None)
     store.update_agent(agent["id"], state="running")
     store.add_item("q_changes", "fix", by="user")
@@ -304,7 +374,7 @@ def test_list_puts_running_first_then_newest(store):
     rows = [line for line in body.splitlines() if line.startswith("| `")]
     assert rows[0].startswith("| `miner` | — | running |")
     assert rows[1].startswith("| `older` | — | paused |")
-    other.update_agent(other.new_agent("grp_reverse", version=1, item_id=None, sends_to=[], folder="/tmp",
+    other.update_agent(other.new_agent("grp_reverse", version=1, item_ids=[], sends_to=[], folder="/tmp",
                                        model=None)["id"], state="attention", problem="stuck")
     store.update_control(state="paused")
     rows = [line for line in wf.render_list(store.root)[1].splitlines() if line.startswith("| `")]

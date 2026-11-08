@@ -190,7 +190,8 @@ async def check_crash(name, store, client):
     saved = wf.saved_checkpoint(after["project"], after["session_id"])
     calls = [call for entry in saved.document.get("entries", []) for call in entry.get("tool_calls", [])]
     assert sum(call.get("name") == "await_interrupts" for call in calls) == 1
-    assert store.item(after["item"])["state"] == "done"
+    leased = wf.agent_items(after)
+    assert leased and all(store.item(i)["state"] == "done" for i in leased)
     print("PASS safe checkpoint resumed without repeating the tool call", flush=True)
 
 if __name__ == "__main__":

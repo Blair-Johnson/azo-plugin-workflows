@@ -144,6 +144,95 @@ def test_finished_agent_frees_a_slot(runtime):
     assert any("new items in q_catalog: item_4 (graph)" in n for n in runtime.controller.notices)
 
 
+PAIRS = """\
+queues:
+  q_a: {}
+  q_b: {}
+  q_out: {}
+agents:
+  grp_pair:
+    count: 2
+    takes_from: { q_a: 2, q_b: 1 }
+    sends_to: [q_out]
+    instructions: Compare these.
+"""
+
+
+def create_pairs(r):
+    r.state.buffer_manager.texts.update(buf_pairs=PAIRS, buf_a1="A one", buf_a2="A two", buf_a3="A three",
+                                        buf_b1="B one")
+    r.plugin.create_workflow(r.state, "pairs", "buf_pairs")
+    r.plugin.add_items(r.state, "pairs", "q_a", ["buf_a1", "buf_a2", "buf_a3"])
+    return wf.WorkflowStore("pairs")
+
+
+def test_batch_group_waits_for_a_full_batch(runtime):
+    store = create_pairs(runtime)
+    text = runtime.controller.run("pairs")
+    assert "No agents started yet: q_b is empty, so grp_pair has nothing to take." in text
+    assert "grp_pair will take them." in runtime.plugin.add_items(runtime.state, "pairs", "q_b", ["buf_b1"])
+    assert runtime.controller.tick("pairs") == ["Started agt_pair_1 on item_1, item_2 from q_a and item_4 from q_b."]
+    message = runtime.launcher.requests[-1].first_user_message
+    assert all(f"{i} from q_" in message for i in ("item_1", "item_2", "item_4")) and "item_3" not in message
+    assert store.agent("agt_pair_1")["items"] == ["item_1", "item_2", "item_4"]
+    assert runtime.controller.idle_reason(store, None) == (
+        "grp_pair takes 2 items from q_a at a time and q_a has 1 waiting; q_b is empty, so grp_pair has nothing "
+        "to take.")
+    text = runtime.controller.restart_agent("pairs", "agt_pair_1")
+    assert "item_1, item_2, item_4 are back in their queues" in text
+    assert all(m["state"] == "waiting" for m in store.items())
+
+
+def test_batch_returns_on_archive_and_launch_failure(runtime):
+    store = create_pairs(runtime)
+    runtime.plugin.add_items(runtime.state, "pairs", "q_b", ["buf_b1"])
+    runtime.controller.run("pairs")
+    assert store.agent("agt_pair_1")["items"] == ["item_1", "item_2", "item_4"]
+    runtime.controller.archive("pairs")
+    assert all(m["state"] == "waiting" and m["taken_by"] is None for m in store.items())
+    runtime.controller.unarchive("pairs")
+    runtime.launcher.start = Mock(side_effect=OSError("boom"))
+    runtime.controller.run("pairs")
+    assert store.agent("agt_pair_2")["state"] == "stopped" and "grp_pair" in store.control()["paused_groups"]
+    assert all(m["state"] == "waiting" and m["taken_by"] is None for m in store.items())
+
+
+def test_batch_worker_outputs_record_every_origin(runtime):
+    store = create_pairs(runtime)
+    runtime.plugin.add_items(runtime.state, "pairs", "q_b", ["buf_b1"])
+    runtime.controller.run("pairs")
+    worker = SimpleNamespace(_session_kind="wf:pairs:agt_pair_1", _session_id="w", _instance_id="w1",
+                             buffer_manager=Buffers(buf_early="early", buf_late="late"), pending_interrupts=[],
+                             entries=[])
+    plugin = wf.WorkflowsPlugin(wf.WorkflowController({}))
+    plugin.worker_add_items(worker, "q_out", ["buf_early"])
+    plugin.finish_task(worker, "Compared", [{"buffer": "buf_late", "queue": "q_out"}])
+    batch = ["item_1", "item_2", "item_4"]
+    assert [store.item(i)["from_items"] for i in ("item_5", "item_6")] == [batch, batch]
+    assert [store.item(i)["state"] for i in batch] == ["done"] * 3 and store.item("item_3")["state"] == "waiting"
+
+
+def test_legacy_single_item_records(runtime):
+    """Agent and item records written before batches use ``item`` and ``from_item``."""
+    store = create(runtime)
+    runtime.controller.run("miner")
+    for agent_id in ("agt_reverse_1", "agt_reverse_2"):
+        record = store.agent(agent_id)
+        record["item"] = record.pop("items")[0]
+        wf.write_json(store.agent_path(agent_id), record)
+    meta = store.add_item("q_catalog", "old result", by="agt_reverse_1")
+    meta.pop("from_items")
+    meta["from_item"] = "item_1"
+    wf.write_json(store.item_paths(meta["id"])[1], meta)
+    assert "agt_reverse_1 on item_1" in wf.render_group(store, "grp_reverse")
+    assert "while working on item_1" in wf.render_item(store, meta["id"])
+    assert "(from `item_1`)" in wf.render_queue_md(store, "q_catalog")[1]
+    out = store.finish_agent("agt_reverse_1", summary="done", outputs=[("q_catalog", "new result")])
+    assert store.item("item_1")["state"] == "done" and out["created"][0]["from_items"] == ["item_1"]
+    assert "item_2 is back in q_targets" in runtime.controller.restart_agent("miner", "agt_reverse_2")
+    assert store.item("item_2")["state"] == "waiting"
+
+
 def test_pause_then_run_resumes(runtime):
     store = create(runtime)
     runtime.controller.run("miner")
@@ -329,7 +418,7 @@ def test_worker_finish_task(runtime):
     assert worker.shutdown and worker.shutdown_reason == "suspend" and worker.done
     assert store.agent("agt_reverse_1")["state"] == "finished"
     assert store.item("item_1")["state"] == "done"
-    assert store.item("item_4")["from_item"] == "item_1"
+    assert store.item("item_4")["from_items"] == ["item_1"]
 
 
 def test_worker_reminder_then_attention(runtime):
