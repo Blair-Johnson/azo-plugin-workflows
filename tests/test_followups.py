@@ -123,17 +123,22 @@ def test_second_controller_adopts_live_pool_without_duplicates(runtime):
 
 def test_bundled_skill_precedes_preserved_config(runtime):
     from pathlib import Path
+    from agent_zoo.events import SessionReady
     registry = SimpleNamespace(add_sources=Mock())
-    wf.WorkflowSkillRegistration()(SimpleNamespace(skill_registry=registry, _session_kind="default"))
-    source = registry.add_sources.call_args.args[0]
-    assert Path(source.path).resolve() == Path(wf.__file__).resolve().parents[1] / "skills/workflows/SKILL.md"
+    wf.WorkflowSkillRegistration().handle(
+        SessionReady(),
+        SimpleNamespace(skill_registry=registry, _session_kind="default"),
+        lambda _ev: None,
+    )
+    sources = registry.add_sources.call_args.args[0]
+    assert Path(sources[0].path).resolve() == Path(wf.__file__).resolve().parents[1] / "skills/workflows/SKILL.md"
 
 
 def test_reaps_a_real_child_process(runtime):
     import subprocess
     import sys
     import time
-    from agent_zoo.runtime_launch import RuntimeHandle
+    from agent_zoo.host.launch import RuntimeHandle
     store = create(runtime)
     runtime.controller.run("miner")
     request = runtime.launcher.requests[0]

@@ -1732,27 +1732,57 @@ import shlex
 import threading
 import uuid
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
-from agent_utils import Feature, Tool, MODEL_RENDER_CHANNEL
-from agent_utils.components import (
-    InterruptCheck, InterruptDelivery, ToolDispatchStart, RenderTransformRegistrar, MessageRenderer,
+from agent_utils.core.events import (
+    Event,
+    IoCompleted,
+    IoFailed,
+    RenderRequested,
+    ToolCallFinished,
+    TurnSettled,
 )
-from agent_utils.files.buffer_manager import ReadonlyBufferView
-from agent_utils.session_cwd import get_session_cwd
-from agent_utils.session_repository import SessionRepository
-from agent_utils.skills import SkillSource
-from agents.llm import enabled_llm_models, require_model_enabled
-from agents.system_prompt import SystemPromptSkillList
-from agent_zoo.config_loader import CONFIG_PATH, load_layered_config
-from agent_zoo.live_session_registry import list_live_sessions
-from agent_zoo.projects import resolve_state_root
-from agent_zoo.runtime.commands import Command, CommandError, CommandResult
-from agent_zoo.runtime.models import InspectorDocument
-from agent_zoo.runtime_launch import CheckpointRef, Fresh, InstanceRef, Resume, RuntimeLaunch, RuntimeSettings
-from agent_zoo.session_store import resolve_local_root
-from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
-from agent_zoo.wsctl import AzoWs
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import MODEL_RENDER_CHANNEL, State, ToolCall
+from agent_utils.core.tool import Tool
+from agent_utils.features.buffers import ReadonlyBufferView
+from agent_utils.features.core import (
+    MessageRenderer,
+    RenderPlanInitializer,
+    RenderTransformRegistrar,
+    SchemaPublisher,
+)
+from agent_utils.features.interrupts import InterruptCheck, InterruptQueued
+from agent_utils.features.skills import SkillSource
+from agent_utils.runtime.driver import Driver
+from agent_utils.storage.repository import SessionRepository
+from agent_zoo.cli.wsctl import AzoWs
+from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
+from agent_zoo.events import (
+    BeforeLLM,
+    EmitNotice,
+    ProjectionRequested,
+    SessionReady,
+    SuspendRequested,
+)
+from agent_zoo.features.commands import Command, CommandError, CommandResult
+from agent_zoo.features.special_buffers import RegisterSpecialBuffers
+from agent_zoo.features.system_prompt import SystemPromptSkillList
+from agent_zoo.features.turn import LLMCaller
+from agent_zoo.host.launch import (
+    CheckpointRef,
+    Fresh,
+    InstanceRef,
+    Resume,
+    RuntimeLaunch,
+    RuntimeLauncher,
+    RuntimeSettings,
+)
+from agent_zoo.host.registry import list_live_sessions
+from agent_zoo.llm import enabled_llm_models, require_model_enabled
+from agent_zoo.storage.projects import resolve_state_root
+from agent_zoo.storage.store import resolve_local_root
+from agent_zoo.transport.models import CommandNotice, InspectorDocument
 from tmux_pilot.process_identity import ProcessIdentity, capture_process_identity, observe_process
 
 LOG = logging.getLogger(__name__)
@@ -1762,6 +1792,21 @@ TICK_SECONDS = 2.0
 READY_TIMEOUT_SECONDS = 120
 MAX_QUICK_RESUMES = 3
 WORKER_TOOLS_GROUP = "Workflows"
+
+
+def get_session_cwd(state) -> str:
+    """Resolve the active working directory from ``state.cwd`` (with legacy fallbacks)."""
+    cwd = (
+        getattr(state, "cwd", "")
+        or getattr(state, "session_cwd", "")
+        or getattr(state, "terminal_cwd", "")
+    )
+    return str(cwd) if cwd else os.getcwd()
+
+
+@dataclass
+class WorkflowNoticesReady(Event):
+    """Posted by ``WorkflowDriver`` when background workflow notices are queued."""
 
 
 def worker_identity(state):
@@ -2124,6 +2169,15 @@ class WorkflowController:
         self.adopted_instance = ""
         self.worker_record: dict | None = None
         self.worker_reminded_entry = -1
+        self._emit: EmitFn | None = None
+
+    def attach_emit(self, emit: EmitFn | None) -> None:
+        """Bind or clear the thread-safe ``Runtime.post`` callback."""
+        self._emit = emit
+
+    def stop(self) -> None:
+        """Signal any running background scheduler thread to exit."""
+        self.stop_event.set()
 
     # -- identity and launch settings (owner thread) -------------------------
 
@@ -2134,8 +2188,16 @@ class WorkflowController:
             self.me = {"session_id": session_id, "instance_id": instance_id}
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
         provenance = (self.config or {}).get("_runtime_launch", {}) or {}
-        self.launcher = getattr(state, "session_launcher", None) or self.launcher
-        if context.get("project_name") and context.get("project_store_root"):
+        project = context.get("project_name") or str(getattr(state, "_project_name", "") or "")
+        store_root = context.get("project_store_root") or ""
+        if not store_root and project:
+            store_root = str(Path(resolve_state_root()) / "projects" / project / "coordination")
+        launcher = getattr(state, "session_launcher", None)
+        if launcher is not None:
+            self.launcher = launcher
+        elif self.launcher is None and getattr(state, "_project_name", None):
+            self.launcher = RuntimeLauncher()
+        if project and store_root:
             local_root = getattr(state, "_persistence_local_root", "") or ""
             if not local_root:
                 try:
@@ -2143,7 +2205,7 @@ class WorkflowController:
                 except Exception:
                     local_root = ""
             self.launch = {
-                "project": context["project_name"], "store_root": context["project_store_root"],
+                "project": project, "store_root": store_root,
                 "state_root": str(resolve_state_root()), "local_state_root": str(local_root),
                 "config_path": str(provenance.get("config_path") or ""),
                 "config_sets": tuple(provenance.get("config_sets") or ()),
@@ -2187,6 +2249,12 @@ class WorkflowController:
                 return
             self.notified.add(key)
         self.notices.append(text)
+        emit = self._emit
+        if emit is not None:
+            try:
+                emit(WorkflowNoticesReady())
+            except Exception:
+                LOG.debug("Could not post WorkflowNoticesReady event", exc_info=True)
 
     # -- control ----------------------------------------------------------------
 
@@ -2898,17 +2966,34 @@ def buffer_text(state, buffer_id: str) -> str:
         raise WorkflowError(f"there is no buffer {buffer_id}") from None
 
 
+class WorkflowDriver(Driver):
+    """Bridges ``WorkflowController`` background scheduler notices into ``Runtime``."""
+
+    def __init__(self, controller: WorkflowController):
+        super().__init__()
+        self.controller = controller
+
+    def start(self, emit) -> None:
+        super().start(emit)
+        self.controller.attach_emit(emit)
+
+    def close(self) -> None:
+        self.controller.stop()
+        self.controller.attach_emit(None)
+        super().close()
+
+
 class WorkflowTool(Tool):
     """A tool with separate behavior (and schema) for controlling sessions and workers."""
     group = WORKER_TOOLS_GROUP
-    optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "buffer_manager",
-                      "session_launcher", "_persistence_local_root", "session_cwd"}
+    optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
+                      "buffer_manager", "session_launcher", "_persistence_local_root", "cwd", "session_cwd"}
     writes = {"done", "result", "shutdown", "shutdown_reason", "shutdown_save", "shutdown_registry_status",
               "shutdown_spawned_policy"}
 
     def __init__(self, name, *, controller_schema=None, worker_schema=None, on_controller=None, on_worker=None,
                  plugin=None):
-        self.name = name
+        super().__init__(name=name, group=WORKER_TOOLS_GROUP)
         self.controller_schema, self.worker_schema = controller_schema, worker_schema
         self.on_controller, self.on_worker = on_controller, on_worker
         self.plugin = plugin
@@ -2921,32 +3006,64 @@ class WorkflowTool(Tool):
     def available(self, state) -> bool:
         return bool(self.worker_schema if worker_identity(state) else self.controller_schema)
 
-    def _publish(self, state):
+    def _publish(self, state) -> None:
         worker = worker_identity(state)
         schema = self.worker_schema if worker else self.controller_schema
         if worker and callable(schema):
             schema = schema(self.plugin.worker_context(state))
         state.tool_schemas[self.name] = {"schema": schema or self.schema, "available": bool(schema)}
 
-    def transform(self, state):
-        for call, kwargs in self.pending(state):
-            worker = worker_identity(state)
-            handler = self.on_worker if worker else self.on_controller
-            try:
-                if handler is None:
-                    raise WorkflowError(f"{self.name} is not available in this session")
-                if not worker:
-                    self.plugin.controller.bind(state)
-                call.result = str(handler(state, **(kwargs or {})))
-            except (WorkflowError, TypeError, ValueError, OSError) as exc:
-                call.result = f"ERROR: {exc}"
-                call.error = True
-            except Exception as exc:
-                LOG.exception("Workflow tool %s failed", self.name)
-                call.result = f"ERROR: {type(exc).__name__}: {exc}"
-                call.error = True
-            self._notify(state, call)
-        return state
+    def call(self, state: State, **kwargs):
+        worker = worker_identity(state)
+        handler = self.on_worker if worker else self.on_controller
+        if handler is None:
+            raise WorkflowError(f"{self.name} is not available in this session")
+        if not worker:
+            self.plugin.controller.bind(state)
+        return str(handler(state, **kwargs))
+
+    def _finish_ok(self, tc: ToolCall, result, ts: float, emit: EmitFn) -> None:
+        super()._finish_ok(tc, result, ts, emit)
+        if self.name == "finish_task":
+            emit(
+                SuspendRequested(
+                    reason="suspend",
+                    save=True,
+                    spawned_policy="terminate",
+                    registry_status="completed",
+                )
+            )
+
+    def _finish_error(self, tc: ToolCall, exc: BaseException, ts: float, emit: EmitFn) -> None:
+        if isinstance(exc, (WorkflowError, TypeError, ValueError, OSError)):
+            tc.result = f"ERROR: {exc}"
+        else:
+            LOG.exception("Workflow tool %s failed", self.name)
+            tc.result = f"ERROR: {type(exc).__name__}: {exc}"
+        tc.error = True
+        tc.finished_at = ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
+
+
+class WorkflowSchemaPublisher:
+    """Publish dynamic controller/worker schemas onto ``state.tool_schemas``."""
+
+    handles = (RenderRequested, TurnSettled)
+    reads = {"tool_schemas"}
+    optional_reads = {"_session_kind", "_session_id"}
+    writes = {"tool_schemas"}
+
+    def __init__(self, tools: list[WorkflowTool]):
+        self._tools = tuple(tools)
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del event, emit
+        schemas = getattr(state, "tool_schemas", None)
+        if not isinstance(schemas, dict):
+            state.tool_schemas = {}
+        for tool in self._tools:
+            tool._publish(state)
 
 
 class WorkflowsPlugin:
@@ -2954,6 +3071,16 @@ class WorkflowsPlugin:
 
     def __init__(self, controller: WorkflowController):
         self.controller = controller
+        self.pending_command_ops: dict[str, str] = {}
+
+    def track_command_op(self, op_id, workflow_name: str = "") -> None:
+        if op_id is not None:
+            self.pending_command_ops[op_id] = workflow_name
+
+    def consume_command_op(self, op_id) -> tuple[bool, str]:
+        if op_id in self.pending_command_ops:
+            return True, self.pending_command_ops.pop(op_id)
+        return False, ""
 
     # -- worker context ---------------------------------------------------------
 
@@ -3414,22 +3541,62 @@ class WorkflowCommand:
             scope = f"{request['name']}:{request['group']}" if request["group"] else request["name"]
             receipt = f"{verb} {scope}..."
 
-        async def work():
+        def work():
             try:
-                return {"ok": True, "text": await asyncio.to_thread(action)}
+                return {"ok": True, "text": action()}
             except Exception as exc:
                 return {"ok": False, "text": f"Workflow {request['name']}: {exc}"}
 
-        ctx.defer(work, then=self.complete)
-        return CommandResult.notice(receipt)
+        op_id = ctx.defer(work, tag="workflow_command")
+        self.plugin.track_command_op(op_id, request["name"])
+        return CommandResult(
+            outputs=(CommandNotice(text=receipt, level="info"),),
+            operation_id=op_id,
+            refresh=False,
+        )
 
     @staticmethod
-    def complete(ctx, result):
-        if result["ok"]:
-            ctx.session.inject("The user typed a /workflow command. Result (already done; do not repeat it):\n"
-                               + result["text"], role="user", system_generated=True)
-            return CommandResult.notice(result["text"].splitlines()[0])
-        return CommandResult.notice(result["text"], level="warning")
+    def complete(state: State, result: dict, emit: EmitFn) -> None:
+        if result.get("ok"):
+            text = str(result.get("text") or "")
+            pending = getattr(state, "pending_interrupts", None)
+            if not isinstance(pending, list):
+                pending = []
+                state.pending_interrupts = pending
+            pending.append(
+                "The user typed a /workflow command. Result (already done; do not repeat it):\n" + text
+            )
+            emit(InterruptQueued(source="workflow_command"))
+            first_line = text.splitlines()[0] if text else "Workflow command completed."
+            emit(EmitNotice(first_line, level="info"))
+            emit(ProjectionRequested())
+            _wake_idle_session(state, emit)
+        else:
+            emit(EmitNotice(str(result.get("text") or "Workflow command failed."), level="warning"))
+            emit(ProjectionRequested())
+
+
+def _wake_idle_session(state: State, emit: EmitFn) -> None:
+    """Wake an idle, unpaused session after queuing a workflow interrupt."""
+    if getattr(state, "activity", "active") == "awaiting":
+        await_op = getattr(state, "await_timer_op", None)
+        if await_op is not None and hasattr(state, "io"):
+            state.io.cancel(await_op)
+            state.await_timer_op = None
+        state.activity = "active"
+    if (
+        getattr(state, "pending_tool_calls", None)
+        or getattr(state, "active_llm", None) is not None
+        or getattr(state, "startup_paused", False)
+        or getattr(state, "_runtime_startup_paused", False)
+        or getattr(state, "interrupted", False)
+        or getattr(state, "_interrupted", False)
+        or getattr(state, "shutdown", False)
+        or getattr(state, "done", False)
+    ):
+        return
+    emit(RenderRequested())
+    emit(BeforeLLM())
 
 
 # ---------------------------------------------------------------------------
@@ -3437,16 +3604,22 @@ class WorkflowCommand:
 # ---------------------------------------------------------------------------
 
 class WorkflowBuffers:
+    handles = (SessionReady, RenderRequested, TurnSettled)
     reads = {"buffer_manager"}
     writes = {"buffer_manager"}
-    optional_reads = {"_session_id", "_agent_zoo_context"}
+    optional_reads = {"_session_id", "_agent_zoo_context", "_session_kind"}
 
     def __init__(self, plugin: "WorkflowsPlugin | None" = None):
         self.plugin = plugin
 
-    def __call__(self, state):
-        state.buffer_manager.register_special_buffer_namespace("wf:", self.render, replace=True)
-        return state
+    def register(self, state) -> None:
+        manager = getattr(state, "buffer_manager", None)
+        if manager is not None:
+            manager.register_special_buffer_namespace("wf:", self.render, replace=True)
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del event, emit
+        self.register(state)
 
     def render(self, state, buffer_id):
         if not buffer_id.startswith("wf:"):
@@ -3479,6 +3652,7 @@ You are {agent} in workflow "{workflow}" (group {group}). Your task is in the fi
 
 class WorkflowSystemPrompt(RenderTransformRegistrar):
     """Durable role guidance on the system entry for workers and controllers."""
+    handles = (RenderRequested,)
     reads = {"entries"}
     optional_reads = {"_session_kind", "_session_id"}
     transform_name = "workflow role guidance"
@@ -3486,13 +3660,16 @@ class WorkflowSystemPrompt(RenderTransformRegistrar):
     def __init__(self, plugin: WorkflowsPlugin):
         self.plugin = plugin
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del emit
+        assert isinstance(event, RenderRequested)
+        if event.channels is not None and MODEL_RENDER_CHANNEL not in event.channels:
+            return
         if not state.entries:
-            return state
+            return
         entry = state.entries[0]
         if self.transform_name not in entry.render_transform_names(MODEL_RENDER_CHANNEL, pending=True):
             entry.append_render_transform(MODEL_RENDER_CHANNEL, self.transform, name=self.transform_name)
-        return state
 
     def transform(self, messages, state):
         if not messages or messages[0].get("role") != "system":
@@ -3522,59 +3699,122 @@ class WorkflowSystemPrompt(RenderTransformRegistrar):
 
 class WorkflowSkillRegistration(RenderTransformRegistrar):
     """Offer the bundled Workflows skill to controlling sessions only."""
+    handles = (SessionReady, RenderRequested)
     optional_reads = {"skill_registry", "_session_kind"}
     writes = {"skill_registry"}
 
     def __init__(self):
         self.registry = None
 
-    def __call__(self, state):
+    def apply(self, state) -> None:
         registry = getattr(state, "skill_registry", None)
         if registry is None or registry is self.registry:
-            return state
+            return
         if worker_identity(state):
-            existing = registry.get("Workflows")
+            existing = registry.get("Workflows") if callable(getattr(registry, "get", None)) else None
             if existing is not None:
-                registry.add_exclusions(existing.root)
+                if callable(getattr(registry, "add_exclusions", None)):
+                    registry.add_exclusions(existing.root)
+                else:
+                    file_skills = getattr(registry, "_file_skills", None)
+                    if isinstance(file_skills, list):
+                        registry._file_skills = [
+                            s for s in file_skills if s.name.lower() != "workflows"
+                        ]
+                    dynamic_skills = getattr(registry, "_dynamic_skills", None)
+                    if isinstance(dynamic_skills, dict):
+                        for key in [k for k in dynamic_skills if k.lower() == "workflows"]:
+                            dynamic_skills.pop(key, None)
+                    sources = getattr(registry, "_sources", None)
+                    if isinstance(sources, list):
+                        registry._sources = [
+                            s for s in sources if getattr(s, "kind", "") != PLUGIN_NAME
+                        ]
+                    rebuild = getattr(registry, "_rebuild", None)
+                    if callable(rebuild):
+                        rebuild()
         else:
             relative = Path("skills/workflows/SKILL.md")
             installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN_NAME / relative
             bundled = Path(__file__).resolve().parent.parent / relative
             package = bundled if bundled.is_file() else installed
             if package.is_file():
-                registry.add_sources(SkillSource(package, kind=PLUGIN_NAME, scope="bundled",
-                                                 precedence=-5000, native=True, always_list=True))
+                source = SkillSource(str(package), kind=PLUGIN_NAME, scope="bundled",
+                                     precedence=-5000, native=True, always_list=True)
+                if callable(getattr(registry, "add_sources", None)):
+                    registry.add_sources([source])
+                if callable(getattr(registry, "register_skill_text", None)):
+                    try:
+                        registry.register_skill_text(
+                            str(package),
+                            package.read_text(encoding="utf-8"),
+                            source=source,
+                        )
+                    except Exception:
+                        LOG.warning("Could not register bundled Workflows skill text", exc_info=True)
         self.registry = registry
-        return state
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del event, emit
+        self.apply(state)
 
 
 class WorkflowNotices(InterruptCheck):
     """Owner-thread hook: adopt workflows after restart, deliver notices, remind workers."""
     check_name = "workflow_notices"
     cooldown = 0
-    optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "session_launcher",
-                      "_persistence_local_root", "session_cwd", "entries", "buffer_manager", "done"}
-    writes = {"pending_interrupts", "buffer_manager"}
-    init = {"pending_interrupts": list}
+    handles = (SessionReady, TurnSettled, WorkflowNoticesReady, IoCompleted, IoFailed)
+    reads = {"step"}
+    optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
+                      "session_launcher", "_persistence_local_root", "cwd", "session_cwd", "entries",
+                      "buffer_manager", "done", "shutdown"}
+    writes = {"pending_interrupts", "_interrupt_state", "buffer_manager"}
 
     def __init__(self, plugin: WorkflowsPlugin):
         self.plugin = plugin
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, (IoCompleted, IoFailed)):
+            matched, workflow_name = self.plugin.consume_command_op(event.op_id)
+            if not matched:
+                return
+            event.stop()
+            if isinstance(event, IoCompleted) and isinstance(event.value, dict):
+                result = event.value
+            elif isinstance(event, IoCompleted):
+                result = {"ok": True, "text": str(event.value or "")}
+            else:
+                result = {"ok": False, "text": f"Workflow {workflow_name}: {event.error}"}
+            WorkflowCommand.complete(state, result, emit)
+            return
+
         if getattr(state, "buffer_manager", None) is not None:
-            WorkflowBuffers(self.plugin)(state)  # Paused startups skip ordinary components.
+            WorkflowBuffers(self.plugin).register(state)
         if worker_identity(state):
-            self.remind_worker(state)
-            return state
+            if isinstance(event, SessionReady):
+                entries = getattr(state, "entries", None) or []
+                if entries and self.plugin.controller.worker_reminded_entry < 0:
+                    self.plugin.controller.worker_reminded_entry = len(entries) - 1
+            elif isinstance(event, TurnSettled):
+                self.remind_worker(state)
+            return
+
         controller = self.plugin.controller
         if getattr(state, "_instance_id", ""):
             try:
                 controller.adopt(state)
             except Exception:
                 LOG.exception("Workflow adoption failed")
+        drained = 0
         while controller.notices:
+            self._ensure_interrupt_attrs(state)
             state.pending_interrupts.append(controller.notices.popleft())
-        return state
+            drained += 1
+        if drained and isinstance(event, (SessionReady, WorkflowNoticesReady)):
+            emit(InterruptQueued(source=self.check_name))
+            if isinstance(event, WorkflowNoticesReady):
+                emit(ProjectionRequested())
+                _wake_idle_session(state, emit)
 
     def remind_worker(self, state):
         """A worker that ends its turn without finish_task gets one reminder, then needs attention."""
@@ -3603,6 +3843,7 @@ class WorkflowNotices(InterruptCheck):
             reminders = int(context.get("reminders", 0))
             if reminders == 0:
                 store.update_agent(context["id"], reminders=1)
+                self._ensure_interrupt_attrs(state)
                 state.pending_interrupts.append(
                     "You ended your turn without calling finish_task. If your task is done, call finish_task now "
                     "with your summary and outputs. If it is not done, keep working.")
@@ -3631,16 +3872,26 @@ def register_features(builder, *, session, config):
     controller.config = config
     plugin = WorkflowsPlugin(controller)
     if worker_identity(state) and builder.has("rlm"):
-        # Workers do their own work: remove agent-facing RLM tools, keep compaction machinery.
+        # Workers do their own work: remove agent-facing RLM tools, keep completion machinery.
         feature = builder._features["rlm"]
         builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
+    tools = build_tools(plugin)
     builder.add(Feature("workflows", components=[
-        WorkflowBuffers(plugin), WorkflowNotices(plugin), *build_tools(plugin),
+        WorkflowBuffers(plugin),
+        WorkflowNotices(plugin),
+        *tools,
+        WorkflowSchemaPublisher(tools),
         Command("/workflow", "List, show, run, pause, rename, archive or change workflows", WorkflowCommand(plugin),
                 raw=True,
                 usage=USAGE, section="Workflows"),
-    ], order=[RegisterSpecialBuffers, WorkflowBuffers, Command, WorkflowNotices, InterruptDelivery,
-              ToolDispatchStart]))
+    ], order=[
+        RegisterSpecialBuffers,
+        WorkflowBuffers,
+        Tool,
+        SchemaPublisher,
+        WorkflowSchemaPublisher,
+        {RenderPlanInitializer, LLMCaller},
+    ], drivers=[WorkflowDriver(controller)]))
     builder.add(Feature("workflow_guidance", components=[
         WorkflowSkillRegistration(), WorkflowSystemPrompt(plugin),
     ], order=[WorkflowSkillRegistration, WorkflowSystemPrompt, SystemPromptSkillList, MessageRenderer]))

@@ -11,7 +11,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import workflows as wf
-from agent_zoo.runtime_launch import RuntimeLauncher, RuntimeLaunch, RuntimeSettings, InstanceRef
+from agent_zoo.host.launch import RuntimeLauncher, RuntimeLaunch, RuntimeSettings, InstanceRef
 
 
 async def wait_for(label, predicate, timeout=120):

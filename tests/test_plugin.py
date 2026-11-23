@@ -1,12 +1,16 @@
 """Plugin surface, scheduling, control and recovery with a fake launcher and websocket."""
-import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+import warnings
 
 import pytest
-from agent_utils import Session, Tool
-from agent_zoo.runtime.commands import CommandError
+from agent_utils.core.events import IoCompleted, RenderRequested, RunToolCall, TurnSettled
+from agent_utils.core.session import Session
+from agent_utils.core.state import Entry, ToolCall
+from agent_utils.core.tool import Tool
+from agent_zoo.events import EmitNotice, RunPluginTask, SessionReady, SlashCommand, SuspendRequested
+from agent_zoo.features.commands import CommandError
 
 import workflows as wf
 
@@ -427,15 +431,16 @@ def test_worker_reminder_then_attention(runtime):
     worker = worker_state(runtime, "agt_reverse_1")
     plugin = wf.WorkflowsPlugin(wf.WorkflowController({}))
     check = wf.WorkflowNotices(plugin)
+    emit = lambda _ev: None
     worker.entries = [SimpleNamespace(role="system"), SimpleNamespace(role="user")]
-    check(worker)  # baseline
+    check.handle(TurnSettled(), worker, emit)  # baseline
     worker.entries.append(SimpleNamespace(role="assistant", tool_calls=[]))
-    check(worker)
+    check.handle(TurnSettled(), worker, emit)
     assert "without calling finish_task" in worker.pending_interrupts[-1]
-    check(worker)  # same entry: no second reminder
+    check.handle(TurnSettled(), worker, emit)  # same entry: no second reminder
     assert len(worker.pending_interrupts) == 1
     worker.entries += [SimpleNamespace(role="user"), SimpleNamespace(role="assistant", tool_calls=None)]
-    check(worker)
+    check.handle(TurnSettled(), worker, emit)
     assert store.agent("agt_reverse_1")["state"] == "attention"
 
 
@@ -461,11 +466,37 @@ def test_worker_schema_lists_allowed_queues(runtime):
 
 # -- command ---------------------------------------------------------------------
 
+def command_context(runtime):
+    emitted = []
+    op_counter = {"n": 0}
+
+    def defer(fn, *args, **kwargs):
+        op_counter["n"] += 1
+        op_id = f"op_{op_counter['n']}"
+        return op_id
+
+    defer_mock = Mock(side_effect=defer)
+    return SimpleNamespace(
+        state=runtime.state,
+        emit=emitted.append,
+        emitted=emitted,
+        defer=defer_mock,
+    )
+
+
+def finish_deferred(runtime, ctx):
+    work = ctx.defer.call_args.args[0]
+    op_id = f"op_{ctx.defer.call_count}"
+    result = work()
+    notices = wf.WorkflowNotices(runtime.plugin)
+    notices.handle(IoCompleted(op_id=op_id, value=result), ctx.state, ctx.emit)
+    return result
+
+
 def test_command_parsing_and_dispatch(runtime):
     create(runtime)
     command = wf.WorkflowCommand(runtime.plugin)
-    session = SimpleNamespace(state=runtime.state, inject=Mock())
-    ctx = SimpleNamespace(state=runtime.state, session=session, defer=Mock())
+    ctx = command_context(runtime)
     listing = command(ctx, raw_args="")
     assert listing.outputs[0].body.startswith("| Workflow | Description | Status | Waiting | Done | Updated |")
     with pytest.raises(CommandError, match="usage"):
@@ -479,24 +510,11 @@ def test_command_parsing_and_dispatch(runtime):
     ctx.defer.assert_not_called()
     receipt = command(ctx, raw_args=" run miner")
     assert receipt.outputs[0].text == "Running miner..."
-    work, then = ctx.defer.call_args.args[0], ctx.defer.call_args.kwargs["then"]
-    result = asyncio.run(work())
+    result = finish_deferred(runtime, ctx)
     assert result["ok"] and "Started agt_reverse_1" in result["text"]
-    notice = then(ctx, result)
-    assert notice.outputs[0].text.startswith("Running miner from this session")
-    assert "do not repeat" in session.inject.call_args.args[0]
-
-
-def command_context(runtime):
-    session = SimpleNamespace(state=runtime.state, inject=Mock())
-    return SimpleNamespace(state=runtime.state, session=session, defer=Mock())
-
-
-def finish_deferred(ctx):
-    work, then = ctx.defer.call_args.args[0], ctx.defer.call_args.kwargs["then"]
-    result = asyncio.run(work())
-    then(ctx, result)
-    return result
+    notice_events = [e for e in ctx.emitted if isinstance(e, EmitNotice)]
+    assert notice_events[-1].text.startswith("Running miner from this session")
+    assert "do not repeat" in ctx.state.pending_interrupts[-1]
 
 
 def test_command_list_archive_and_rename(runtime):
@@ -512,11 +530,11 @@ def test_command_list_archive_and_rename(runtime):
     assert "discovery" not in listing.body
     assert '`/workflow set NAME description "..."`' in listing.body
     command(ctx, raw_args=' set scratch description "Throwaway test of archiving"')
-    assert "It shows in /workflow list" in finish_deferred(ctx)["text"]
+    assert "It shows in /workflow list" in finish_deferred(runtime, ctx)["text"]
     assert "| `scratch` | Throwaway test of archiving | paused |" in command(ctx, raw_args="").outputs[0].body
 
     assert command(ctx, raw_args=" archive scratch").outputs[0].text == "Archiving scratch..."
-    assert finish_deferred(ctx)["ok"]
+    assert finish_deferred(runtime, ctx)["ok"]
     listing = command(ctx, raw_args="").outputs[0]
     assert "`scratch`" not in listing.body and "1 archived workflow hidden" in listing.body
     assert listing.subtitle == "1 paused · 1 archived"
@@ -538,11 +556,11 @@ def test_command_list_archive_and_rename(runtime):
     with pytest.raises(CommandError, match="reserved"):
         command(ctx, raw_args=" rename miner archived")
     assert command(ctx, raw_args=" rename miner test_failures").outputs[0].text == "Renaming miner to test_failures..."
-    assert finish_deferred(ctx)["ok"]
-    assert "Renamed miner to test_failures" in ctx.session.inject.call_args.args[0]
+    assert finish_deferred(runtime, ctx)["ok"]
+    assert "Renamed miner to test_failures" in ctx.state.pending_interrupts[-1]
     assert "| `test_failures` | — | paused |" in command(ctx, raw_args="").outputs[0].body
     command(ctx, raw_args=" unarchive scratch")
-    finish_deferred(ctx)
+    finish_deferred(runtime, ctx)
     assert command(ctx, raw_args="").outputs[0].subtitle == "2 paused"
 
 
@@ -611,22 +629,22 @@ def test_command_set_model_and_count(runtime):
     ctx = command_context(runtime)
     receipt = command(ctx, raw_args=" set miner:grp_reverse model big")
     assert receipt.outputs[0].text == "Setting miner:grp_reverse model to big..."
-    result = finish_deferred(ctx)
+    result = finish_deferred(runtime, ctx)
     assert result["ok"]
     assert "Set miner:grp_reverse model from default to big (def_2)." in result["text"]
     assert "agt_reverse_1 (offline), agt_reverse_2 (offline) keep their current model" in result["text"]
-    assert "do not repeat" in ctx.session.inject.call_args.args[0]
+    assert "do not repeat" in ctx.state.pending_interrupts[-1]
     command(ctx, raw_args=" set miner:grp_reverse count 3")
-    result = finish_deferred(ctx)
+    result = finish_deferred(runtime, ctx)
     assert "Started agt_reverse_3 on item_3 from q_targets." in result["text"]
     assert runtime.launcher.requests[-1].settings.model == "big"
     command(ctx, raw_args=" set miner:grp_reverse model default")
-    finish_deferred(ctx)
+    finish_deferred(runtime, ctx)
     assert store.definition()["agents"]["grp_reverse"]["model"] is None
     command(ctx, raw_args=" set miner:q_catalog notify off")
-    assert "no longer notify" in finish_deferred(ctx)["text"]
+    assert "no longer notify" in finish_deferred(runtime, ctx)["text"]
     command(ctx, raw_args=' set miner folder "~/work/my miner"')
-    finish_deferred(ctx)
+    finish_deferred(runtime, ctx)
     assert store.definition()["folder"] == "~/work/my miner"
     assert [store.version_meta(v)["reason"] for v in range(2, store.version + 1)] == [
         "User set miner:grp_reverse model from default to big",
@@ -654,8 +672,8 @@ def test_create_and_update_check_models(runtime):
                                             ("wf:miner:agt_reverse_1x", False), ("rlm", False)])
 def test_plugin_builds_real_default_pipeline(tmp_path, monkeypatch, kind, is_worker):
     import agent_zoo.pipelines as pipelines
-    import agent_zoo.plugins as plugins
-    from agent_zoo.modes import default_modes
+    import agent_zoo.plugins.loader as plugins
+    from agent_zoo.features.modes import default_modes
     root = tmp_path / "plugins"
     (root / "default").mkdir(parents=True)
     (root / "default" / "workflows.py").write_text(Path(wf.__file__).read_text())
@@ -667,23 +685,129 @@ def test_plugin_builds_real_default_pipeline(tmp_path, monkeypatch, kind, is_wor
     session = Session(system_prompt="offline", token_budget=120000)
     session.state._session_kind = kind
     pipeline = pipelines.build_default_pipeline(
-        session, config={}, skill_paths=[], max_idle=0, terminal_backend="headless",
-        mode_defs=default_modes(), on_interrupt=lambda _: None)
+        session, config={}, skill_paths=[], terminal_backend="headless",
+        mode_defs=default_modes(), include_llm_drivers=False)
     session.pipeline = pipeline
-    session.ensure_initialized()
+    session.step(SessionReady())
+    session.render()
     tools = {c.name for c in pipeline if isinstance(c, Tool)}
     assert {"create_workflow", "update_workflow", "command_workflow", "rename_workflow", "set_agent_count",
             "message_agents",
             "restart_agent", "add_items", "move_items", "finish_task"} <= tools
     assert bool(tools & {"submit_rlm", "rlm_status", "cancel_rlm"}) == (not is_worker)
     assert any(type(c).__name__ == "WorkflowNotices" for c in pipeline)
-    prompt = next(c for c in pipeline if type(c).__name__ == "WorkflowSystemPrompt")
-    rendered = prompt.transform([{"role": "system", "content": "Base"}], session.state)[0]["content"]
+    rendered = session.messages[0]["content"]
     assert ("# Workflow agent" in rendered) == is_worker
-    registration = next(c for c in pipeline if type(c).__name__ == "WorkflowSkillRegistration")
-    registration(session.state)
     assert bool(session.state.skill_registry.get("Workflows")) == (not is_worker)
-    session.state.buffer_manager  # registered by the pipeline
-    buffers = next(c for c in pipeline if type(c).__name__ == "WorkflowBuffers")
-    buffers(session.state)
     assert "There are no workflows yet" in session.state.buffer_manager.resolve_for_read(session.state, "wf:index").text
+    assert session.state.tool_schemas["finish_task"]["available"] is is_worker
+    assert session.state.tool_schemas["create_workflow"]["available"] is (not is_worker)
+    add_props = session.state.tool_schemas["add_items"]["schema"]["function"]["parameters"]["properties"]
+    assert ("workflow_name" in add_props) is (not is_worker)
+
+
+def test_register_features_composes_cleanly_on_default_builder():
+    from agent_zoo.pipelines import build_default_builder
+    session = Session(system_prompt="base", token_budget=120000)
+    builder = build_default_builder(
+        session, config={}, include_plugins=False, include_llm_drivers=False,
+    )
+    wf.register_features(builder, session=session, config={})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pipeline = builder.build()
+    assert not caught, [str(w.message) for w in caught]
+    drivers = builder.build_drivers({})
+    assert any(isinstance(d, wf.WorkflowDriver) for d in drivers)
+    session.pipeline = pipeline
+    session.step(SessionReady())
+    session.render()
+    assert "There are no workflows yet" in session.state.buffer_manager.resolve_for_read(session.state, "wf:index").text
+
+
+def test_event_driven_tool_and_slash_command_pipeline(tmp_path, monkeypatch):
+    from agent_zoo.events import SaveCheckpoint
+    from agent_zoo.pipelines import build_default_builder
+
+    monkeypatch.setattr(wf.WorkflowController, "ensure_thread", lambda self: None)
+    monkeypatch.setattr(wf, "saved_model_config", lambda config: None)
+    launcher = FakeLauncher()
+    cfg = {"llm": {"default": "offline", "models": {"offline": {"litellm": {"request": {"model": "a"}}}}}}
+    session = Session(system_prompt="base", token_budget=120000, cwd=str(tmp_path / "work"))
+    session.state._session_id = "parent"
+    session.state._instance_id = "parent-a"
+    session.state._agent_zoo_context = {
+        "project_name": "test",
+        "project_store_root": str(tmp_path / "registry"),
+    }
+    session.state.session_launcher = launcher
+    session.state._persistence_local_root = str(tmp_path / "local")
+    session.state.startup_paused = True
+
+    builder = build_default_builder(
+        session, config=cfg, include_plugins=False, include_llm_drivers=False,
+    )
+    wf.register_features(builder, session=session, config=cfg)
+    session.pipeline = builder.build()
+    drivers = builder.build_drivers(cfg)
+    driver = next(d for d in drivers if isinstance(d, wf.WorkflowDriver))
+    posted = []
+    driver.start(posted.append)
+
+    session.step(SessionReady(session_id="parent", instance_id="parent-a", paused=True))
+    bid, _ = session.state.buffer_manager.create_scratch_buffer(DEFINITION)
+
+    # Dispatch create_workflow through RunToolCall.
+    tc = ToolCall(
+        id="tc_1",
+        name="create_workflow",
+        raw_args="{}",
+        parsed_args={"workflow_name": "miner", "definition_buffer": bid},
+    )
+    session.step(RunToolCall(tc))
+    assert not tc.error and "Created workflow miner (def_1)" in tc.result
+
+    # Dispatch /workflow run miner through SlashCommand -> SubmitOp(RunPluginTask) -> IoCompleted.
+    effects = session.step(SlashCommand(raw="/workflow run miner"))
+    task_effects = [eff for eff in effects if isinstance(getattr(eff, "request", None), RunPluginTask)]
+    assert len(task_effects) == 1
+    task_eff = task_effects[0]
+    task_result = task_eff.request.fn(*task_eff.request.args, **task_eff.request.kwargs)
+    assert task_result["ok"] and "Started agt_discovery_1." in task_result["text"]
+    session.step(IoCompleted(op_id=task_eff.op_id, value=task_result))
+    assert any(
+        e.system_generated and "do not repeat" in e.messages[0]["content"]
+        for e in session.state.entries
+    )
+
+    # Verify WorkflowDriver posts WorkflowNoticesReady and delivers notices via InterruptDelivery.
+    session.state.entries.append(Entry(messages=[{"role": "assistant", "content": "ok"}], index=len(session.state.entries), step=session.state.step))
+    driver.controller.notice("Workflow miner: new items in q_catalog.")
+    assert any(isinstance(ev, wf.WorkflowNoticesReady) for ev in posted)
+    session.step(posted[-1])
+    assert any(
+        e.system_generated and "new items in q_catalog" in e.messages[0]["content"]
+        for e in session.state.entries
+    )
+    driver.close()
+    assert driver.controller.stop_event.is_set()
+
+    # Verify worker finish_task emits SuspendRequested -> SaveCheckpoint via pipeline step.
+    worker_session = Session(system_prompt="base", token_budget=120000)
+    worker_session.state._session_kind = "wf:miner:agt_discovery_1"
+    worker_builder = build_default_builder(
+        worker_session, config=cfg, include_plugins=False, include_llm_drivers=False,
+    )
+    wf.register_features(worker_builder, session=worker_session, config=cfg)
+    worker_session.pipeline = worker_builder.build()
+    worker_session.step(SessionReady())
+    finish_tc = ToolCall(
+        id="tc_finish",
+        name="finish_task",
+        raw_args="{}",
+        parsed_args={"summary": "All done"},
+    )
+    finish_effects = worker_session.step(RunToolCall(finish_tc))
+    assert not finish_tc.error and "Task finished" in finish_tc.result
+    assert worker_session.state.shutdown and worker_session.state.done
+    assert any(isinstance(getattr(eff, "request", None), SaveCheckpoint) for eff in finish_effects)

@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 
 import yaml
-from agent_zoo.live_session_registry import list_live_sessions
-from agent_zoo.wsctl import AzoWs
+from agent_zoo.host.registry import list_live_sessions
+from agent_zoo.cli.wsctl import AzoWs
 
 
 async def main():
