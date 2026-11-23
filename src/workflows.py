@@ -1725,23 +1725,26 @@ def render_view(buffer_id: str, *, viewer_session_id: str = "", transcript=None,
 # Agent Zoo integration
 # ===========================================================================
 
-import asyncio
 import collections
+import inspect
 import logging
 import shlex
-import threading
 import uuid
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from typing import Any
 
 from agent_utils.core.events import (
     Event,
     IoCompleted,
     IoFailed,
     RenderRequested,
+    TimerFired,
     ToolCallFinished,
     TurnSettled,
 )
+from agent_utils.core.io import IoRequest, OpId, StartTimer
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import MODEL_RENDER_CHANNEL, State, ToolCall
 from agent_utils.core.tool import Tool
@@ -1754,36 +1757,42 @@ from agent_utils.features.core import (
 )
 from agent_utils.features.interrupts import InterruptCheck, InterruptQueued
 from agent_utils.features.skills import SkillSource
-from agent_utils.runtime.driver import Driver
 from agent_utils.storage.repository import SessionRepository
-from agent_zoo.cli.wsctl import AzoWs
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
 from agent_zoo.events import (
+    AdoptSession,
     BeforeLLM,
+    ConfigureSessionLifecycle,
+    DiscoverSessions,
+    DiscoverSessionsResult,
     EmitNotice,
+    ExternalSessionExited,
+    ExternalSessionReady,
+    LiveSessionInfo,
+    ObserveSession,
     ProjectionRequested,
+    SendSessionData,
+    SendSessionInput,
+    SessionArtifact,
+    SessionDataReceived,
+    SessionDeliveryResult,
+    SessionObservation,
     SessionReady,
+    SessionSource,
+    SessionSpawnResult,
+    SessionSpec,
+    SpawnSession,
+    StopSession,
     SuspendRequested,
 )
 from agent_zoo.features.commands import Command, CommandError, CommandResult
 from agent_zoo.features.special_buffers import RegisterSpecialBuffers
 from agent_zoo.features.system_prompt import SystemPromptSkillList
 from agent_zoo.features.turn import LLMCaller
-from agent_zoo.host.launch import (
-    CheckpointRef,
-    Fresh,
-    InstanceRef,
-    Resume,
-    RuntimeLaunch,
-    RuntimeLauncher,
-    RuntimeSettings,
-)
-from agent_zoo.host.registry import list_live_sessions
 from agent_zoo.llm import enabled_llm_models, require_model_enabled
 from agent_zoo.storage.projects import resolve_state_root
 from agent_zoo.storage.store import resolve_local_root
 from agent_zoo.transport.models import CommandNotice, InspectorDocument
-from tmux_pilot.process_identity import ProcessIdentity, capture_process_identity, observe_process
 
 LOG = logging.getLogger(__name__)
 
@@ -1792,6 +1801,14 @@ TICK_SECONDS = 2.0
 READY_TIMEOUT_SECONDS = 120
 MAX_QUICK_RESUMES = 3
 WORKER_TOOLS_GROUP = "Workflows"
+
+RECOVERY_MESSAGE = (
+    "Your session was restarted from a checkpoint after an interruption. "
+    "Inspect saved results and existing processes/artifacts before continuing. "
+    "Do not repeat a command just because its output is missing; if its outcome is "
+    "uncertain, report that uncertainty instead of retrying it. "
+    "Continue from confirmed progress and call finish_task when done."
+)
 
 
 def get_session_cwd(state) -> str:
@@ -1802,11 +1819,6 @@ def get_session_cwd(state) -> str:
         or getattr(state, "terminal_cwd", "")
     )
     return str(cwd) if cwd else os.getcwd()
-
-
-@dataclass
-class WorkflowNoticesReady(Event):
-    """Posted by ``WorkflowDriver`` when background workflow notices are queued."""
 
 
 def worker_identity(state):
@@ -1922,56 +1934,19 @@ def check_definition_models(definition: dict, config) -> None:
         raise WorkflowError("The definition has problems:\n" + "\n".join(f"- {p}" for p in problems))
 
 
-def process_evidence(identity: dict | None) -> str:
-    """'alive', 'dead' or 'unknown' for a recorded process identity."""
-    if not identity:
-        return "unknown"
-    try:
-        return observe_process(ProcessIdentity.from_dict(identity)).state.value.lower()
-    except Exception:
-        return "unknown"
-
-
-def run_async(factory, timeout: float = 30):
-    """Run a coroutine factory to completion from synchronous code on any thread."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(asyncio.wait_for(factory(), timeout))
-    box = {}
-
-    def target():
-        try:
-            box["value"] = asyncio.run(asyncio.wait_for(factory(), timeout))
-        except BaseException as exc:  # Re-raised on the calling thread.
-            box["error"] = exc
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout + 5)
-    if "error" in box:
-        raise box["error"]
-    return box.get("value")
-
-
-async def send_to_agent(target: dict, action: str, message: str = "") -> None:
-    """Send one frame to a live agent after proving its websocket identity."""
-    client = AzoWs.attach(target["websocket_url"], modern=False, terminate_on_close=False,
-                          connect_timeout_s=10)
-    try:
-        await client.connect()
-        hello = client.observation().hello or {}
-        if (hello.get("session_id") != target["session_id"]
-                or hello.get("instance_id") != target["instance_id"] or client.protocol_errors):
-            raise WorkflowError("the agent's websocket belongs to a different session")
-        if action == "message":
-            await client.send_user(message, client_id=uuid.uuid4().hex)
-        elif action == "shutdown":
-            await client.control("shutdown", {"save": True, "reason": "workflow"})
-        else:
-            await client.slash("/" + action)
-    finally:
-        await client.close()
+def _pick_live_row(disc: Any) -> LiveSessionInfo | None:
+    """Return the freshest live, non-terminal registry row with a websocket URL."""
+    rows = disc.rows if isinstance(disc, DiscoverSessionsResult) else ()
+    live = [
+        row for row in rows
+        if isinstance(row, LiveSessionInfo)
+        and not row.is_terminal
+        and row.process_state != "dead"
+        and row.websocket_url
+    ]
+    if not live:
+        return None
+    return max(live, key=lambda r: (r.updated_at, r.started_at, r.instance_id))
 
 
 # ---------------------------------------------------------------------------
@@ -2148,36 +2123,25 @@ def render_folder(store: WorkflowStore, template: str, agent: dict) -> str:
 # ---------------------------------------------------------------------------
 
 class WorkflowController:
-    """Per-process controller. All scheduling for a workflow happens in the
-    session that controls it; other sessions only change files."""
+    """Pure Sans-I/O workflow controller. All external session lifecycle, discovery,
+    liveness observation, and WS transport delegate to ``AgentZooSessionDriver`` via
+    yielded ``SessionRequest``s and unsolicited ``ExternalSession*`` events."""
 
     def __init__(self, config, session=None):
         self.config, self.session = config, session
-        self.lock = threading.RLock()
-        # Keep each owned process until poll() reaps it, even after a workflow
-        # is archived/transferred or the same logical agent has been relaunched.
-        self.handles: dict[tuple[str, str, str], object] = {}
         self.managed: dict[str, dict] = {}
         self.me: dict | None = None
         self.launch: dict | None = None
-        self.launcher = None
         self.notices = collections.deque()
         self.notified: set = set()
         self.errors: dict[str, str] = {}
-        self.thread: threading.Thread | None = None
-        self.stop_event = threading.Event()
         self.adopted_instance = ""
         self.worker_record: dict | None = None
         self.worker_reminded_entry = -1
-        self._emit: EmitFn | None = None
-
-    def attach_emit(self, emit: EmitFn | None) -> None:
-        """Bind or clear the thread-safe ``Runtime.post`` callback."""
-        self._emit = emit
-
-    def stop(self) -> None:
-        """Signal any running background scheduler thread to exit."""
-        self.stop_event.set()
+        # Map live/spawned instance_id -> (workflow_name, agent_id) for unsolicited events.
+        self.instances_by_id: dict[str, tuple[str, str]] = {}
+        # Guard against concurrent observe/ready/exit handling on the same logical agent.
+        self.in_flight_agents: set[tuple[str, str]] = set()
 
     # -- identity and launch settings (owner thread) -------------------------
 
@@ -2192,11 +2156,6 @@ class WorkflowController:
         store_root = context.get("project_store_root") or ""
         if not store_root and project:
             store_root = str(Path(resolve_state_root()) / "projects" / project / "coordination")
-        launcher = getattr(state, "session_launcher", None)
-        if launcher is not None:
-            self.launcher = launcher
-        elif self.launcher is None and getattr(state, "_project_name", None):
-            self.launcher = RuntimeLauncher()
         if project and store_root:
             local_root = getattr(state, "_persistence_local_root", "") or ""
             if not local_root:
@@ -2219,8 +2178,8 @@ class WorkflowController:
     def require_launch(self) -> None:
         if not self.me:
             raise WorkflowError("this session has no runtime identity yet; try again in a moment")
-        if self.launch is None or self.launcher is None:
-            raise WorkflowError("this session cannot launch agents (it has no project or runtime launcher)")
+        if self.launch is None:
+            raise WorkflowError("this session cannot launch agents (it has no project or store root)")
 
     def default_model(self) -> str:
         return saved_default_model(self.config)
@@ -2234,13 +2193,18 @@ class WorkflowController:
             raise WorkflowError("no model is configured; set one with /workflow set NAME model PROFILE")
         return self.check_model(model)
 
-    def settings_for(self, folder: str, model: str) -> RuntimeSettings:
+    def spec_for(self, store: WorkflowStore, agent: dict, *, message: str,
+                 checkpoint: tuple[str, str] | None = None) -> SessionSpec:
         launch = self.launch
-        return RuntimeSettings(
-            project=launch["project"], workdir=folder, state_root=launch["state_root"],
-            store_root=launch["store_root"], local_state_root=launch["local_state_root"],
-            config_path=launch["config_path"], config_sets=launch["config_sets"], model=model,
-            env_name=launch["env_name"], pipeline_key="default", host="127.0.0.1", port=0,
+        return SessionSpec(
+            project=launch["project"], workdir=agent["folder"], model=agent["model"], pipeline_key="default",
+            env_name=launch["env_name"], config_path=launch["config_path"], config_sets=launch["config_sets"],
+            state_root=launch["state_root"], store_root=launch["store_root"],
+            local_state_root=launch["local_state_root"], host="127.0.0.1", port=0,
+            parent_session_id=self.me["session_id"], kind=f"wf:{store.name}:{agent['id']}",
+            title=f"{store.name}:{agent['id']}", first_user_message="" if checkpoint else message,
+            lifetime="independent", startup_mode="paused" if checkpoint else "normal",
+            extra_env=(("AZO_WORKFLOW", store.name), ("AZO_WORKFLOW_AGENT", agent["id"])),
         )
 
     def notice(self, text: str, key=None) -> None:
@@ -2249,12 +2213,6 @@ class WorkflowController:
                 return
             self.notified.add(key)
         self.notices.append(text)
-        emit = self._emit
-        if emit is not None:
-            try:
-                emit(WorkflowNoticesReady())
-            except Exception:
-                LOG.debug("Could not post WorkflowNoticesReady event", exc_info=True)
 
     # -- control ----------------------------------------------------------------
 
@@ -2273,79 +2231,41 @@ class WorkflowController:
                 store.update_control(default_folder=self.launch["cwd"])
             store.log("control_taken", by=self.me["session_id"], epoch=epoch)
         self.managed[store.name] = {"epoch": epoch, "watermark": store.counters().get("item", 0)}
-        self.ensure_thread()
         return previous
 
-    def ensure_thread(self) -> None:
-        if self.thread is not None and self.thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self.loop, name="workflows-scheduler", daemon=True)
-        self.thread.start()
-
-    def loop(self) -> None:
-        while not self.stop_event.wait(TICK_SECONDS):
-            for name in list(self.managed):
-                try:
-                    with self.lock:
-                        self.tick(name)
-                    self.errors.pop(name, None)
-                except Exception as exc:
-                    LOG.exception("Workflow %s scheduling failed", name)
-                    message = f"Workflow {name}: scheduling failed: {exc}"
-                    if self.errors.get(name) != message:
-                        self.errors[name] = message
-                        self.notice(message)
-            self.reap_children()
-
-    def reap_children(self) -> None:
-        """Reap owned children independently of workflow scheduling ownership."""
-        with self.lock:
-            for key, handle in list(self.handles.items()):
-                try:
-                    if handle.poll().status == "exited":
-                        self.handles.pop(key, None)
-                except Exception:
-                    # Keep the handle: unknown is not evidence of process exit.
-                    LOG.exception("Could not poll workflow child %s", key)
-
-    def handle_key(self, store: WorkflowStore, agent: dict) -> tuple[str, str, str]:
-        return store.name, agent["id"], agent.get("instance_id", "")
-
-    def run(self, name: str, group: str | None = None) -> str:
-        with self.lock:
-            store = WorkflowStore(name).require()
-            definition = store.definition()
-            if group is not None:
-                check_group_id(group, definition["agents"])
-            previous = self.take_control(store)
-            with store.lock():
-                control = store.control()
-                if group is None:
-                    store.update_control(state="running", paused_groups=[])
-                else:
-                    paused = set(control.get("paused_groups") or [])
-                    if control.get("state") != "running":
-                        paused = set(definition["agents"])
-                    paused.discard(group)
-                    store.update_control(state="running", paused_groups=sorted(paused))
-                store.log("run", group=group, by=self.me["session_id"])
-            resumed, problems = self.resume_paused(store, group)
-            started = self.tick(name)
-            lines = []
-            if previous and previous.get("session_id") != self.me["session_id"]:
-                lines.append(f"Took control of {name} from session {previous['session_id'][:8]}.")
-            scope = f"{group} in {name}" if group else name
-            lines.append(f"Running {scope} from this session (def_{store.version}).")
-            if resumed:
-                lines.append("Resumed " + ", ".join(resumed) + " where they left off.")
-            if started:
-                lines.extend(started)
-            if not resumed and not started:
-                lines.append("No agents started yet: " + self.idle_reason(store, group))
-            lines.extend(problems)
-            lines.append(f"See wf:{name} for progress.")
-            return "\n".join(lines)
+    def run(self, name: str, group: str | None = None):
+        store = WorkflowStore(name).require()
+        definition = store.definition()
+        if group is not None:
+            check_group_id(group, definition["agents"])
+        previous = self.take_control(store)
+        with store.lock():
+            control = store.control()
+            if group is None:
+                store.update_control(state="running", paused_groups=[])
+            else:
+                paused = set(control.get("paused_groups") or [])
+                if control.get("state") != "running":
+                    paused = set(definition["agents"])
+                paused.discard(group)
+                store.update_control(state="running", paused_groups=sorted(paused))
+            store.log("run", group=group, by=self.me["session_id"])
+        resumed, problems = yield from self.resume_paused(store, group)
+        started = yield from self.tick(name)
+        lines = []
+        if previous and previous.get("session_id") != self.me["session_id"]:
+            lines.append(f"Took control of {name} from session {previous['session_id'][:8]}.")
+        scope = f"{group} in {name}" if group else name
+        lines.append(f"Running {scope} from this session (def_{store.version}).")
+        if resumed:
+            lines.append("Resumed " + ", ".join(resumed) + " where they left off.")
+        if started:
+            lines.extend(started)
+        if not resumed and not started:
+            lines.append("No agents started yet: " + self.idle_reason(store, group))
+        lines.extend(problems)
+        lines.append(f"See wf:{name} for progress.")
+        return "\n".join(lines)
 
     def idle_reason(self, store: WorkflowStore, group: str | None) -> str:
         definition = store.definition()
@@ -2365,160 +2285,237 @@ class WorkflowController:
                                        f"{queue} has {waiting} waiting")
         return "; ".join(reasons) + "." if reasons else "all groups are at their count."
 
-    def pause(self, name: str, group: str | None = None) -> str:
-        with self.lock:
-            store = WorkflowStore(name).require()
-            definition = store.definition()
-            if group is not None:
-                check_group_id(group, definition["agents"])
-            with store.lock():
-                control = store.control()
-                if control.get("state") == "archived":
-                    raise WorkflowError(f"{name} is archived")
-                if group is None:
-                    store.update_control(state="paused")
-                else:
-                    paused = set(control.get("paused_groups") or []) | {group}
-                    store.update_control(paused_groups=sorted(paused))
-                store.log("pause", group=group, by=self.me_label())
-            stopped, starting, problems = [], [], []
-            for agent in store.agents(group):
-                if agent["state"] == "starting":
-                    starting.append(agent["id"])
-                elif agent["state"] == "running":
-                    problem = self.pause_one(store, agent)
-                    (problems if problem else stopped).append(problem or agent["id"])
-            scope = f"{group} in {name}" if group else name
-            text = f"Paused {scope}. No new agents will start."
-            if stopped:
-                text += f" Interrupted {', '.join(stopped)}; their work is kept and resumes when the workflow runs again."
-            if starting:
-                text += f" {', '.join(starting)} will pause as soon as they finish starting."
-            if starting and name not in self.managed:
-                text += f" (That happens in the session that controls {name}.)"
-            return "\n".join([text, *problems])
+    def pause(self, name: str, group: str | None = None):
+        store = WorkflowStore(name).require()
+        definition = store.definition()
+        if group is not None:
+            check_group_id(group, definition["agents"])
+        with store.lock():
+            control = store.control()
+            if control.get("state") == "archived":
+                raise WorkflowError(f"{name} is archived")
+            if group is None:
+                store.update_control(state="paused")
+            else:
+                paused = set(control.get("paused_groups") or []) | {group}
+                store.update_control(paused_groups=sorted(paused))
+            store.log("pause", group=group, by=self.me_label())
+        stopped, starting, problems = [], [], []
+        for agent in store.agents(group):
+            if agent["state"] == "starting":
+                starting.append(agent["id"])
+            elif agent["state"] == "running":
+                problem = yield from self.pause_one(store, agent)
+                (problems if problem else stopped).append(problem or agent["id"])
+        scope = f"{group} in {name}" if group else name
+        text = f"Paused {scope}. No new agents will start."
+        if stopped:
+            text += f" Interrupted {', '.join(stopped)}; their work is kept and resumes when the workflow runs again."
+        if starting:
+            text += f" {', '.join(starting)} will pause as soon as they finish starting."
+        if starting and name not in self.managed:
+            text += f" (That happens in the session that controls {name}.)"
+        return "\n".join([text, *problems])
 
-    def pause_one(self, store: WorkflowStore, agent: dict) -> str | None:
+    def pause_one(self, store: WorkflowStore, agent: dict):
         try:
-            self.send(store, agent, "interrupt")
+            yield from self.send(store, agent, "interrupt")
         except Exception as exc:
             return f"Could not interrupt {agent['id']}: {exc}"
         store.update_agent(agent["id"], state="paused")
         return None
 
-    def archive(self, name: str) -> str:
-        with self.lock:
-            store = WorkflowStore(name).require()
-            if store.control().get("state") == "archived":
-                raise WorkflowError(f"{name} is already archived")
-            self.pause(name)
-            ended = []
-            for agent in store.agents():
-                if agent["state"] not in ACTIVE_STATES | {"attention"}:
-                    continue
-                try:
-                    if self.liveness(store, agent) == "alive":
-                        self.send(store, agent, "shutdown")
-                except Exception as exc:
-                    LOG.warning("Could not shut down %s: %s", agent["id"], exc)
-                with store.lock():
-                    for item_id in agent_items(agent):
-                        store.return_item(item_id, agent["id"], by="archive")
-                store.update_agent(agent["id"], state="stopped", problem="workflow archived")
-                ended.append(agent["id"])
+    def archive(self, name: str):
+        store = WorkflowStore(name).require()
+        if store.control().get("state") == "archived":
+            raise WorkflowError(f"{name} is already archived")
+        yield from self.pause(name)
+        ended = []
+        for agent in store.agents():
+            if agent["state"] not in ACTIVE_STATES | {"attention"}:
+                continue
+            yield from self.stop_agent(store, agent, reason="workflow")
             with store.lock():
-                store.update_control(state="archived", controller=None)
-                store.log("archived", by=self.me_label())
-            self.managed.pop(name, None)
-            text = (f"Archived {name}. It no longer appears in /workflow; its definition, items and history "
-                    f"stay readable at wf:{name}, and /workflow unarchive {name} brings it back.")
-            if ended:
-                text += f" Shut down {', '.join(ended)}."
-            return text
+                for item_id in agent_items(agent):
+                    store.return_item(item_id, agent["id"], by="archive")
+            store.update_agent(agent["id"], state="stopped", problem="workflow archived")
+            ended.append(agent["id"])
+        with store.lock():
+            store.update_control(state="archived", controller=None)
+            store.log("archived", by=self.me_label())
+        self.managed.pop(name, None)
+        text = (f"Archived {name}. It no longer appears in /workflow; its definition, items and history "
+                f"stay readable at wf:{name}, and /workflow unarchive {name} brings it back.")
+        if ended:
+            text += f" Shut down {', '.join(ended)}."
+        return text
 
     def unarchive(self, name: str) -> str:
-        with self.lock:
-            store = WorkflowStore(name).require()
-            with store.lock():
-                if store.control().get("state") != "archived":
-                    raise WorkflowError(f"{name} is not archived")
-                store.update_control(state="paused", paused_groups=[])
-                store.log("unarchived", by=self.me_label())
-            return f"Restored {name}. It is paused; start it with /workflow run {name}."
+        store = WorkflowStore(name).require()
+        with store.lock():
+            if store.control().get("state") != "archived":
+                raise WorkflowError(f"{name} is not archived")
+            store.update_control(state="paused", paused_groups=[])
+            store.log("unarchived", by=self.me_label())
+        return f"Restored {name}. It is paused; start it with /workflow run {name}."
 
     def rename(self, name: str, new_name: str) -> str:
-        with self.lock:
-            renamed = WorkflowStore(name).require().rename(new_name, by=self.me_label())
-            if name in self.managed:
-                self.managed[renamed.name] = self.managed.pop(name)
-            self.errors.pop(name, None)
-            return (f"Renamed {name} to {renamed.name}. Open it with /workflow view {renamed.name}; "
-                    f"agents read it at wf:{renamed.name}.")
+        renamed = WorkflowStore(name).require().rename(new_name, by=self.me_label())
+        if name in self.managed:
+            self.managed[renamed.name] = self.managed.pop(name)
+        for iid, pair in list(self.instances_by_id.items()):
+            if pair[0] == name:
+                self.instances_by_id[iid] = (renamed.name, pair[1])
+        self.errors.pop(name, None)
+        return (f"Renamed {name} to {renamed.name}. Open it with /workflow view {renamed.name}; "
+                f"agents read it at wf:{renamed.name}.")
 
-    # -- agents -----------------------------------------------------------------
+    # -- agents (pure SessionRequests) -----------------------------------------
 
-    def target(self, store: WorkflowStore, agent: dict) -> dict:
-        """Current websocket target for a live agent, refreshed from the live registry if needed."""
-        if agent.get("websocket_url") and process_evidence(agent.get("process_identity")) == "alive":
-            return {"session_id": agent["session_id"], "instance_id": agent["instance_id"],
-                    "websocket_url": agent["websocket_url"]}
-        root = (self.launch or {}).get("store_root")
-        if root and agent.get("session_id"):
-            for row in list_live_sessions(root, include_stale=False):
-                identity = row.process_identity.to_dict() if row.process_identity else None
-                if row.session_id == agent["session_id"] and process_evidence(identity) == "alive":
-                    store.update_agent(agent["id"], instance_id=row.instance_id,
-                                       websocket_url=row.websocket_url, process_identity=identity)
-                    return {"session_id": row.session_id, "instance_id": row.instance_id,
-                            "websocket_url": row.websocket_url}
-        raise WorkflowError(f"{agent['id']} is not running")
+    def _owns_control(self, store: WorkflowStore, control: dict | None = None) -> bool:
+        control = store.control() if control is None else control
+        mine = self.managed.get(store.name)
+        return (mine is not None and int(control.get("epoch", 0)) == mine["epoch"]
+                and (control.get("controller") or {}).get("instance_id") == (self.me or {}).get("instance_id"))
 
-    def send(self, store: WorkflowStore, agent: dict, action: str, message: str = "") -> None:
-        target = self.target(store, agent)
-        run_async(lambda: send_to_agent(target, action, message), timeout=30)
-
-    def liveness(self, store: WorkflowStore, agent: dict) -> str:
-        handle = self.handles.get(self.handle_key(store, agent))
-        if handle is not None and getattr(handle, "ref", None) is not None \
-                and handle.ref.instance_id == agent.get("instance_id"):
-            status = handle.poll().status
-            if status in {"exited"}:
-                return "dead"
-            if status in {"starting", "ready"}:
-                return "alive"
-        return process_evidence(agent.get("process_identity"))
-
-    def launch_agent(self, store: WorkflowStore, agent: dict, message: str, checkpoint=None,
-                     recovery_action: str | None = None) -> None:
-        """Start (or resume) one agent's session. Persists identity before spawning."""
-        session_id = agent.get("session_id") or str(uuid.uuid4())
-        target = InstanceRef.new_instance(session_id)
-        request = RuntimeLaunch(
-            target=target, source=Resume(checkpoint) if checkpoint else Fresh(),
-            settings=self.settings_for(agent["folder"], agent["model"]),
-            parent_session_id=self.me["session_id"], kind=f"wf:{store.name}:{agent['id']}",
-            title=f"{store.name}:{agent['id']}", lifetime="independent",
-            startup_mode="paused" if checkpoint else "normal",
-            first_user_message="" if checkpoint else message,
+    def _discover_target(self, store: WorkflowStore, agent: dict):
+        session_id = agent.get("session_id") or ""
+        if not session_id:
+            return None
+        disc = yield DiscoverSessions(
+            store_root=(self.launch or {}).get("store_root") or "", session_id=session_id,
+            include_stale=False, probe_local_processes=True,
         )
-        Path(agent["folder"]).mkdir(parents=True, exist_ok=True)
-        plan = self.launcher.prepare(request, cwd=agent["folder"],
-                                     env=dict(os.environ, AZO_WORKFLOW=store.name, AZO_WORKFLOW_AGENT=agent["id"]))
-        store.update_agent(agent["id"], session_id=session_id, instance_id=target.instance_id, state="starting",
-                           project=self.launch["project"], launch_started=time.time(), websocket_url=None,
-                           process_identity=None, release="resume" if checkpoint else None,
-                           recovery_action=recovery_action)
+        row = _pick_live_row(disc)
+        if row is None:
+            return None
+        identity = row.process_identity or agent.get("process_identity")
+        store.update_agent(agent["id"], instance_id=row.instance_id, websocket_url=row.websocket_url,
+                           process_identity=identity)
+        self.instances_by_id[row.instance_id] = (store.name, agent["id"])
+        return {"session_id": row.session_id, "instance_id": row.instance_id,
+                "websocket_url": row.websocket_url, "process_identity": identity}
+
+    def _resolve_target(self, store: WorkflowStore, agent: dict):
+        if agent.get("websocket_url") and agent.get("session_id"):
+            return {"session_id": agent["session_id"], "instance_id": agent.get("instance_id") or "",
+                    "websocket_url": agent["websocket_url"], "process_identity": agent.get("process_identity")}
+        target = yield from self._discover_target(store, agent)
+        if target is None:
+            raise WorkflowError(f"{agent['id']} is not running")
+        return target
+
+    @staticmethod
+    def _send_request(target: dict, action: str, message: str = "") -> SendSessionInput:
+        if action == "message":
+            channel, payload = "user_text", {"text": str(message)}
+        elif action in {"interrupt", "continue"}:
+            channel, payload = "slash_command", {"raw": f"/{action}"}
+        else:
+            raise WorkflowError(f"unsupported agent action {action!r}")
+        return SendSessionInput(
+            session_id=target["session_id"], instance_id=target.get("instance_id") or "",
+            channel=channel, payload=payload, client_id=uuid.uuid4().hex,
+            websocket_url=target["websocket_url"], expected_process_identity=target.get("process_identity"),
+            verify_loopback=True, timeout_s=30.0,
+        )
+
+    def send(self, store: WorkflowStore, agent: dict, action: str, message: str = ""):
+        """Deliver one user message or slash command to a live agent via ``SendSessionInput``."""
+        target = yield from self._resolve_target(store, agent)
+        result = yield self._send_request(target, action, message)
+        if isinstance(result, SessionDeliveryResult):
+            if result.outcome == "sent":
+                return
+            if result.outcome in {"pre_send_race", "unavailable"}:
+                refreshed = yield from self._discover_target(store, agent)
+                if refreshed is not None and refreshed["instance_id"] != target["instance_id"]:
+                    result = yield self._send_request(refreshed, action, message)
+                    if isinstance(result, SessionDeliveryResult) and result.outcome == "sent":
+                        return
+            raise WorkflowError(result.error or f"could not deliver {action} to {agent['id']} ({result.outcome})")
+
+    def send_data(self, store: WorkflowStore, agent: dict, artifacts: Sequence[SessionArtifact], *,
+                  channel: str = "workflow", message: str = ""):
+        """Push typed ``SessionArtifact`` payloads to a live agent via ``SendSessionData``."""
+        target = yield from self._resolve_target(store, agent)
+        result = yield SendSessionData(
+            session_id=target["session_id"], instance_id=target.get("instance_id") or "",
+            artifacts=tuple(artifacts), channel=channel, message=message,
+            sender_session_id=(self.me or {}).get("session_id", ""),
+            sender_instance_id=(self.me or {}).get("instance_id", ""), client_id=uuid.uuid4().hex,
+            websocket_url=target["websocket_url"], expected_process_identity=target.get("process_identity"),
+            verify_loopback=True, timeout_s=30.0,
+        )
+        if isinstance(result, SessionDeliveryResult) and result.outcome != "sent":
+            raise WorkflowError(result.error or f"could not deliver data to {agent['id']} ({result.outcome})")
+
+    def stop_agent(self, store: WorkflowStore, agent: dict, *, reason: str = "workflow"):
+        """Request graceful WS shutdown for a live agent via ``StopSession``."""
+        del store
+        session_id = agent.get("session_id") or ""
+        if not session_id:
+            return
         try:
-            handle = self.launcher.start(plan)
+            obs = yield ObserveSession(session_id=session_id, instance_id=agent.get("instance_id") or "")
+        except Exception as exc:
+            LOG.warning("Could not observe %s before shutdown: %s", agent["id"], exc)
+            return
+        live = obs.live_info if isinstance(obs, SessionObservation) else None
+        if isinstance(obs, SessionObservation) and (obs.alive is False or (obs.alive is None and not agent.get("websocket_url"))):
+            return
+        try:
+            yield StopSession(
+                session_id=session_id,
+                instance_id=(live.instance_id if live and live.instance_id else agent.get("instance_id") or ""),
+                mode="graceful_ws", reason=reason, save=True, spawned_policy="leave",
+                expected_process_identity=(live.process_identity if live and live.process_identity else agent.get("process_identity")),
+                timeout_s=5.0,
+            )
+        except Exception as exc:
+            LOG.warning("Could not shut down %s: %s", agent["id"], exc)
+
+    def spawn_agent(self, store: WorkflowStore, agent: dict, message: str, *,
+                    checkpoint: tuple[str, str] | None = None, recovery_action: str | None = None):
+        """Start (or resume) one agent's session via ``SpawnSession``. Persists identity first."""
+        session_id = agent.get("session_id") or str(uuid.uuid4())
+        instance_id = str(uuid.uuid4())
+        Path(agent["folder"]).mkdir(parents=True, exist_ok=True)
+        store.update_agent(
+            agent["id"], session_id=session_id, instance_id=instance_id, state="starting",
+            project=self.launch["project"], launch_started=time.time(), websocket_url=None,
+            process_identity=None, release="resume" if checkpoint else None, recovery_action=recovery_action,
+        )
+        source = (SessionSource(kind="resume", session_id=checkpoint[0], revision_id=checkpoint[1])
+                  if checkpoint else SessionSource(kind="fresh"))
+        try:
+            spawn_result = yield SpawnSession(
+                session_id=session_id, instance_id=instance_id, source=source,
+                spec=self.spec_for(store, agent, message=message, checkpoint=checkpoint),
+                wait_ready=False, ready_timeout_s=float(READY_TIMEOUT_SECONDS), watch=False,
+                result_key=f"wf:{store.name}:{agent['id']}:{instance_id}",
+                launch_metadata={"workflow": store.name, "agent_id": agent["id"]},
+            )
         except Exception:
             store.update_agent(agent["id"], process_identity=None, problem="launch did not complete")
             raise
-        self.handles[(store.name, agent["id"], target.instance_id)] = handle
-        identity = capture_process_identity(handle.process.pid)
-        store.update_agent(agent["id"], pid=handle.process.pid,
-                           process_identity=identity.to_dict() if identity else None)
+        is_res = isinstance(spawn_result, SessionSpawnResult)
+        resolved_iid = (spawn_result.instance_id if is_res and spawn_result.instance_id else instance_id)
+        self.instances_by_id[resolved_iid] = (store.name, agent["id"])
+        updates: dict[str, Any] = {
+            "instance_id": resolved_iid,
+            "pid": spawn_result.pid if is_res else None,
+            "process_identity": spawn_result.process_identity if is_res else None,
+        }
+        if is_res and spawn_result.ready:
+            updates["websocket_url"] = spawn_result.ready.get("websocket_url") or spawn_result.websocket_url or None
+        store.update_agent(agent["id"], **updates)
+        try:
+            yield ConfigureSessionLifecycle(spawned_policy="leave", session_ids=(session_id,))
+        except Exception:
+            LOG.debug("Could not configure independent lifecycle for %s", session_id, exc_info=True)
 
-    def resume_agent(self, store: WorkflowStore, agent: dict) -> str | None:
+    def resume_agent(self, store: WorkflowStore, agent: dict):
         """Relaunch a stopped agent from its saved checkpoint. Returns a problem or None."""
         if not agent.get("session_id"):
             return f"{agent['id']} never started, so there is nothing to resume"
@@ -2544,35 +2541,44 @@ class WorkflowController:
             return (f"{agent['id']} checkpoint {saved.commit_id}: {reason}. "
                     "External work may already have happened; inspect its transcript and artifacts before retrying")
         try:
-            self.launch_agent(store, agent, "", checkpoint=CheckpointRef(agent["session_id"], saved.commit_id),
-                              recovery_action=action)
+            yield from self.spawn_agent(
+                store,
+                agent,
+                "",
+                checkpoint=(agent["session_id"], saved.commit_id),
+                recovery_action=action,
+            )
         except Exception as exc:
             return f"{agent['id']} could not be relaunched: {exc}"
         store.update_agent(agent["id"], resumes=int(agent.get("resumes", 0)) + 1, last_resume=time.time())
         return None
 
-    def resume_paused(self, store: WorkflowStore, group: str | None) -> tuple[list[str], list[str]]:
+    def resume_paused(self, store: WorkflowStore, group: str | None):
         resumed, problems = [], []
         for agent in store.agents(group):
             if agent["state"] != "paused":
                 continue
-            alive = self.liveness(store, agent)
-            if alive == "alive" and agent.get("websocket_url"):
+            obs = yield ObserveSession(
+                session_id=agent.get("session_id") or "",
+                instance_id=agent.get("instance_id") or "",
+            )
+            alive = obs.alive if isinstance(obs, SessionObservation) else None
+            if alive is True and agent.get("websocket_url"):
                 try:
                     if agent.get("release") in {"resume", "continue"}:
-                        self.release_ready(store, agent, True)
+                        yield from self.release_ready(store, agent, True)
                     else:
-                        self.send(store, agent, "continue")
+                        yield from self.send(store, agent, "continue")
                         store.update_agent(agent["id"], state="running")
                     if store.agent(agent["id"])["state"] == "running":
                         resumed.append(agent["id"])
                 except Exception as exc:
                     problems.append(f"Could not resume {agent['id']}: {exc}")
-            elif alive == "alive":
+            elif alive is True:
                 store.update_agent(agent["id"], state="starting", release=agent.get("release") or "continue")
                 resumed.append(agent["id"])
-            elif alive == "dead":
-                problem = self.resume_agent(store, agent)
+            elif alive is False:
+                problem = yield from self.resume_agent(store, agent)
                 if problem:
                     self.mark_attention(store, agent, problem + "; use restart_agent to give its item to a fresh agent")
                     problems.append(problem + ".")
@@ -2588,7 +2594,7 @@ class WorkflowController:
 
     # -- scheduling ---------------------------------------------------------------
 
-    def tick(self, name: str) -> list[str]:
+    def tick(self, name: str):
         """One scheduling pass. Returns descriptions of agents started."""
         store = WorkflowStore(name)
         if not store.exists():
@@ -2611,24 +2617,19 @@ class WorkflowController:
         running = control.get("state") == "running"
         for agent in store.agents():
             if agent["state"] in {"starting", "running"}:
-                self.observe(store, agent, definition, running and agent["group"] not in paused_groups)
+                yield from self.observe(store, agent, definition, running and agent["group"] not in paused_groups)
         self.report_attention(store)
         started = []
         if running:
-            started = self.start_agents(store, definition, paused_groups)
+            started = yield from self.start_agents(store, definition, paused_groups)
         self.report_new_items(store, definition)
-        self.reap_children()
         return started
 
-    def release_ready(self, store: WorkflowStore, agent: dict, should_run: bool) -> None:
+    def release_ready(self, store: WorkflowStore, agent: dict, should_run: bool):
         """Release a ready process before claiming it is running; pause wins."""
         agent = store.agent(agent["id"])
-        if agent["state"] not in ACTIVE_STATES:
-            return
         control = store.control()
-        mine = self.managed.get(store.name)
-        if (mine is None or control.get("epoch") != mine["epoch"]
-                or (control.get("controller") or {}).get("instance_id") != self.me["instance_id"]):
+        if agent["state"] not in ACTIVE_STATES or not self._owns_control(store, control):
             return
         should_run = (should_run and control.get("state") == "running"
                       and agent["group"] not in control.get("paused_groups", []))
@@ -2638,7 +2639,7 @@ class WorkflowController:
                 if release in {"resume", "continue"}:
                     store.update_agent(agent["id"], state="paused")
                 else:
-                    problem = self.pause_one(store, agent)
+                    problem = yield from self.pause_one(store, agent)
                     if problem:
                         raise WorkflowError(problem)
                 return
@@ -2647,12 +2648,7 @@ class WorkflowController:
                 if action not in {"continue", "message"}:
                     self.mark_attention(store, agent, "recovery action is missing; checkpoint must be reviewed")
                     return
-                message = ("Your session was restarted from a checkpoint after an interruption. "
-                           "Inspect saved results and existing processes/artifacts before continuing. "
-                           "Do not repeat a command just because its output is missing; if its outcome is "
-                           "uncertain, report that uncertainty instead of retrying it. "
-                           "Continue from confirmed progress and call finish_task when done.")
-                self.send(store, agent, action, message if action == "message" else "")
+                yield from self.send(store, agent, action, RECOVERY_MESSAGE if action == "message" else "")
             with store.lock():
                 current = store.agent(agent["id"])
                 if current["state"] in ACTIVE_STATES and current.get("instance_id") == agent.get("instance_id"):
@@ -2662,42 +2658,13 @@ class WorkflowController:
             self.mark_attention(store, agent,
                                 f"could not confirm recovery release: {exc}; inspect the live session before retrying")
 
-    def observe(self, store: WorkflowStore, agent: dict, definition: dict, should_run: bool) -> None:
+    def _handle_agent_dead(self, store: WorkflowStore, agent: dict, should_run: bool):
         agent = store.agent(agent["id"])
-        if agent["state"] not in {"starting", "running"}:
+        control = store.control()
+        if agent["state"] not in {"starting", "running"} or not self._owns_control(store, control):
             return
-        handle = self.handles.get(self.handle_key(store, agent))
-        if agent["state"] == "starting":
-            observation = handle.poll() if handle is not None else None
-            if observation is not None and observation.status == "ready":
-                ready = observation.ready or {}
-                agent = store.update_agent(agent["id"], websocket_url=ready.get("websocket_url"),
-                                           instance_id=ready.get("instance_id", agent["instance_id"]),
-                                           process_identity=ready.get("process_identity") or agent.get("process_identity"))
-                self.release_ready(store, agent, should_run)
-                return
-            if observation is not None and observation.status == "starting":
-                if time.time() - float(agent.get("launch_started") or 0) > READY_TIMEOUT_SECONDS:
-                    self.mark_attention(store, agent, "did not finish starting within two minutes")
-                return
-            if observation is None and process_evidence(agent.get("process_identity")) == "alive":
-                # Launched by an earlier instance of this session: find it in the live registry.
-                try:
-                    self.target(store, agent)
-                except WorkflowError:
-                    if time.time() - float(agent.get("launch_started") or 0) > READY_TIMEOUT_SECONDS:
-                        self.mark_attention(store, agent, "is running but cannot be reached")
-                    return
-                agent = store.agent(agent["id"])
-                self.release_ready(store, agent, should_run)
-                return
-        status = self.liveness(store, agent)
-        if status != "dead":
-            return
-        agent = store.agent(agent["id"])
-        if agent["state"] not in {"starting", "running"}:
-            return  # It finished (or was changed) while we looked.
-        self.handles.pop(self.handle_key(store, agent), None)
+        should_run = (should_run and control.get("state") == "running"
+                      and agent["group"] not in control.get("paused_groups", []))
         if not should_run:
             store.update_agent(agent["id"], state="paused")
             return
@@ -2706,17 +2673,105 @@ class WorkflowController:
             self.mark_attention(store, agent, f"stopped unexpectedly {agent['resumes']} times in a row; "
                                               "read its transcript, then use restart_agent")
             return
-        problem = self.resume_agent(store, agent)
+        problem = yield from self.resume_agent(store, agent)
         if problem:
             self.mark_attention(store, agent, problem + "; use restart_agent to give its item to a fresh agent")
 
-    def start_agents(self, store: WorkflowStore, definition: dict, paused_groups: set) -> list[str]:
+    def observe(self, store: WorkflowStore, agent: dict, definition: dict, should_run: bool):
+        del definition
+        agent = store.agent(agent["id"])
+        key = (store.name, agent["id"])
+        if agent["state"] not in {"starting", "running"} or key in self.in_flight_agents:
+            return
+        self.in_flight_agents.add(key)
+        try:
+            obs = yield ObserveSession(session_id=agent.get("session_id") or "", instance_id=agent.get("instance_id") or "")
+            alive = obs.alive if isinstance(obs, SessionObservation) else None
+            live_info = obs.live_info if isinstance(obs, SessionObservation) else None
+            if agent["state"] == "starting":
+                ws_url = (live_info.websocket_url if live_info and not live_info.is_terminal and live_info.process_state != "dead" else "")
+                if not ws_url and alive is not False and agent.get("session_id"):
+                    disc = yield DiscoverSessions(store_root=(self.launch or {}).get("store_root") or "",
+                                                  session_id=agent["session_id"], include_stale=False, probe_local_processes=True)
+                    discovered = _pick_live_row(disc)
+                    if discovered is not None:
+                        live_info, ws_url = discovered, discovered.websocket_url
+                if ws_url and alive is not False:
+                    new_iid = live_info.instance_id if live_info and live_info.instance_id else agent["instance_id"]
+                    agent = store.update_agent(agent["id"], websocket_url=ws_url, instance_id=new_iid,
+                                               process_identity=(live_info.process_identity if live_info and live_info.process_identity else agent.get("process_identity")))
+                    self.instances_by_id[new_iid] = key
+                    yield from self.release_ready(store, agent, should_run)
+                    return
+                if alive is True:
+                    if time.time() - float(agent.get("launch_started") or 0) > READY_TIMEOUT_SECONDS:
+                        self.mark_attention(store, agent, "did not finish starting within two minutes")
+                    return
+            if alive is False:
+                yield from self._handle_agent_dead(store, agent, should_run)
+        finally:
+            self.in_flight_agents.discard(key)
+
+    def _find_agent_for_instance(self, session_id: str, instance_id: str) -> tuple[str, str] | None:
+        if instance_id and instance_id in self.instances_by_id:
+            return self.instances_by_id[instance_id]
+        for name in list(self.managed):
+            store = WorkflowStore(name)
+            if not store.exists():
+                continue
+            for agent in store.agents():
+                if (instance_id and agent.get("instance_id") == instance_id) or (
+                        session_id and agent.get("session_id") == session_id and agent["state"] in ACTIVE_STATES):
+                    return name, agent["id"]
+        return None
+
+    def _handle_session_event(self, event: ExternalSessionReady | ExternalSessionExited):
+        pair = self._find_agent_for_instance(event.session_id, event.instance_id)
+        if isinstance(event, ExternalSessionExited) and event.instance_id:
+            self.instances_by_id.pop(event.instance_id, None)
+        if pair is None or pair[0] not in self.managed or pair in self.in_flight_agents:
+            return
+        name, agent_id = pair
+        store = WorkflowStore(name)
+        if not store.exists():
+            return
+        agent = store.agent(agent_id)
+        if agent.get("instance_id") and event.instance_id and agent["instance_id"] != event.instance_id:
+            return
+        if isinstance(event, ExternalSessionReady) and agent["state"] != "starting":
+            return
+        self.in_flight_agents.add(pair)
+        try:
+            control = store.control()
+            should_run = control.get("state") == "running" and agent["group"] not in (control.get("paused_groups") or [])
+            if isinstance(event, ExternalSessionReady):
+                agent = store.update_agent(agent_id, websocket_url=event.websocket_url or agent.get("websocket_url"),
+                                           instance_id=event.instance_id or agent.get("instance_id"),
+                                           process_identity=event.process_identity or agent.get("process_identity"))
+                if event.instance_id:
+                    self.instances_by_id[event.instance_id] = pair
+                yield from self.release_ready(store, agent, should_run)
+            else:
+                yield from self._handle_agent_dead(store, agent, should_run)
+                self.report_attention(store)
+        finally:
+            self.in_flight_agents.discard(pair)
+
+    def on_session_ready(self, event: ExternalSessionReady):
+        """Handle unsolicited ``ExternalSessionReady`` from ``AgentZooSessionDriver``."""
+        return self._handle_session_event(event)
+
+    def on_session_exited(self, event: ExternalSessionExited):
+        """Handle unsolicited ``ExternalSessionExited`` from ``AgentZooSessionDriver``."""
+        return self._handle_session_event(event)
+
+    def start_agents(self, store: WorkflowStore, definition: dict, paused_groups: set):
         planned = []
         with store.lock():
             control = store.control()
             mine = self.managed.get(store.name)
             if (mine is None or control.get("epoch") != mine["epoch"]
-                    or (control.get("controller") or {}).get("instance_id") != self.me["instance_id"]
+                    or (control.get("controller") or {}).get("instance_id") != (self.me or {}).get("instance_id")
                     or control.get("state") != "running"):
                 return []
             definition = store.definition()
@@ -2755,7 +2810,7 @@ class WorkflowController:
                 model = self.model_for(definition, settings)
                 agent = store.update_agent(agent["id"], model=model)
                 message = render_instructions(store, settings, agent, items, self.me["session_id"])
-                self.launch_agent(store, agent, message)
+                yield from self.spawn_agent(store, agent, message)
                 store.log("agent_started", agent=agent["id"], items=[i["id"] for i in items])
                 started.append(f"Started {agent['id']}" + (f" on {batch_text(items)}." if items else "."))
             except Exception as exc:
@@ -2763,6 +2818,7 @@ class WorkflowController:
         return started
 
     def launch_failed(self, store, agent, items, settings, exc) -> None:
+        del settings
         group = agent["group"]
         with store.lock():
             for item in items:
@@ -2804,7 +2860,7 @@ class WorkflowController:
 
     # -- other controller operations ---------------------------------------------
 
-    def message_agents(self, name: str, message: str, group: str | None) -> str:
+    def message_agents(self, name: str, message: str, group: str | None):
         store = WorkflowStore(name).require()
         if group is not None:
             check_group_id(group, {a["group"] for a in store.agents()} | set(store.definition()["agents"]))
@@ -2814,7 +2870,7 @@ class WorkflowController:
         for agent in store.agents(group):
             if agent["state"] == "running":
                 try:
-                    self.send(store, agent, "message", message)
+                    yield from self.send(store, agent, "message", message)
                     sent.append(agent["id"])
                 except Exception as exc:
                     problems.append(f"Could not reach {agent['id']}: {exc}")
@@ -2828,92 +2884,87 @@ class WorkflowController:
             text += f" Skipped {', '.join(skipped)} (paused or still starting)."
         return "\n".join([text, *problems])
 
-    def restart_agent(self, name: str, agent_id: str) -> str:
-        with self.lock:
-            store = WorkflowStore(name).require()
-            agent = store.agent(check_agent_id(agent_id))
-            if agent["state"] in {"finished", "restarted"}:
-                raise WorkflowError(f"{agent_id} has already {agent['state']}")
-            if self.liveness(store, agent) == "alive":
-                try:
-                    self.send(store, agent, "shutdown")
-                except Exception as exc:
-                    LOG.warning("Could not shut down %s: %s", agent_id, exc)
-            item_ids = agent_items(agent)
-            with store.lock():
-                for item_id in item_ids:
-                    store.return_item(item_id, agent_id, by="restart_agent")
-            store.update_agent(agent_id, state="restarted", problem=None)
-            store.log("agent_restarted", agent=agent_id)
-            text = f"Stopped {agent_id} and discarded its progress."
-            if len(item_ids) == 1:
-                text += f" {item_ids[0]} is back in {store.item(item_ids[0])['queue']} for a fresh agent."
-            elif item_ids:
-                text += f" {', '.join(item_ids)} are back in their queues for a fresh agent."
-            if name not in self.managed:
-                text += f" This session does not control {name}; run it to start new agents."
-            return text
+    def restart_agent(self, name: str, agent_id: str):
+        store = WorkflowStore(name).require()
+        agent = store.agent(check_agent_id(agent_id))
+        if agent["state"] in {"finished", "restarted"}:
+            raise WorkflowError(f"{agent_id} has already {agent['state']}")
+        yield from self.stop_agent(store, agent, reason="workflow")
+        item_ids = agent_items(agent)
+        with store.lock():
+            for item_id in item_ids:
+                store.return_item(item_id, agent_id, by="restart_agent")
+        store.update_agent(agent_id, state="restarted", problem=None)
+        store.log("agent_restarted", agent=agent_id)
+        text = f"Stopped {agent_id} and discarded its progress."
+        if len(item_ids) == 1:
+            text += f" {item_ids[0]} is back in {store.item(item_ids[0])['queue']} for a fresh agent."
+        elif item_ids:
+            text += f" {', '.join(item_ids)} are back in their queues for a fresh agent."
+        if name not in self.managed:
+            text += f" This session does not control {name}; run it to start new agents."
+        return text
 
-    def change_setting(self, name: str, kind: str, target: str | None, setting: str, raw: str) -> str:
+    def change_setting(self, name: str, kind: str, target: str | None, setting: str, raw: str):
         """Apply one /workflow set change and describe its effect."""
-        with self.lock:
-            store = WorkflowStore(name).require()
-            change = prepare_setting(store, kind, target, setting, raw, check_model=self.check_model,
-                                     default_model=self.default_model())
-            label, setting = change["label"], change["setting"]
-            if change["unchanged"]:
-                return f"{label} {setting} is already {change['new_text']}; nothing changed."
-            result = store.set_setting(change["section"], change["name"], change["key"], change["value"],
-                                       reason=change["reason"], by="user")
-            text = (f"Set {label} {setting} from {change['old_text']} to {change['new_text']} "
-                    f"(def_{result['version']}).")
-            definition = store.definition()
-            active = [a for a in store.agents() if a["state"] in ACTIVE_STATES]
-            if setting == "count":
-                if change["value"] < int(change["old_text"]):
-                    text += " Extra running agents finish their current item first."
-                elif name in self.managed:
-                    started = self.tick(name)
-                    text += (" " + " ".join(started)) if started else ""
-                elif store.control().get("state") == "running":
-                    text += " The session controlling it will start agents shortly."
-                else:
-                    text += f" {name} is paused; agents start when it runs."
-            elif setting == "model":
-                stale = []
-                for agent in active:
-                    group = definition["agents"].get(agent["group"])
-                    if kind == "group" and agent["group"] != target or group is None:
-                        continue
-                    model, _ = effective_model(definition, group, self.default_model())
-                    if agent.get("model") and agent["model"] != model:
-                        stale.append(f"{agent['id']} ({agent['model']})")
-                text += " New agents use it."
-                if stale:
-                    text += (f" {', '.join(stale)} keep their current model; restart them with restart_agent "
-                             "or let them finish to switch.")
-            elif setting == "folder":
-                scope = [a["id"] for a in active if kind == "workflow" or a["group"] == target]
-                text += " New agents start there."
-                if scope:
-                    text += f" {', '.join(scope)} keep their current folder."
-            elif setting == "every":
-                text += " It applies from the group's next start."
-            elif setting == "description":
-                text += " It shows in /workflow list."
-            elif setting == "notify":
-                text += (f" The controlling agent will be told about new items in {target}."
-                         if change["value"] else f" New items in {target} no longer notify anyone.")
-            return text
+        store = WorkflowStore(name).require()
+        change = prepare_setting(store, kind, target, setting, raw, check_model=self.check_model,
+                                 default_model=self.default_model())
+        label, setting = change["label"], change["setting"]
+        if change["unchanged"]:
+            return f"{label} {setting} is already {change['new_text']}; nothing changed."
+        result = store.set_setting(change["section"], change["name"], change["key"], change["value"],
+                                   reason=change["reason"], by="user")
+        text = (f"Set {label} {setting} from {change['old_text']} to {change['new_text']} "
+                f"(def_{result['version']}).")
+        definition = store.definition()
+        active = [a for a in store.agents() if a["state"] in ACTIVE_STATES]
+        if setting == "count":
+            if change["value"] < int(change["old_text"]):
+                text += " Extra running agents finish their current item first."
+            elif name in self.managed:
+                started = yield from self.tick(name)
+                text += (" " + " ".join(started)) if started else ""
+            elif store.control().get("state") == "running":
+                text += " The session controlling it will start agents shortly."
+            else:
+                text += f" {name} is paused; agents start when it runs."
+        elif setting == "model":
+            stale = []
+            for agent in active:
+                group = definition["agents"].get(agent["group"])
+                if kind == "group" and agent["group"] != target or group is None:
+                    continue
+                model, _ = effective_model(definition, group, self.default_model())
+                if agent.get("model") and agent["model"] != model:
+                    stale.append(f"{agent['id']} ({agent['model']})")
+            text += " New agents use it."
+            if stale:
+                text += (f" {', '.join(stale)} keep their current model; restart them with restart_agent "
+                         "or let them finish to switch.")
+        elif setting == "folder":
+            scope = [a["id"] for a in active if kind == "workflow" or a["group"] == target]
+            text += " New agents start there."
+            if scope:
+                text += f" {', '.join(scope)} keep their current folder."
+        elif setting == "every":
+            text += " It applies from the group's next start."
+        elif setting == "description":
+            text += " It shows in /workflow list."
+        elif setting == "notify":
+            text += (f" The controlling agent will be told about new items in {target}."
+                     if change["value"] else f" New items in {target} no longer notify anyone.")
+        return text
 
-    # -- startup adoption ---------------------------------------------------------
+    # -- startup adoption & reload rediscovery ------------------------------------
 
-    def adopt(self, state) -> None:
+    def adopt(self, state) -> list[str]:
         """After a restart or reload, keep running workflows this session controlled."""
         self.bind(state)
         if not self.me or self.adopted_instance == self.me["instance_id"]:
-            return
+            return []
         self.adopted_instance = self.me["instance_id"]
+        adopted = []
         for name in list_workflow_names():
             store = WorkflowStore(name)
             control = store.control()
@@ -2923,10 +2974,47 @@ class WorkflowController:
                 continue
             try:
                 self.take_control(store)
+                adopted.append(name)
                 self.notice(f"Workflow {name} is running again under this session after a restart. "
                             f"See wf:{name}.")
             except Exception as exc:
                 self.notice(f"Workflow {name} could not resume after a restart: {exc}")
+        return adopted
+
+    def rediscover_workflows(self, names: Sequence[str]):
+        """Rediscover live worker sessions after parent reload via ``DiscoverSessions`` + ``AdoptSession``."""
+        root = (self.launch or {}).get("store_root") or ""
+        if not names or not root:
+            return
+        disc = yield DiscoverSessions(store_root=root, include_stale=False, probe_local_processes=True)
+        by_session: dict[str, LiveSessionInfo] = {}
+        for row in (disc.rows if isinstance(disc, DiscoverSessionsResult) else ()):
+            if row.is_terminal or row.process_state == "dead":
+                continue
+            existing = by_session.get(row.session_id)
+            if existing is None or (row.updated_at, row.started_at) >= (existing.updated_at, existing.started_at):
+                by_session[row.session_id] = row
+        for name in names:
+            store = WorkflowStore(name)
+            if not store.exists():
+                continue
+            for agent in store.agents():
+                row = by_session.get(agent.get("session_id") or "") if agent["state"] in ACTIVE_STATES else None
+                if row is None:
+                    continue
+                store.update_agent(agent["id"], instance_id=row.instance_id,
+                                   websocket_url=row.websocket_url or agent.get("websocket_url"),
+                                   process_identity=row.process_identity or agent.get("process_identity"))
+                self.instances_by_id[row.instance_id] = (store.name, agent["id"])
+                try:
+                    yield AdoptSession(
+                        session_id=row.session_id, instance_id=row.instance_id,
+                        process_identity=row.process_identity, websocket_url=row.websocket_url,
+                        result_key=f"wf:{store.name}:{agent['id']}:{row.instance_id}", watch=False,
+                        metadata={"workflow": store.name, "agent_id": agent["id"]},
+                    )
+                except Exception:
+                    LOG.debug("Could not adopt worker %s/%s", store.name, agent["id"], exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2966,28 +3054,20 @@ def buffer_text(state, buffer_id: str) -> str:
         raise WorkflowError(f"there is no buffer {buffer_id}") from None
 
 
-class WorkflowDriver(Driver):
-    """Bridges ``WorkflowController`` background scheduler notices into ``Runtime``."""
+@dataclass
+class _WorkflowTask:
+    """In-flight Sans-I/O generator task driven via ``state.io.submit``."""
 
-    def __init__(self, controller: WorkflowController):
-        super().__init__()
-        self.controller = controller
-
-    def start(self, emit) -> None:
-        super().start(emit)
-        self.controller.attach_emit(emit)
-
-    def close(self) -> None:
-        self.controller.stop()
-        self.controller.attach_emit(None)
-        super().close()
+    kind: str  # "command" | "tick" | "event"
+    gen: Any
+    workflow_name: str = ""
 
 
 class WorkflowTool(Tool):
     """A tool with separate behavior (and schema) for controlling sessions and workers."""
     group = WORKER_TOOLS_GROUP
     optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
-                      "buffer_manager", "session_launcher", "_persistence_local_root", "cwd", "session_cwd"}
+                      "buffer_manager", "_persistence_local_root", "cwd", "session_cwd"}
     writes = {"done", "result", "shutdown", "shutdown_reason", "shutdown_save", "shutdown_registry_status",
               "shutdown_spawned_policy"}
 
@@ -3013,6 +3093,11 @@ class WorkflowTool(Tool):
             schema = schema(self.plugin.worker_context(state))
         state.tool_schemas[self.name] = {"schema": schema or self.schema, "available": bool(schema)}
 
+    def _drive_generator(self, state: State, gen):
+        result = yield from gen
+        self.plugin.ensure_tick_timer(state)
+        return str(result)
+
     def call(self, state: State, **kwargs):
         worker = worker_identity(state)
         handler = self.on_worker if worker else self.on_controller
@@ -3020,7 +3105,10 @@ class WorkflowTool(Tool):
             raise WorkflowError(f"{self.name} is not available in this session")
         if not worker:
             self.plugin.controller.bind(state)
-        return str(handler(state, **kwargs))
+        result = handler(state, **kwargs)
+        if inspect.isgenerator(result):
+            return self._drive_generator(state, result)
+        return str(result)
 
     def _finish_ok(self, tc: ToolCall, result, ts: float, emit: EmitFn) -> None:
         super()._finish_ok(tc, result, ts, emit)
@@ -3067,20 +3155,104 @@ class WorkflowSchemaPublisher:
 
 
 class WorkflowsPlugin:
-    """Tool handlers and worker context, shared by the components of one pipeline."""
+    """Tool handlers, Sans-I/O task driver, and worker context for one pipeline."""
 
     def __init__(self, controller: WorkflowController):
         self.controller = controller
-        self.pending_command_ops: dict[str, str] = {}
+        self.pending_tasks: dict[OpId, _WorkflowTask] = {}
+        self.tick_timer_op: OpId | None = None
+        self.tick_active: bool = False
 
-    def track_command_op(self, op_id, workflow_name: str = "") -> None:
+    def ensure_tick_timer(self, state: State) -> OpId | None:
+        """Schedule the next periodic scheduling timer when any workflow is managed."""
+        if (
+            not self.controller.managed
+            or self.tick_active
+            or self.tick_timer_op is not None
+            or getattr(state, "shutdown", False)
+            or getattr(state, "done", False)
+            or not hasattr(state, "io")
+        ):
+            return self.tick_timer_op
+        self.tick_timer_op = state.io.submit(StartTimer(delay_s=TICK_SECONDS), tag="workflow_tick")
+        return self.tick_timer_op
+
+    def advance_task(
+        self,
+        state: State,
+        task: _WorkflowTask,
+        *,
+        first: bool = False,
+        send_value: Any = None,
+        throw_exc: BaseException | None = None,
+    ) -> tuple[OpId | None, bool, Any]:
+        """Step a generator task until it yields an ``IoRequest`` or completes."""
+        try:
+            if first:
+                yielded = next(task.gen)
+            elif throw_exc is not None:
+                yielded = task.gen.throw(throw_exc)
+            else:
+                yielded = task.gen.send(send_value)
+        except StopIteration as stop:
+            return None, True, stop.value
+        except Exception as exc:
+            return None, False, exc
+        if not isinstance(yielded, IoRequest):
+            try:
+                task.gen.close()
+            except Exception:
+                pass
+            return None, False, TypeError(
+                f"Workflow task yielded unsupported object {type(yielded).__name__}; expected IoRequest"
+            )
+        tag = "workflow_command" if task.kind == "command" else "workflow_scheduler"
+        op_id = state.io.submit(yielded, tag=tag)
+        self.pending_tasks[op_id] = task
+        return op_id, False, None
+
+    def start_event_task(self, state: State, emit: EmitFn, kind: str, gen, workflow_name: str = "") -> OpId | None:
+        task = _WorkflowTask(kind=kind, gen=gen, workflow_name=workflow_name)
+        op_id, ok, val = self.advance_task(state, task, first=True)
         if op_id is not None:
-            self.pending_command_ops[op_id] = workflow_name
+            return op_id
+        self.finish_task_outcome(state, emit, task, ok, val)
+        return None
 
-    def consume_command_op(self, op_id) -> tuple[bool, str]:
-        if op_id in self.pending_command_ops:
-            return True, self.pending_command_ops.pop(op_id)
-        return False, ""
+    def finish_task_outcome(self, state: State, emit: EmitFn, task: _WorkflowTask, ok: bool, val: Any) -> None:
+        if task.kind == "command":
+            result = (
+                {"ok": True, "text": str(val or "")}
+                if ok
+                else {"ok": False, "text": f"Workflow {task.workflow_name}: {val}"}
+            )
+            WorkflowCommand.complete(state, result, emit)
+            self.drain_notices(state, emit, wake=False)
+            self.ensure_tick_timer(state)
+            return
+        if task.kind == "tick":
+            self.tick_active = False
+            if not ok:
+                LOG.exception("Workflow scheduler tick failed: %s", val)
+        elif not ok:
+            LOG.warning("Workflow event task failed: %s", val)
+        self.drain_notices(state, emit, wake=True)
+        self.ensure_tick_timer(state)
+
+    def drain_notices(self, state: State, emit: EmitFn, *, wake: bool) -> int:
+        drained = 0
+        while self.controller.notices:
+            pending = getattr(state, "pending_interrupts", None)
+            if not isinstance(pending, list):
+                pending = []
+                state.pending_interrupts = pending
+            pending.append(self.controller.notices.popleft())
+            drained += 1
+        if drained and wake:
+            emit(InterruptQueued(source="workflow_notices"))
+            emit(ProjectionRequested())
+            _wake_idle_session(state, emit)
+        return drained
 
     # -- worker context ---------------------------------------------------------
 
@@ -3131,16 +3303,17 @@ class WorkflowsPlugin:
         return f"{head}\n\nDiff:\n{result['diff']}\nEffects:\n{effects}"
 
     def command_workflow(self, state, workflow_name, command, agent_group=None):
+        del state
         command = str(command or "").strip().lower()
         agent_group = None if agent_group in (None, "") else agent_group
         if command == "run":
-            return self.controller.run(workflow_name, agent_group)
+            return (yield from self.controller.run(workflow_name, agent_group))
         if command == "pause":
-            return self.controller.pause(workflow_name, agent_group)
+            return (yield from self.controller.pause(workflow_name, agent_group))
         if command == "archive":
             if agent_group:
                 raise WorkflowError("archive applies to the whole workflow; omit agent_group")
-            return self.controller.archive(workflow_name)
+            return (yield from self.controller.archive(workflow_name))
         if command == "unarchive":
             if agent_group:
                 raise WorkflowError("unarchive applies to the whole workflow; omit agent_group")
@@ -3148,9 +3321,11 @@ class WorkflowsPlugin:
         raise WorkflowError(f'unknown command "{command}"; use run, pause, archive or unarchive')
 
     def rename_workflow(self, state, workflow_name, new_name):
+        del state
         return self.controller.rename(workflow_name, new_name)
 
     def set_agent_count(self, state, workflow_name, agent_group, count):
+        del state
         store = WorkflowStore(workflow_name).require()
         result = store.set_count(agent_group, int(count), by=self.controller.me_label())
         if not result["changed"]:
@@ -3159,8 +3334,7 @@ class WorkflowsPlugin:
         if int(count) < result["old"]:
             text += " Extra running agents finish their current item first."
         elif workflow_name in self.controller.managed:
-            with self.controller.lock:
-                started = self.controller.tick(store.name)
+            started = yield from self.controller.tick(store.name)
             if started:
                 text += " " + " ".join(started)
         elif store.control().get("state") == "running":
@@ -3168,11 +3342,13 @@ class WorkflowsPlugin:
         return text
 
     def message_agents(self, state, workflow_name, message, agent_group=None):
+        del state
         agent_group = None if agent_group in (None, "") else agent_group
-        return self.controller.message_agents(workflow_name, str(message), agent_group)
+        return (yield from self.controller.message_agents(workflow_name, str(message), agent_group))
 
     def restart_agent(self, state, workflow_name, agent):
-        return self.controller.restart_agent(workflow_name, agent)
+        del state
+        return (yield from self.controller.restart_agent(workflow_name, agent))
 
     def add_items(self, state, workflow_name, queue, from_buffers, note=None):
         store = WorkflowStore(workflow_name).require()
@@ -3518,45 +3694,58 @@ class WorkflowCommand:
             raise CommandError(str(exc)) from exc
 
         if request["action"] == "set":
-            def action():
-                return controller.change_setting(request["name"], request["kind"], request["target"],
-                                                 request["setting"], request["value"])
+            gen = controller.change_setting(request["name"], request["kind"], request["target"],
+                                            request["setting"], request["value"])
             receipt = f"Setting {change['label']} {change['setting']} to {change['new_text']}..."
         elif request["action"] == "rename":
-            def action():
+            def _rename_gen():
+                if False:
+                    yield
                 return controller.rename(request["name"], request["new_name"])
+            gen = _rename_gen()
             receipt = f"Renaming {request['name']} to {request['new_name']}..."
-        elif request["action"] in {"archive", "unarchive"}:
-            method = controller.archive if request["action"] == "archive" else controller.unarchive
-
-            def action():
-                return method(request["name"])
-            receipt = f"{'Archiving' if request['action'] == 'archive' else 'Restoring'} {request['name']}..."
+        elif request["action"] == "archive":
+            gen = controller.archive(request["name"])
+            receipt = f"Archiving {request['name']}..."
+        elif request["action"] == "unarchive":
+            def _unarchive_gen():
+                if False:
+                    yield
+                return controller.unarchive(request["name"])
+            gen = _unarchive_gen()
+            receipt = f"Restoring {request['name']}..."
         else:
             method = controller.run if request["action"] == "run" else controller.pause
-
-            def action():
-                return method(request["name"], request["group"])
+            gen = method(request["name"], request["group"])
             verb = "Running" if request["action"] == "run" else "Pausing"
             scope = f"{request['name']}:{request['group']}" if request["group"] else request["name"]
             receipt = f"{verb} {scope}..."
 
-        def work():
-            try:
-                return {"ok": True, "text": action()}
-            except Exception as exc:
-                return {"ok": False, "text": f"Workflow {request['name']}: {exc}"}
-
-        op_id = ctx.defer(work, tag="workflow_command")
-        self.plugin.track_command_op(op_id, request["name"])
+        task = _WorkflowTask(kind="command", gen=gen, workflow_name=request["name"])
+        op_id, ok, val = self.plugin.advance_task(ctx.state, task, first=True)
+        if op_id is not None:
+            return CommandResult(
+                outputs=(CommandNotice(text=receipt, level="info"),),
+                operation_id=op_id,
+                refresh=False,
+            )
+        result = (
+            {"ok": True, "text": str(val or "")}
+            if ok
+            else {"ok": False, "text": f"Workflow {request['name']}: {val}"}
+        )
+        self.complete(ctx.state, result, ctx.emit, emit_notice=False)
+        self.plugin.drain_notices(ctx.state, ctx.emit, wake=False)
+        self.plugin.ensure_tick_timer(ctx.state)
+        text = str(result.get("text") or "")
+        first_line = text.splitlines()[0] if text else "Workflow command completed."
         return CommandResult(
-            outputs=(CommandNotice(text=receipt, level="info"),),
-            operation_id=op_id,
+            outputs=(CommandNotice(text=first_line, level="info" if result["ok"] else "warning"),),
             refresh=False,
         )
 
     @staticmethod
-    def complete(state: State, result: dict, emit: EmitFn) -> None:
+    def complete(state: State, result: dict, emit: EmitFn, *, emit_notice: bool = True) -> None:
         if result.get("ok"):
             text = str(result.get("text") or "")
             pending = getattr(state, "pending_interrupts", None)
@@ -3568,11 +3757,13 @@ class WorkflowCommand:
             )
             emit(InterruptQueued(source="workflow_command"))
             first_line = text.splitlines()[0] if text else "Workflow command completed."
-            emit(EmitNotice(first_line, level="info"))
+            if emit_notice:
+                emit(EmitNotice(first_line, level="info"))
             emit(ProjectionRequested())
             _wake_idle_session(state, emit)
         else:
-            emit(EmitNotice(str(result.get("text") or "Workflow command failed."), level="warning"))
+            if emit_notice:
+                emit(EmitNotice(str(result.get("text") or "Workflow command failed."), level="warning"))
             emit(ProjectionRequested())
 
 
@@ -3760,32 +3951,101 @@ class WorkflowSkillRegistration(RenderTransformRegistrar):
 
 
 class WorkflowNotices(InterruptCheck):
-    """Owner-thread hook: adopt workflows after restart, deliver notices, remind workers."""
+    """Pure Sans-I/O scheduler & notice hook: timers, session events, adoption, worker reminders."""
     check_name = "workflow_notices"
     cooldown = 0
-    handles = (SessionReady, TurnSettled, WorkflowNoticesReady, IoCompleted, IoFailed)
+    handles = (
+        SessionReady,
+        TurnSettled,
+        TimerFired,
+        IoCompleted,
+        IoFailed,
+        ExternalSessionReady,
+        ExternalSessionExited,
+        SessionDataReceived,
+    )
     reads = {"step"}
-    optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
-                      "session_launcher", "_persistence_local_root", "cwd", "session_cwd", "entries",
-                      "buffer_manager", "done", "shutdown"}
+    optional_reads = {
+        "_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
+        "_persistence_local_root", "cwd", "session_cwd", "entries", "buffer_manager", "done", "shutdown",
+        "activity", "await_timer_op", "pending_tool_calls", "active_llm", "startup_paused",
+        "_runtime_startup_paused", "interrupted", "_interrupted",
+    }
     writes = {"pending_interrupts", "_interrupt_state", "buffer_manager"}
 
     def __init__(self, plugin: WorkflowsPlugin):
         self.plugin = plugin
 
+    def _tick_all_managed(self):
+        controller = self.plugin.controller
+        for name in list(controller.managed):
+            try:
+                yield from controller.tick(name)
+                controller.errors.pop(name, None)
+            except Exception as exc:
+                LOG.exception("Workflow %s scheduling failed", name)
+                message = f"Workflow {name}: scheduling failed: {exc}"
+                if controller.errors.get(name) != message:
+                    controller.errors[name] = message
+                    controller.notice(message)
+
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if isinstance(event, (IoCompleted, IoFailed)):
-            matched, workflow_name = self.plugin.consume_command_op(event.op_id)
-            if not matched:
+            task = self.plugin.pending_tasks.pop(event.op_id, None)
+            if task is None:
                 return
             event.stop()
-            if isinstance(event, IoCompleted) and isinstance(event.value, dict):
-                result = event.value
-            elif isinstance(event, IoCompleted):
-                result = {"ok": True, "text": str(event.value or "")}
+            if isinstance(event, IoCompleted):
+                op_id, ok, val = self.plugin.advance_task(state, task, send_value=event.value)
             else:
-                result = {"ok": False, "text": f"Workflow {workflow_name}: {event.error}"}
-            WorkflowCommand.complete(state, result, emit)
+                err = event.error
+                exc = err if isinstance(err, BaseException) else RuntimeError(str(err))
+                op_id, ok, val = self.plugin.advance_task(state, task, throw_exc=exc)
+            if op_id is None:
+                self.plugin.finish_task_outcome(state, emit, task, ok, val)
+            return
+
+        if isinstance(event, TimerFired):
+            if self.plugin.tick_timer_op is None or event.op_id != self.plugin.tick_timer_op:
+                return
+            event.stop()
+            self.plugin.tick_timer_op = None
+            if (
+                worker_identity(state)
+                or not self.plugin.controller.managed
+                or getattr(state, "shutdown", False)
+                or getattr(state, "done", False)
+            ):
+                return
+            self.plugin.tick_active = True
+            self.plugin.start_event_task(state, emit, "tick", self._tick_all_managed())
+            return
+
+        if isinstance(event, ExternalSessionReady):
+            if worker_identity(state) or not self.plugin.controller.managed:
+                return
+            self.plugin.start_event_task(state, emit, "event", self.plugin.controller.on_session_ready(event))
+            return
+
+        if isinstance(event, ExternalSessionExited):
+            if worker_identity(state) or not self.plugin.controller.managed:
+                return
+            self.plugin.start_event_task(state, emit, "event", self.plugin.controller.on_session_exited(event))
+            return
+
+        if isinstance(event, SessionDataReceived):
+            if not worker_identity(state) or event.channel != "workflow":
+                return
+            parts = [event.message] if event.message else []
+            for art in event.artifacts:
+                body = art.data if isinstance(art.data, str) else json.dumps(art.data, ensure_ascii=False)
+                parts.append(f"[{art.name} ({art.kind})]: {body}")
+            if parts:
+                self._ensure_interrupt_attrs(state)
+                state.pending_interrupts.append("\n".join(parts))
+                emit(InterruptQueued(source="workflow_data"))
+                emit(ProjectionRequested())
+                _wake_idle_session(state, emit)
             return
 
         if getattr(state, "buffer_manager", None) is not None:
@@ -3800,21 +4060,18 @@ class WorkflowNotices(InterruptCheck):
             return
 
         controller = self.plugin.controller
+        adopted: list[str] = []
         if getattr(state, "_instance_id", ""):
             try:
-                controller.adopt(state)
+                adopted = controller.adopt(state)
             except Exception:
                 LOG.exception("Workflow adoption failed")
-        drained = 0
-        while controller.notices:
-            self._ensure_interrupt_attrs(state)
-            state.pending_interrupts.append(controller.notices.popleft())
-            drained += 1
-        if drained and isinstance(event, (SessionReady, WorkflowNoticesReady)):
+        if adopted and hasattr(state, "io"):
+            self.plugin.start_event_task(state, emit, "event", controller.rediscover_workflows(adopted))
+        drained = self.plugin.drain_notices(state, emit, wake=False)
+        if drained and isinstance(event, SessionReady):
             emit(InterruptQueued(source=self.check_name))
-            if isinstance(event, WorkflowNoticesReady):
-                emit(ProjectionRequested())
-                _wake_idle_session(state, emit)
+        self.plugin.ensure_tick_timer(state)
 
     def remind_worker(self, state):
         """A worker that ends its turn without finish_task gets one reminder, then needs attention."""
@@ -3891,7 +4148,7 @@ def register_features(builder, *, session, config):
         SchemaPublisher,
         WorkflowSchemaPublisher,
         {RenderPlanInitializer, LLMCaller},
-    ], drivers=[WorkflowDriver(controller)]))
+    ]))
     builder.add(Feature("workflow_guidance", components=[
         WorkflowSkillRegistration(), WorkflowSystemPrompt(plugin),
     ], order=[WorkflowSkillRegistration, WorkflowSystemPrompt, SystemPromptSkillList, MessageRenderer]))
