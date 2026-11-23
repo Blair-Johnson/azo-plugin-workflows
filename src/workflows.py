@@ -3779,9 +3779,7 @@ def _wake_idle_session(state: State, emit: EmitFn) -> None:
         getattr(state, "pending_tool_calls", None)
         or getattr(state, "active_llm", None) is not None
         or getattr(state, "startup_paused", False)
-        or getattr(state, "_runtime_startup_paused", False)
         or getattr(state, "interrupted", False)
-        or getattr(state, "_interrupted", False)
         or getattr(state, "shutdown", False)
         or getattr(state, "done", False)
     ):
@@ -3968,8 +3966,7 @@ class WorkflowNotices(InterruptCheck):
     optional_reads = {
         "_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
         "_persistence_local_root", "cwd", "session_cwd", "entries", "buffer_manager", "done", "shutdown",
-        "activity", "await_timer_op", "pending_tool_calls", "active_llm", "startup_paused",
-        "_runtime_startup_paused", "interrupted", "_interrupted",
+        "activity", "await_timer_op", "pending_tool_calls", "active_llm", "startup_paused", "interrupted",
     }
     writes = {"pending_interrupts", "_interrupt_state", "buffer_manager"}
 
