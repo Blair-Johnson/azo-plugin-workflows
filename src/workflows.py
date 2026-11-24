@@ -445,6 +445,13 @@ def workflows_root() -> Path:
 
 
 def atomic_write(path: Path, text: str) -> None:
+    try:
+        from agent_zoo.durability import atomic_write_text
+
+        atomic_write_text(path, text)
+        return
+    except ImportError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with open(temporary, "w", encoding="utf-8") as stream:
@@ -762,6 +769,36 @@ class WorkflowStore:
     def _save_item(self, meta: dict) -> None:
         write_json(self.item_paths(meta["id"])[1], meta)
 
+    def _add_item_unlocked(
+        self,
+        queue: str,
+        text: str,
+        *,
+        by: str,
+        note: str | None = None,
+        from_items: list[str] | None = None,
+        allowed: set | None = None,
+    ) -> dict:
+        queue = check_queue_id(queue)
+        if allowed is not None and queue not in allowed:
+            raise WorkflowError(f"you can only send to: {', '.join(sorted(allowed))}")
+        if not text.strip():
+            raise WorkflowError("an item cannot be empty")
+        self.require()
+        number = self.next_number("item")
+        item_id = f"item_{number}"
+        at = now_iso()
+        meta = {
+            "id": item_id, "title": item_title(text), "queue": queue, "state": "waiting",
+            "created_at": at, "created_by": by, "from_items": list(from_items or []), "taken_by": None,
+            "notes": [{"text": note, "by": by, "at": at}] if note else [],
+            "history": [{"at": at, "event": "added", "queue": queue, "by": by}],
+        }
+        atomic_write(self.item_paths(item_id)[0], text if text.endswith("\n") else text + "\n")
+        self._save_item(meta)
+        self.log("item_added", item=item_id, queue=queue, by=by)
+        return meta
+
     def add_item(self, queue: str, text: str, *, by: str, note: str | None = None,
                  from_items: list[str] | None = None, allowed: set | None = None) -> dict:
         queue = check_queue_id(queue)
@@ -770,20 +807,9 @@ class WorkflowStore:
         if not text.strip():
             raise WorkflowError("an item cannot be empty")
         with self.lock():
-            self.require()
-            number = self.next_number("item")
-            item_id = f"item_{number}"
-            at = now_iso()
-            meta = {
-                "id": item_id, "title": item_title(text), "queue": queue, "state": "waiting",
-                "created_at": at, "created_by": by, "from_items": list(from_items or []), "taken_by": None,
-                "notes": [{"text": note, "by": by, "at": at}] if note else [],
-                "history": [{"at": at, "event": "added", "queue": queue, "by": by}],
-            }
-            atomic_write(self.item_paths(item_id)[0], text if text.endswith("\n") else text + "\n")
-            self._save_item(meta)
-            self.log("item_added", item=item_id, queue=queue, by=by)
-        return meta
+            return self._add_item_unlocked(
+                queue, text, by=by, note=note, from_items=from_items, allowed=allowed
+            )
 
     def move_items(self, item_ids: list[str], to_queue: str, *, by: str, note: str | None = None,
                    allowed: set | None = None) -> list[dict]:
@@ -891,27 +917,32 @@ class WorkflowStore:
 
     def finish_agent(self, agent_id: str, *, summary: str,
                      outputs: list[tuple[str, str]]) -> dict:
-        """Record a worker's finish: create output items, mark its item done."""
+        """Record a worker's finish atomically under one lock: create outputs, mark inputs done."""
         with self.lock():
             record = self.agent(agent_id)
             if record["state"] in {"finished", "restarted"}:
                 raise WorkflowError(f"{agent_id} has already {record['state']}")
             allowed = set(record.get("sends_to", [])) | {TRASH}
-            for queue, _ in outputs:
+            for queue, text in outputs:
                 check_queue_id(queue)
                 if queue not in allowed:
                     raise WorkflowError(f"you can only send to: {', '.join(sorted(allowed))}")
-        created = [self.add_item(queue, text, by=agent_id, from_items=agent_items(record),
-                                 allowed=allowed) for queue, text in outputs]
-        with self.lock():
-            record = self.agent(agent_id)
-            for item_id in agent_items(record):
+                if not str(text or "").strip():
+                    raise WorkflowError("an item cannot be empty")
+            input_ids = agent_items(record)
+            created = [
+                self._add_item_unlocked(
+                    queue, text, by=agent_id, from_items=input_ids, allowed=allowed
+                )
+                for queue, text in outputs
+            ]
+            for item_id in input_ids:
                 self.finish_item(item_id, agent_id)
             record.update(state="finished", summary=summary, finished_at=now_iso(),
                           outputs=record.get("outputs", []) + [m["id"] for m in created],
                           problem=None)
             self.save_agent(record)
-            self.log("agent_finished", agent=agent_id, items=agent_items(record),
+            self.log("agent_finished", agent=agent_id, items=input_ids,
                      outputs=[m["id"] for m in created], summary=summary)
         return {"agent": record, "created": created}
 
