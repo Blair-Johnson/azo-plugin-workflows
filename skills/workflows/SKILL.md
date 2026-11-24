@@ -81,7 +81,7 @@ and you can lower the batch size with `update_workflow` to drain it.
 
 Always give a workflow a short `description`: it is how the user recognizes it in
 `/workflow list`.
-Group settings: `count` (agents at once, default 1), `takes_from`, `sends_to`,
+Group settings: `count` (concurrent agents, 0 to 64, default 1), `takes_from`, `sends_to`,
 `every` (only without `takes_from`), `instructions` (required), `folder`, `model`.
 Queue settings: `notify_on_new`.
 
@@ -91,7 +91,8 @@ In `instructions` and `folder`: `{{item}}` expands to the items the agent took
 view at launch time.
 
 Instructions are free-form. Agents already know how to finish (they call
-`finish_task` and send results to queues), so write instructions about the work,
+`finish_task(summary, outputs=[{"buffer": "buf_...", "queue": "q_..."}])` to mark taken
+items done and send results to queues), so write instructions about the work,
 including which queue each kind of result belongs in. There are no schemas: if
 an agent can get stuck, give it a queue such as `q_blocked` and say when to use it.
 

@@ -3028,7 +3028,6 @@ def function_schema(name: str, description: str, properties: dict, required: lis
         if key not in required:
             kinds = prop["type"] if isinstance(prop["type"], list) else [prop["type"]]
             prop["type"] = list(dict.fromkeys([*kinds, "null"]))
-            prop["description"] = prop.get("description", "") + " Omit or pass null to use the default."
     return {"type": "function", "function": {
         "name": name, "description": description,
         "parameters": {"type": "object", "properties": properties, "required": required},
@@ -3039,9 +3038,9 @@ def text_property(description: str) -> dict:
     return {"type": "string", "description": description}
 
 
-WORKFLOW_NAME_PROPERTY = text_property('Name of the workflow, e.g. "miner".')
-AGENT_GROUP_PROPERTY = text_property("Limit to one agent group, e.g. grp_reverse. Omit for the whole workflow.")
-NOTE_PROPERTY = text_property("Optional note shown to the next agent that takes these items.")
+WORKFLOW_NAME_PROPERTY = text_property("Workflow name.")
+AGENT_GROUP_PROPERTY = text_property("Single agent group (grp_*), or null for all.")
+NOTE_PROPERTY = text_property("Optional note shown to the next agent.")
 
 
 def buffer_text(state, buffer_id: str) -> str:
@@ -3430,11 +3429,10 @@ class WorkflowsPlugin:
 def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
     outputs_property = {
         "type": "array",
-        "description": "One entry per result, e.g. [{\"buffer\": \"buf_a1\", \"queue\": \"q_results\"}]. "
-                       "Each buffer becomes one item; its first line is the title. May be empty.",
+        "description": "Result entries [{buffer, queue}]; each buffer becomes one item.",
         "items": {"type": "object", "properties": {
-            "buffer": text_property("Buffer holding the result text."),
-            "queue": text_property("Queue to send it to."),
+            "buffer": text_property("Result buffer ID."),
+            "queue": text_property("Destination queue."),
         }, "required": ["buffer", "queue"]},
     }
 
@@ -3445,108 +3443,90 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
     def finish_schema(context):
         return function_schema(
             "finish_task",
-            "Finish your assigned task and end this session. The items you took are marked done whatever you send. "
-            + allowed_text(context),
-            {"summary": text_property("A few sentences on what you did and found, for whoever runs the workflow."),
+            "Finish your task and end this session; taken items are marked done. " + allowed_text(context),
+            {"summary": text_property("Short summary of what you did and found."),
              "outputs": outputs_property},
             ["summary"])
 
     def worker_add_schema(context):
         return function_schema(
             "add_items",
-            "Add items to a queue before you finish, e.g. results you want delivered as you find them. "
-            "Each buffer becomes one item; its first line is the title. " + allowed_text(context),
-            {"queue": text_property("Queue to add to, e.g. q_results."),
+            "Add buffer contents as items to a queue before finishing. " + allowed_text(context),
+            {"queue": text_property("Target queue (q_*)."),
              "from_buffers": {"type": "array", "items": {"type": "string"},
-                              "description": "Buffer IDs; each becomes one item."},
+                              "description": "Buffer IDs (one item each)."},
              "note": NOTE_PROPERTY},
             ["queue", "from_buffers"])
 
     def worker_move_schema(context):
         return function_schema(
             "move_items",
-            "Move waiting or finished items into another queue, e.g. to send blocked items back for another "
-            "try. You cannot move items another agent is working on. " + allowed_text(context),
-            {"item_ids": {"type": "array", "items": {"type": "string"}, "description": 'e.g. ["item_12"]'},
+            "Move waiting or finished items to another queue (not in-progress items). " + allowed_text(context),
+            {"item_ids": {"type": "array", "items": {"type": "string"}, "description": "Item IDs (item_*)."},
              "to_queue": text_property("Destination queue."),
-             "note": text_property("Why you moved them; shown to the next agent.")},
+             "note": NOTE_PROPERTY},
             ["item_ids", "to_queue"])
 
     create = function_schema(
         "create_workflow",
-        "Create a new workflow from a YAML definition stored in a buffer. Nothing runs until it is started "
-        "with command_workflow or /workflow run. Queues are named q_*, agent groups grp_*. A group with "
-        "takes_from starts one agent per item from that queue; takes_from: {q_a: 2, q_b: 1} instead gives each "
-        "agent a batch (2 items from q_a and 1 from q_b) and starts it only once the whole batch is waiting. "
-        "A group without takes_from keeps `count` agents running. Example definition:\n" + EXAMPLE_DEFINITION,
-        {"workflow_name": text_property('New workflow name: lowercase letters, digits and underscores, e.g. "miner".'),
-         "definition_buffer": text_property("Buffer holding the YAML definition.")},
+        "Create a paused workflow from a YAML definition buffer (queues q_*, groups grp_* with takes_from or standing count). Activate the Workflows skill for full YAML syntax.",
+        {"workflow_name": text_property("New name (lowercase letters, digits, underscores)."),
+         "definition_buffer": text_property("Buffer with YAML definition.")},
         ["workflow_name", "definition_buffer"])
     update = function_schema(
         "update_workflow",
-        "Replace a workflow's definition with the full YAML in a buffer. Copy wf:<name>:definition into a "
-        "buffer, edit it, and pass it here. Returns a diff and the effects on running agents and waiting items. "
-        "Running agents finish under the old definition; the new one applies to agents started afterward.",
+        "Replace a workflow's YAML definition from a buffer (copy wf:<name>:definition first). Returns diff and effects; running agents keep the old definition.",
         {"workflow_name": WORKFLOW_NAME_PROPERTY,
-         "definition_buffer": text_property("Buffer holding the complete new YAML definition."),
-         "reason": text_property("One sentence saying why; saved in the workflow's history."),
-         "preview_only": {"type": "boolean", "description": "Show the diff and effects without changing anything."}},
+         "definition_buffer": text_property("Buffer with complete new YAML."),
+         "reason": text_property("One-sentence reason for history."),
+         "preview_only": {"type": "boolean", "description": "Show diff and effects without saving."}},
         ["workflow_name", "definition_buffer", "reason"])
     command = function_schema(
         "command_workflow",
-        "Run, pause, archive or unarchive a workflow. run: take control in this session, resume paused agents "
-        "where they left off, and start new agents up to each group's count (agents cost money; confirm with the "
-        "user first). pause: start no new agents and interrupt running ones, keeping their work. archive: stop "
-        "all agents and hide the workflow from the user's /workflow list (e.g. one-off or test workflows); its "
-        "history stays readable. unarchive: bring an archived workflow back, paused.",
+        "Control a workflow: run (confirm with user first; agents cost money), pause, archive, or unarchive.",
         {"workflow_name": WORKFLOW_NAME_PROPERTY,
-         "command": {"type": "string", "enum": ["run", "pause", "archive", "unarchive"], "description": "What to do."},
+         "command": {"type": "string", "enum": ["run", "pause", "archive", "unarchive"], "description": "Action."},
          "agent_group": AGENT_GROUP_PROPERTY},
         ["workflow_name", "command"])
     rename = function_schema(
         "rename_workflow",
-        "Give a workflow a new name, keeping its definition, items, agents and history. The workflow must be "
-        "paused or archived with no unfinished agents, because agent sessions are tied to the old name.",
+        "Rename a paused or archived workflow that has no unfinished agents.",
         {"workflow_name": WORKFLOW_NAME_PROPERTY,
-         "new_name": text_property('New name: lowercase letters, digits and underscores, e.g. "test_failures".')},
+         "new_name": text_property("New workflow name.")},
         ["workflow_name", "new_name"])
     count = function_schema(
         "set_agent_count",
-        "Set how many agents in a group run at once. Takes effect immediately and records a new definition "
-        "version. When lowering, extra agents finish their current item first.",
+        "Set concurrent agent count (0-64) for a group; records a new version immediately.",
         {"workflow_name": WORKFLOW_NAME_PROPERTY,
-         "agent_group": text_property("Agent group, e.g. grp_reverse."),
-         "count": {"type": "integer", "description": "Agents to run at once, 0 to 64."}},
+         "agent_group": text_property("Agent group (grp_*)."),
+         "count": {"type": "integer", "description": "Concurrent agents (0-64)."}},
         ["workflow_name", "agent_group", "count"])
     message = function_schema(
         "message_agents",
-        "Send a message to a workflow's running agents, as if the user typed it in their sessions.",
-        {"workflow_name": WORKFLOW_NAME_PROPERTY, "message": text_property("The message."),
-         "agent_group": text_property("Only message this agent group, e.g. grp_reverse. Omit for all running agents.")},
+        "Send a message to a workflow's running agents.",
+        {"workflow_name": WORKFLOW_NAME_PROPERTY, "message": text_property("Message text."),
+         "agent_group": AGENT_GROUP_PROPERTY},
         ["workflow_name", "message"])
     restart = function_schema(
         "restart_agent",
-        "Stop one agent, discard its progress, and put its item back in its queue for a fresh agent. Use when an "
-        "agent is stuck or cannot resume.",
-        {"workflow_name": WORKFLOW_NAME_PROPERTY, "agent": text_property("Agent ID, e.g. agt_reverse_3.")},
+        "Stop a stuck agent, discard its progress, and return its items to their queues.",
+        {"workflow_name": WORKFLOW_NAME_PROPERTY, "agent": text_property("Agent ID (agt_*).")},
         ["workflow_name", "agent"])
     add = function_schema(
         "add_items",
-        "Add items to a workflow queue. Each buffer becomes one item; its first line is the item's title.",
-        {"workflow_name": WORKFLOW_NAME_PROPERTY, "queue": text_property("Queue to add to, e.g. q_targets."),
+        "Add buffer contents as items to a workflow queue (first line becomes title).",
+        {"workflow_name": WORKFLOW_NAME_PROPERTY, "queue": text_property("Target queue (q_*)."),
          "from_buffers": {"type": "array", "items": {"type": "string"},
-                          "description": "Buffer IDs; each becomes one item."},
+                          "description": "Buffer IDs (one item each)."},
          "note": NOTE_PROPERTY},
         ["workflow_name", "queue", "from_buffers"])
     move = function_schema(
         "move_items",
-        "Move items to another queue: retry finished items by moving them back, reroute them, or discard them "
-        "by moving them to q_trash (they can be moved back). Items an agent is working on cannot be moved; "
-        "use restart_agent first.",
+        "Move waiting or finished items to another queue (retry, reroute, or discard to q_trash). Use restart_agent first for taken items.",
         {"workflow_name": WORKFLOW_NAME_PROPERTY,
-         "item_ids": {"type": "array", "items": {"type": "string"}, "description": 'e.g. ["item_12", "item_17"]'},
-         "to_queue": text_property("Destination queue, e.g. q_targets or q_trash."),
-         "note": text_property("Why they moved; shown to the next agent that takes them.")},
+         "item_ids": {"type": "array", "items": {"type": "string"}, "description": "Item IDs (item_*)."},
+         "to_queue": text_property("Destination queue (q_* or q_trash)."),
+         "note": NOTE_PROPERTY},
         ["workflow_name", "item_ids", "to_queue"])
 
     p = plugin
