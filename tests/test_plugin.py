@@ -20,6 +20,7 @@ from agent_zoo.events import (
     ExternalSessionExited,
     ExternalSessionReady,
     ObserveSession,
+    QuiesceDrivers,
     SaveCheckpoint,
     SendSessionData,
     SendSessionInput,
@@ -934,7 +935,11 @@ def test_event_driven_tool_and_slash_command_pipeline_with_sim_session_driver(tm
     assert not finish_tc.error and "Task finished" in finish_tc.result
     assert worker_session.state.shutdown
     assert worker_session.state.shutdown_registry_status == "completed"
-    save_effs = [eff for eff in finish_effects if isinstance(getattr(eff, "request", None), SaveCheckpoint)]
+    quiesce_effs = [eff for eff in finish_effects if isinstance(getattr(eff, "request", None), QuiesceDrivers)]
+    assert len(quiesce_effs) == 1
+    assert not worker_session.state.done
+    save_effects = worker_session.step(IoCompleted(op_id=quiesce_effs[0].op_id, value=None))
+    save_effs = [eff for eff in save_effects if isinstance(getattr(eff, "request", None), SaveCheckpoint)]
     assert len(save_effs) == 1
     worker_session.step(IoCompleted(op_id=save_effs[0].op_id, value={"revision_id": "rev-1"}))
     assert worker_session.state.done
