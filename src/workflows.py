@@ -1753,7 +1753,6 @@ import collections
 import inspect
 import logging
 import shlex
-import threading
 import uuid
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
@@ -1785,10 +1784,10 @@ from agent_utils.features.core import (
 )
 from agent_utils.features.interrupts import InterruptCheck, InterruptQueued
 from agent_utils.features.skills import SkillSource
-from agent_utils.runtime.driver import Driver
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
 from agent_zoo.core.feature_state import ZooState, session_state
+from agent_zoo.durability import QueuedWorkerDriver
 from agent_zoo.events import (
     AdoptSession,
     ConfigureSessionLifecycle,
@@ -1873,7 +1872,7 @@ class _WorkflowTask:
     kind: str  # "command" | "command_doc" | "tick" | "event" | "startup" | "worker_remind"
     gen: Any
     workflow_name: str = ""
-    release_readiness: bool = False
+    hold_readiness: str | None = None
 
 
 @dataclass
@@ -1886,7 +1885,6 @@ class WorkflowRuntimeState:
     pending_tasks: dict[OpId, _WorkflowTask] = field(default_factory=dict)
     tick_timer_op: OpId | None = None
     tick_active: bool = False
-    readiness_held: bool = False
     adopted_instance: str = ""
     instances_by_id: dict[str, tuple[str, str]] = field(default_factory=dict)
     in_flight_agents: set[tuple[str, str]] = field(default_factory=set)
@@ -1959,24 +1957,6 @@ def get_session_cwd(state) -> str:
 def worker_identity(state):
     """Workers are identified by their durable session kind, never by environment."""
     return WORKER_KIND.fullmatch(str(_session_meta(state).kind or ""))
-
-
-def _readiness_hold(state: Any, reason: str) -> None:
-    gate = getattr(state, "readiness", None)
-    if gate is not None and callable(getattr(gate, "hold", None)):
-        gate.hold("workflows", reason)
-        _wf_runtime(state).readiness_held = True
-
-
-def _readiness_release(state: Any, emit: EmitFn | None = None) -> None:
-    rt = _wf_runtime(state)
-    gate = getattr(state, "readiness", None)
-    released = False
-    if gate is not None and callable(getattr(gate, "release", None)):
-        released = bool(gate.release("workflows"))
-    rt.readiness_held = False
-    if released and emit is not None:
-        emit(PacingCheck(reason="workflows_ready"))
 
 
 def _apply_snapshot(state: Any, snapshot: dict[str, Any] | None) -> None:
@@ -2303,123 +2283,16 @@ class WorkflowStoreRequest(IoRequest):
     params: dict[str, Any] = field(default_factory=dict)
 
 
-class WorkflowStoreDriver(Driver):
+class WorkflowStoreDriver(QueuedWorkerDriver):
     """Commit-class Sans-I/O driver owning ALL ``WorkflowStore`` disk/lock/checkpoint I/O."""
 
     request_types = (WorkflowStoreRequest,)
     durability = "commit"
+    worker_name = "agent-zoo-workflow-store"
 
     def __init__(self, *, root: Path | None = None) -> None:
         super().__init__()
         self._root = root
-        self._cond = threading.Condition(threading.RLock())
-        self._queue: collections.deque[tuple[OpId, WorkflowStoreRequest]] = collections.deque()
-        self._cancelled: set[OpId] = set()
-        self._in_progress = False
-        self._closing = False
-        self._closed = False
-        self._worker: threading.Thread | None = None
-
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._cond:
-            self._closing = False
-            self._closed = False
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._worker_loop,
-                    name="agent-zoo-workflow-store",
-                    daemon=True,
-                )
-                self._worker.start()
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, WorkflowStoreRequest):
-            raise TypeError(
-                f"WorkflowStoreDriver expected WorkflowStoreRequest, got {type(req).__name__}"
-            )
-        with self._cond:
-            if self._closing or self._closed or op_id in self._cancelled:
-                return
-            self._queue.append((op_id, req))
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._worker_loop,
-                    name="agent-zoo-workflow-store",
-                    daemon=True,
-                )
-                self._worker.start()
-            self._cond.notify_all()
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._cond:
-            self._cancelled.add(op_id)
-
-    def drain(self, *, timeout_s: float | None = None) -> None:
-        deadline = (
-            None if timeout_s is None else (time.monotonic() + max(0.0, float(timeout_s)))
-        )
-        with self._cond:
-            while (self._queue or self._in_progress) and not self._closed:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    self._cond.wait(timeout=min(remaining, 0.25))
-                else:
-                    self._cond.wait(timeout=0.25)
-
-    def quiesce(self, *, policy: str = "terminate", deadline: float | None = None) -> list[Event]:
-        del policy
-        remaining = None if deadline is None else max(0.0, float(deadline) - time.monotonic())
-        self.drain(timeout_s=remaining)
-        return []
-
-    def close(self) -> None:
-        with self._cond:
-            self._closing = True
-            worker = self._worker
-            self._cond.notify_all()
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=5.0)
-        with self._cond:
-            self._closed = True
-            self._worker = None
-            self._cancelled.clear()
-            self._cond.notify_all()
-
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._cond:
-            return self._closed or op_id in self._cancelled
-
-    def _worker_loop(self) -> None:
-        while True:
-            with self._cond:
-                while not self._queue:
-                    if self._closing or self._closed:
-                        return
-                    self._cond.wait(timeout=0.5)
-                op_id, req = self._queue.popleft()
-                cancelled = op_id in self._cancelled
-                if not cancelled:
-                    self._in_progress = True
-            if cancelled:
-                with self._cond:
-                    self._cancelled.discard(op_id)
-                    self._cond.notify_all()
-                continue
-            try:
-                value = self.execute(req)
-                if not self._is_fenced(op_id):
-                    self._safe_emit(IoCompleted(op_id=op_id, value=value))
-            except Exception as exc:
-                if not self._is_fenced(op_id):
-                    self._safe_emit(IoFailed(op_id=op_id, error=exc))
-            finally:
-                with self._cond:
-                    self._in_progress = False
-                    self._cancelled.discard(op_id)
-                    self._cond.notify_all()
 
     def register_sim(self, sim, *, delay: float = 0.0):
         """Register deterministic simulation handler on a ``SimulationRuntime``."""
@@ -4515,7 +4388,7 @@ class WorkflowsPlugin:
                 f"Workflow task yielded unsupported object {type(yielded).__name__}; expected IoRequest"
             )
         tag = "workflow_command" if task.kind in {"command", "command_doc"} else "workflow_scheduler"
-        op_id = state.io.submit(yielded, tag=tag)
+        op_id = state.io.submit(yielded, tag=tag, hold_readiness=task.hold_readiness)
         _wf_runtime(state).pending_tasks[op_id] = task
         return op_id, False, None
 
@@ -4527,13 +4400,13 @@ class WorkflowsPlugin:
         gen,
         workflow_name: str = "",
         *,
-        release_readiness: bool = False,
+        hold_readiness: str | None = None,
     ) -> OpId | None:
         task = _WorkflowTask(
             kind=kind,
             gen=gen,
             workflow_name=workflow_name,
-            release_readiness=release_readiness,
+            hold_readiness=hold_readiness,
         )
         op_id, ok, val = self.advance_task(state, task, first=True)
         if op_id is not None:
@@ -4543,8 +4416,8 @@ class WorkflowsPlugin:
 
     def finish_task_outcome(self, state: State, emit: EmitFn, task: _WorkflowTask, ok: bool, val: Any) -> None:
         rt = _wf_runtime(state)
-        if task.release_readiness:
-            _readiness_release(state, emit)
+        if task.hold_readiness and emit is not None:
+            emit(PacingCheck(reason="workflows_ready"))
         if task.kind == "command_doc":
             if ok and isinstance(val, InspectorDocument):
                 if hasattr(state, "io") and state.io is not None:
@@ -5449,14 +5322,22 @@ class WorkflowNotices(InterruptCheck):
             if task is None:
                 return
             event.stop()
-            if isinstance(event, IoCompleted):
-                op_id, ok, val = self.plugin.advance_task(state, task, send_value=event.value)
-            else:
-                err = event.error
-                exc = err if isinstance(err, BaseException) else RuntimeError(str(err))
-                op_id, ok, val = self.plugin.advance_task(state, task, throw_exc=exc)
-            if op_id is None:
-                self.plugin.finish_task_outcome(state, emit, task, ok, val)
+            io_table = getattr(state, "io", None)
+            manual_complete = io_table is not None and io_table.is_active(event.op_id)
+            if manual_complete:
+                io_table.complete(event.op_id, defer_readiness_release=True)
+            try:
+                if isinstance(event, IoCompleted):
+                    op_id, ok, val = self.plugin.advance_task(state, task, send_value=event.value)
+                else:
+                    err = event.error
+                    exc = err if isinstance(err, BaseException) else RuntimeError(str(err))
+                    op_id, ok, val = self.plugin.advance_task(state, task, throw_exc=exc)
+                if op_id is None:
+                    self.plugin.finish_task_outcome(state, emit, task, ok, val)
+            finally:
+                if manual_complete:
+                    io_table.flush_deferred_readiness_releases()
             return
 
         if isinstance(event, IoReattached):
@@ -5473,6 +5354,9 @@ class WorkflowNotices(InterruptCheck):
             task = rt.pending_tasks.pop(event.op_id, None)
             if task is not None:
                 event.stop()
+                io_table = getattr(state, "io", None)
+                if io_table is not None and io_table.is_active(event.op_id):
+                    io_table.complete(event.op_id)
                 self.plugin.finish_task_outcome(
                     state, emit, task, False, RuntimeError(f"Workflow operation lost: {event.reason}")
                 )
@@ -5538,11 +5422,10 @@ class WorkflowNotices(InterruptCheck):
                 if entries and rt.worker_reminded_entry < 0:
                     rt.worker_reminded_entry = len(entries) - 1
                 if hasattr(state, "io") and state.io is not None:
-                    _readiness_hold(state, "loading workflow worker context")
                     self.plugin.start_event_task(
                         state, emit, "startup",
                         self._startup_worker_gen(state, identity),
-                        release_readiness=True,
+                        hold_readiness="workflows",
                     )
             elif isinstance(event, TurnSettled):
                 self._schedule_worker_reminder(state, emit, identity)
@@ -5552,12 +5435,10 @@ class WorkflowNotices(InterruptCheck):
             self.plugin.controller.bind(state)
             if hasattr(state, "io") and state.io is not None:
                 is_restore = isinstance(event, SessionRestored) or bool(getattr(event, "restored", False))
-                if is_restore:
-                    _readiness_hold(state, "reconciling managed workflows")
                 self.plugin.start_event_task(
                     state, emit, "startup",
                     self._startup_controller_gen(state),
-                    release_readiness=is_restore,
+                    hold_readiness="workflows" if is_restore else None,
                 )
             else:
                 self.plugin.drain_notices(state, emit, wake=False)
