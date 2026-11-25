@@ -11,7 +11,27 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import workflows as wf
+from agent_zoo.cli.wsctl import AzoWs
 from agent_zoo.host.launch import RuntimeLauncher, RuntimeLaunch, RuntimeSettings, InstanceRef
+from tmux_pilot.process_identity import ProcessIdentity, capture_process_identity, observe_process
+
+
+def _process_state(identity_dict) -> str:
+    if not identity_dict:
+        return "unknown"
+    return observe_process(ProcessIdentity.from_dict(identity_dict)).state.value.lower()
+
+
+async def _send_shutdown(target: dict) -> None:
+    ws_url = target.get("websocket_url")
+    if not ws_url:
+        return
+    client = AzoWs.attach(ws_url, terminate_on_close=False)
+    await client.connect()
+    try:
+        await client.control("shutdown", save=True, reason="live-control-smoke")
+    finally:
+        await client.close()
 
 
 async def wait_for(label, predicate, timeout=120):
@@ -28,7 +48,7 @@ async def wait_for(label, predicate, timeout=120):
 async def connect(handle):
     observation = await wait_for("controller ready", lambda: (
         result if (result := handle.poll()).status == "ready" else None))
-    client = wf.AzoWs.attach(observation.ready["websocket_url"], terminate_on_close=False)
+    client = AzoWs.attach(observation.ready["websocket_url"], terminate_on_close=False)
     await client.connect()
     hello = client.observation().hello
     assert hello["session_id"] == handle.ref.session_id
@@ -63,9 +83,9 @@ async def main():
                 if store.control().get("state") != "archived":
                     store.update_control(state="paused")
             for agent in store.agents():
-                if wf.process_evidence(agent.get("process_identity")) == "alive" and agent.get("websocket_url"):
+                if _process_state(agent.get("process_identity")) == "alive" and agent.get("websocket_url"):
                     try:
-                        await wf.send_to_agent(agent, "shutdown")
+                        await _send_shutdown(agent)
                     except Exception as exc:
                         print("CLEANUP WARNING", agent["id"], str(exc), flush=True)
         for client in clients:
@@ -74,7 +94,7 @@ async def main():
             if handle.poll().status != "exited":
                 target = handle.poll().ready
                 if target:
-                    await wf.send_to_agent(target, "shutdown")
+                    await _send_shutdown(target)
             try:
                 await asyncio.to_thread(handle.process.wait, timeout=15)
             except subprocess.TimeoutExpired:
@@ -178,7 +198,7 @@ async def check_crash(name, store, client):
             call.get("name") == "await_interrupts" for call in calls) else None
 
     agent = await wait_for("complete saved tool result before crash", complete_checkpoint, timeout=60)
-    identity = wf.capture_process_identity(agent["pid"])
+    identity = capture_process_identity(agent["pid"])
     assert identity and identity.to_dict() == agent["process_identity"]
     os.kill(agent["pid"], signal.SIGKILL)
     await wait_for("safe checkpoint relaunched", lambda: (

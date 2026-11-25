@@ -88,7 +88,7 @@ def test_exit_events_ignored_after_scheduling_ends(runtime, end):
 
 def test_instances_are_isolated_between_workflows(runtime):
     create(runtime)
-    runtime.plugin.create_workflow(runtime.state, "other", "buf_def")
+    runtime.drive(runtime.plugin.create_workflow(runtime.state, "other", "buf_def"))
     runtime.drive(runtime.controller.run("miner"))
     runtime.drive(runtime.controller.run("other"))
     assert len(runtime.controller.instances_by_id) == 4

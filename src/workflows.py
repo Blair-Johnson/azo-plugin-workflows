@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import contextlib
 import difflib
-import fcntl
 import json
 import os
 import re
@@ -22,6 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+from agent_zoo.durability import (
+    atomic_write_json,
+    atomic_write_text,
+    file_lock,
+    fsync_dir,
+    fsync_fd,
+)
 
 PLUGIN_NAME = "azo-plugin-workflows"
 TRASH = "q_trash"
@@ -445,24 +452,11 @@ def workflows_root() -> Path:
 
 
 def atomic_write(path: Path, text: str) -> None:
-    try:
-        from agent_zoo.durability import atomic_write_text
-
-        atomic_write_text(path, text)
-        return
-    except ImportError:
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with open(temporary, "w", encoding="utf-8") as stream:
-        stream.write(text)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    atomic_write_text(path, text)
 
 
 def write_json(path: Path, value) -> None:
-    atomic_write(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_json(path, value, indent=2)
 
 
 def read_json(path: Path, default=None):
@@ -502,13 +496,8 @@ class WorkflowStore:
 
     @contextlib.contextmanager
     def lock(self):
-        self.dir.mkdir(parents=True, exist_ok=True)
-        with open(self.dir / ".lock", "a+") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        with file_lock(self.dir / ".lock"):
+            yield
 
     def counters(self) -> dict:
         return read_json(self.dir / "counters.json", {"item": 0, "version": 0, "agents": {}})
@@ -526,8 +515,11 @@ class WorkflowStore:
 
     def log(self, event: str, **fields) -> None:
         record = {"at": now_iso(), "event": event, **fields}
+        self.dir.mkdir(parents=True, exist_ok=True)
         with open(self.dir / "log.jsonl", "a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.flush()
+            fsync_fd(stream.fileno())
 
     def log_records(self) -> list[dict]:
         try:
@@ -637,6 +629,7 @@ class WorkflowStore:
                 target.dir.rmdir()
             self.log("renamed", old_name=self.name, new_name=target.name, by=by)
             os.rename(self.dir, target.dir)
+            fsync_dir(self.root)
         return target
 
     def update(self, text: str, *, reason: str, by: str, preview_only: bool = False) -> dict:
@@ -1753,31 +1746,35 @@ def render_view(buffer_id: str, *, viewer_session_id: str = "", transcript=None,
 
 
 # ===========================================================================
-# Agent Zoo integration
+# Agent Zoo integration (100% pure Sans-I/O + commit-class WorkflowStoreDriver)
 # ===========================================================================
 
 import collections
 import inspect
 import logging
 import shlex
+import threading
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from agent_utils.core.events import (
     Event,
     IoCompleted,
     IoFailed,
+    IoLost,
+    IoReattached,
     RenderRequested,
+    SessionRestored,
     TimerFired,
     ToolCallFinished,
     TurnSettled,
 )
 from agent_utils.core.io import IoRequest, OpId, StartTimer
 from agent_utils.core.pipeline import EmitFn, Feature
-from agent_utils.core.state import MODEL_RENDER_CHANNEL, State, ToolCall
+from agent_utils.core.state import MODEL_RENDER_CHANNEL, DurableSpec, State, ToolCall
 from agent_utils.core.tool import Tool
 from agent_utils.features.buffers import ReadonlyBufferView
 from agent_utils.features.core import (
@@ -1788,11 +1785,12 @@ from agent_utils.features.core import (
 )
 from agent_utils.features.interrupts import InterruptCheck, InterruptQueued
 from agent_utils.features.skills import SkillSource
+from agent_utils.runtime.driver import Driver
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
+from agent_zoo.core.feature_state import ZooState, session_state
 from agent_zoo.events import (
     AdoptSession,
-    BeforeLLM,
     ConfigureSessionLifecycle,
     DiscoverSessions,
     DiscoverSessionsResult,
@@ -1801,7 +1799,9 @@ from agent_zoo.events import (
     ExternalSessionReady,
     LiveSessionInfo,
     ObserveSession,
+    PacingCheck,
     ProjectionRequested,
+    PublishInspector,
     SendSessionData,
     SendSessionInput,
     SessionArtifact,
@@ -1833,6 +1833,11 @@ READY_TIMEOUT_SECONDS = 120
 MAX_QUICK_RESUMES = 3
 WORKER_TOOLS_GROUP = "Workflows"
 
+DEFAULT_EMPTY_INDEX = (
+    "Workflows. Open one with wf:<name>, e.g. wf:miner.\n"
+    "There are no workflows yet. Create one with create_workflow.\n"
+)
+
 RECOVERY_MESSAGE = (
     "Your session was restarted from a checkpoint after an interruption. "
     "Inspect saved results and existing processes/artifacts before continuing. "
@@ -1842,20 +1847,153 @@ RECOVERY_MESSAGE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Durable & ephemeral per-session state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkflowDurableState:
+    """Durable per-session workflow control state stored under ``state.features['workflows']``."""
+
+    managed: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+WORKFLOWS_DURABLE_SPEC = DurableSpec(
+    name="workflows",
+    cls=WorkflowDurableState,
+    version=1,
+    on_fork="reset",
+)
+
+
+@dataclass
+class _WorkflowTask:
+    """In-flight Sans-I/O generator task driven via ``state.io.submit``."""
+
+    kind: str  # "command" | "command_doc" | "tick" | "event" | "startup" | "worker_remind"
+    gen: Any
+    workflow_name: str = ""
+    release_readiness: bool = False
+
+
+@dataclass
+class WorkflowRuntimeState:
+    """Strictly ephemeral per-session runtime state and cached snapshots (never serialized)."""
+
+    cached_names: tuple[str, ...] = ()
+    cached_views: dict[str, str] = field(default_factory=dict)
+    cached_worker_context: dict[str, Any] | None = None
+    pending_tasks: dict[OpId, _WorkflowTask] = field(default_factory=dict)
+    tick_timer_op: OpId | None = None
+    tick_active: bool = False
+    readiness_held: bool = False
+    adopted_instance: str = ""
+    instances_by_id: dict[str, tuple[str, str]] = field(default_factory=dict)
+    in_flight_agents: set[tuple[str, str]] = field(default_factory=set)
+    notices: collections.deque = field(default_factory=collections.deque)
+    notified: set = field(default_factory=set)
+    errors: dict[str, str] = field(default_factory=dict)
+    worker_reminded_entry: int = -1
+    me: dict[str, str] | None = None
+    launch: dict[str, Any] | None = None
+
+
+def _wf_durable(state: Any) -> WorkflowDurableState:
+    if state is None:
+        return WorkflowDurableState()
+    durable_fn = getattr(state, "durable", None)
+    if callable(durable_fn):
+        return durable_fn(WORKFLOWS_DURABLE_SPEC)
+    existing = getattr(state, "_wf_durable_fallback", None)
+    if not isinstance(existing, WorkflowDurableState):
+        existing = WorkflowDurableState()
+        try:
+            setattr(state, "_wf_durable_fallback", existing)
+        except Exception:
+            pass
+    return existing
+
+
+def _wf_runtime(state: Any) -> WorkflowRuntimeState:
+    if state is None:
+        return WorkflowRuntimeState()
+    runtime_fn = getattr(state, "runtime", None)
+    if callable(runtime_fn):
+        return runtime_fn("workflows", WorkflowRuntimeState)
+    existing = getattr(state, "_wf_runtime_fallback", None)
+    if not isinstance(existing, WorkflowRuntimeState):
+        existing = WorkflowRuntimeState()
+        try:
+            setattr(state, "_wf_runtime_fallback", existing)
+        except Exception:
+            pass
+    return existing
+
+
+def _session_meta(state: Any):
+    meta = session_state(state)
+    if state is not None and not isinstance(state, ZooState):
+        d = getattr(state, "__dict__", None)
+        if isinstance(d, dict):
+            for attr, field_name in (
+                ("_session_id", "session_id"),
+                ("_instance_id", "instance_id"),
+                ("_project_name", "project_name"),
+                ("_session_kind", "kind"),
+            ):
+                if attr in d and d[attr]:
+                    setattr(meta, field_name, d[attr])
+    return meta
+
+
 def get_session_cwd(state) -> str:
-    """Resolve the active working directory from ``state.cwd`` (with legacy fallbacks)."""
+    """Resolve the active working directory purely from ``state.cwd`` (with legacy fallbacks)."""
     cwd = (
         getattr(state, "cwd", "")
         or getattr(state, "session_cwd", "")
         or getattr(state, "terminal_cwd", "")
     )
-    return str(cwd) if cwd else os.getcwd()
+    return str(cwd) if cwd else ""
 
 
 def worker_identity(state):
     """Workers are identified by their durable session kind, never by environment."""
-    return WORKER_KIND.fullmatch(str(getattr(state, "_session_kind", "") or ""))
+    return WORKER_KIND.fullmatch(str(_session_meta(state).kind or ""))
 
+
+def _readiness_hold(state: Any, reason: str) -> None:
+    gate = getattr(state, "readiness", None)
+    if gate is not None and callable(getattr(gate, "hold", None)):
+        gate.hold("workflows", reason)
+        _wf_runtime(state).readiness_held = True
+
+
+def _readiness_release(state: Any, emit: EmitFn | None = None) -> None:
+    rt = _wf_runtime(state)
+    gate = getattr(state, "readiness", None)
+    released = False
+    if gate is not None and callable(getattr(gate, "release", None)):
+        released = bool(gate.release("workflows"))
+    rt.readiness_held = False
+    if released and emit is not None:
+        emit(PacingCheck(reason="workflows_ready"))
+
+
+def _apply_snapshot(state: Any, snapshot: dict[str, Any] | None) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    rt = _wf_runtime(state)
+    if "names" in snapshot:
+        rt.cached_names = tuple(snapshot["names"])
+    if isinstance(snapshot.get("views"), dict):
+        rt.cached_views = dict(snapshot["views"])
+    if "worker_context" in snapshot and snapshot["worker_context"] is not None:
+        rt.cached_worker_context = dict(snapshot["worker_context"])
+
+
+# ---------------------------------------------------------------------------
+# Host/Driver-only helpers (NEVER called from Sans-I/O pipeline code)
+# ---------------------------------------------------------------------------
 
 def project_sessions_dir(project: str) -> Path:
     if not project or project in {".", ".."} or Path(project).name != project:
@@ -1899,7 +2037,6 @@ def checkpoint_recovery(document: dict) -> tuple[str, str]:
                 return "uncertain", "checkpoint contains a tool call without an identity"
             if call.get("result") is None or call["id"] not in results:
                 return "uncertain", f"unresolved tool call {call['id']} ({call.get('name', 'unknown tool')})"
-        # Canonical entries carry parsed calls as well as provider messages.
         if any(m.get("tool_calls") for m in messages) and not calls:
             return "uncertain", "checkpoint has tool-call messages without canonical call records"
         for message in messages:
@@ -1913,7 +2050,7 @@ def checkpoint_recovery(document: dict) -> tuple[str, str]:
 
 
 def saved_model_config(config) -> dict | None:
-    """Saved config layers only: never the session's model change or CLI --set overrides."""
+    """Saved config layers only: called ONCE at controller build/init time, never in pipeline steps."""
     path = ((config or {}).get("_runtime_launch", {}) or {}).get("config_path")
     try:
         if path and Path(path).resolve() == CONFIG_PATH.resolve():
@@ -1924,12 +2061,16 @@ def saved_model_config(config) -> dict | None:
         return None
 
 
-def saved_default_model(config) -> str:
-    for source in (saved_model_config(config), config):
+def _default_model_from_sources(saved_cfg: dict | None, config: dict | None) -> str:
+    for source in (saved_cfg, config):
         model = str(((source or {}).get("llm", {}) or {}).get("default") or "")
         if model:
             return model
     return ""
+
+
+def saved_default_model(config) -> str:
+    return _default_model_from_sources(saved_model_config(config), config)
 
 
 def check_model(config, profile: str) -> str:
@@ -1981,7 +2122,7 @@ def _pick_live_row(disc: Any) -> LiveSessionInfo | None:
 
 
 # ---------------------------------------------------------------------------
-# Transcript rendering (from azo-plugin-swarm)
+# Transcript rendering (host/driver-only)
 # ---------------------------------------------------------------------------
 
 def saved_transcript(project: str, session_id: str) -> str:
@@ -2123,7 +2264,7 @@ def _content_text(value):
 
 
 # ---------------------------------------------------------------------------
-# Instructions
+# Instructions (driver-side rendering)
 # ---------------------------------------------------------------------------
 
 def render_instructions(store: WorkflowStore, group: dict, agent: dict, items: list[dict],
@@ -2150,53 +2291,1052 @@ def render_folder(store: WorkflowStore, template: str, agent: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Controller: control, scheduling, live agents
+# Commit-Class WorkflowStoreRequest & WorkflowStoreDriver
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkflowStoreRequest(IoRequest):
+    """Typed commit-class request executed exclusively by ``WorkflowStoreDriver``."""
+
+    op: str = ""
+    workflow_name: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+class WorkflowStoreDriver(Driver):
+    """Commit-class Sans-I/O driver owning ALL ``WorkflowStore`` disk/lock/checkpoint I/O."""
+
+    request_types = (WorkflowStoreRequest,)
+    durability = "commit"
+
+    def __init__(self, *, root: Path | None = None) -> None:
+        super().__init__()
+        self._root = root
+        self._cond = threading.Condition(threading.RLock())
+        self._queue: collections.deque[tuple[OpId, WorkflowStoreRequest]] = collections.deque()
+        self._cancelled: set[OpId] = set()
+        self._in_progress = False
+        self._closing = False
+        self._closed = False
+        self._worker: threading.Thread | None = None
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._cond:
+            self._closing = False
+            self._closed = False
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="agent-zoo-workflow-store",
+                    daemon=True,
+                )
+                self._worker.start()
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, WorkflowStoreRequest):
+            raise TypeError(
+                f"WorkflowStoreDriver expected WorkflowStoreRequest, got {type(req).__name__}"
+            )
+        with self._cond:
+            if self._closing or self._closed or op_id in self._cancelled:
+                return
+            self._queue.append((op_id, req))
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="agent-zoo-workflow-store",
+                    daemon=True,
+                )
+                self._worker.start()
+            self._cond.notify_all()
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._cond:
+            self._cancelled.add(op_id)
+
+    def drain(self, *, timeout_s: float | None = None) -> None:
+        deadline = (
+            None if timeout_s is None else (time.monotonic() + max(0.0, float(timeout_s)))
+        )
+        with self._cond:
+            while (self._queue or self._in_progress) and not self._closed:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._cond.wait(timeout=min(remaining, 0.25))
+                else:
+                    self._cond.wait(timeout=0.25)
+
+    def quiesce(self, *, policy: str = "terminate", deadline: float | None = None) -> list[Event]:
+        del policy
+        remaining = None if deadline is None else max(0.0, float(deadline) - time.monotonic())
+        self.drain(timeout_s=remaining)
+        return []
+
+    def close(self) -> None:
+        with self._cond:
+            self._closing = True
+            worker = self._worker
+            self._cond.notify_all()
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=5.0)
+        with self._cond:
+            self._closed = True
+            self._worker = None
+            self._cancelled.clear()
+            self._cond.notify_all()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._cond:
+            return self._closed or op_id in self._cancelled
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue:
+                    if self._closing or self._closed:
+                        return
+                    self._cond.wait(timeout=0.5)
+                op_id, req = self._queue.popleft()
+                cancelled = op_id in self._cancelled
+                if not cancelled:
+                    self._in_progress = True
+            if cancelled:
+                with self._cond:
+                    self._cancelled.discard(op_id)
+                    self._cond.notify_all()
+                continue
+            try:
+                value = self.execute(req)
+                if not self._is_fenced(op_id):
+                    self._safe_emit(IoCompleted(op_id=op_id, value=value))
+            except Exception as exc:
+                if not self._is_fenced(op_id):
+                    self._safe_emit(IoFailed(op_id=op_id, error=exc))
+            finally:
+                with self._cond:
+                    self._in_progress = False
+                    self._cancelled.discard(op_id)
+                    self._cond.notify_all()
+
+    def register_sim(self, sim, *, delay: float = 0.0):
+        """Register deterministic simulation handler on a ``SimulationRuntime``."""
+        from agent_utils.runtime.simulation import SimOutcome
+
+        def _handler(_op_id, req, _sim):
+            try:
+                return SimOutcome(value=self.execute(req), delay=delay)
+            except Exception as exc:
+                return SimOutcome(error=exc, delay=delay)
+
+        sim.register_handler(WorkflowStoreRequest, _handler)
+        return self
+
+    def _store(self, name: str) -> WorkflowStore:
+        return WorkflowStore(name, self._root)
+
+    def _build_snapshot(
+        self,
+        *,
+        viewer_session_id: str = "",
+        default_model: str = "",
+        worker_workflow: str = "",
+        worker_agent: str = "",
+        include_transcripts: bool = False,
+    ) -> dict[str, Any]:
+        names = list_workflow_names(self._root)
+        views: dict[str, str] = {"wf:index": render_index(self._root, viewer_session_id)}
+        for wf_name in names:
+            store = self._store(wf_name)
+            try:
+                control = store.control()
+                views[f"wf:{wf_name}"] = render_overview(store, viewer_session_id, default_model)
+                views[f"wf:{wf_name}:definition"] = store.definition_text()
+                if control.get("state") == "archived" and wf_name != worker_workflow:
+                    continue
+                views[f"wf:{wf_name}:history"] = render_history(store)
+                views[f"wf:{wf_name}:log"] = render_log(store)
+                for ver in range(1, store.version + 1):
+                    try:
+                        views[f"wf:{wf_name}:def_{ver}"] = store.definition_text(ver)
+                    except WorkflowError:
+                        pass
+                defn = store.definition()
+                items = store.items()
+                agents = store.agents()
+                queue_ids = set(defn["queues"]) | {TRASH} | {i["queue"] for i in items}
+                for q in queue_ids:
+                    views[f"wf:{wf_name}:{q}"] = render_queue(store, q)
+                group_ids = set(defn["agents"]) | {a["group"] for a in agents}
+                for g in group_ids:
+                    views[f"wf:{wf_name}:{g}"] = render_group(store, g, default_model)
+                for item in items:
+                    views[f"wf:{wf_name}:{item['id']}"] = render_item(store, item["id"])
+                for agent in agents:
+                    transcript_fn = None
+                    if include_transcripts:
+                        def _transcript(sid, proj=agent.get("project") or "default"):
+                            return saved_transcript(proj, sid)
+                        transcript_fn = _transcript
+                    views[f"wf:{wf_name}:{agent['id']}"] = render_agent(store, agent["id"], transcript_fn)
+            except Exception:
+                LOG.debug("Skipping damaged workflow %s in snapshot", wf_name, exc_info=True)
+        worker_ctx = None
+        if worker_workflow and worker_agent:
+            store = self._store(worker_workflow)
+            try:
+                worker_ctx = store.agent(worker_agent)
+            except WorkflowError:
+                worker_ctx = {"id": worker_agent, "group": "", "sends_to": [], "items": [], "state": "unknown"}
+            worker_ctx["workflow"] = worker_workflow
+        return {"names": tuple(names), "views": views, "worker_context": worker_ctx}
+
+    @staticmethod
+    def _taker_hint(store: WorkflowStore, queue: str) -> str:
+        if queue == TRASH:
+            return " Move them back out of q_trash to restore them."
+        groups = takers(store.definition(), queue)
+        if not groups:
+            return f" No agent group takes from {queue}."
+        if store.control().get("state") != "running":
+            return f" {', '.join(groups)} will take them when {store.name} runs."
+        return f" {', '.join(groups)} will take them."
+
+    @staticmethod
+    def _idle_reason(store: WorkflowStore, group: str | None) -> str:
+        definition = store.definition()
+        reasons = []
+        for gname, settings in definition["agents"].items():
+            if group and gname != group:
+                continue
+            if settings["count"] == 0:
+                reasons.append(f"{gname} has count 0")
+            else:
+                for queue, size in (settings["takes_from"] or {}).items():
+                    waiting = sum(i["state"] == "waiting" for i in store.items(queue))
+                    if size == 1 and not waiting:
+                        reasons.append(f"{queue} is empty, so {gname} has nothing to take")
+                    elif waiting < size:
+                        reasons.append(
+                            f"{gname} takes {size} items from {queue} at a time and "
+                            f"{queue} has {waiting} waiting"
+                        )
+        return "; ".join(reasons) + "." if reasons else "all groups are at their count."
+
+    @staticmethod
+    def _take_control_locked(store: WorkflowStore, me: dict, launch: dict) -> tuple[dict | None, int, int]:
+        with store.lock():
+            store.require()
+            control = store.control()
+            if control.get("state") == "archived":
+                raise WorkflowError(
+                    f"{store.name} is archived; restore it with /workflow unarchive {store.name} first"
+                )
+            previous = control.get("controller")
+            epoch = int(control.get("epoch", 0)) + 1
+            store.update_control(controller=dict(me, project=launch["project"]), epoch=epoch)
+            if not control.get("default_folder") and launch.get("cwd"):
+                store.update_control(default_folder=launch["cwd"])
+            store.log("control_taken", by=me["session_id"], epoch=epoch)
+        watermark = store.counters().get("item", 0)
+        return previous, epoch, watermark
+
+    def execute(self, req: WorkflowStoreRequest) -> Any:
+        op = req.op
+        p = req.params
+        viewer = str(p.get("viewer_session_id", "") or "")
+        default_model = str(p.get("default_model", "") or "")
+
+        if op == "snapshot":
+            return self._build_snapshot(
+                viewer_session_id=viewer,
+                default_model=default_model,
+                worker_workflow=str(p.get("worker_workflow", "") or ""),
+                worker_agent=str(p.get("worker_agent", "") or ""),
+            )
+
+        if op == "create_workflow":
+            store = self._store(req.workflow_name)
+            text = str(p["text"])
+            check_definition_models(parse_definition(split_version(text)[1]), p.get("config"))
+            definition = store.create(text, by=str(p["by"]))
+            cwd = str(p.get("cwd") or "") or os.getcwd()
+            store.update_control(default_folder=cwd)
+            groups = "\n".join(f"  {g}: {describe_group(s)}" for g, s in definition["agents"].items())
+            queues = ", ".join(definition["queues"]) or "none"
+            msg = (
+                f"Created workflow {store.name} (def_1). Nothing is running yet.\n"
+                f"Queues: {queues}\nAgent groups:\n{groups}\n"
+                f"Add starting items with add_items, then ask the user before running it with "
+                f'command_workflow(workflow_name="{store.name}", command="run"). The user can also type '
+                f"/workflow run {store.name}. See wf:{store.name}."
+            )
+            return {"text": msg, "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "update_workflow":
+            store = self._store(req.workflow_name).require()
+            reason = str(p.get("reason") or "").strip()
+            if not reason:
+                raise WorkflowError("reason is required: one sentence saying why the definition changed")
+            text = str(p["text"])
+            check_definition_models(parse_definition(split_version(text)[1]), p.get("config"))
+            preview_only = bool(p.get("preview_only", False))
+            result = store.update(text, reason=reason, by=str(p["by"]), preview_only=preview_only)
+            effects = "\n".join(f"- {e}" for e in result["effects"])
+            if not result["changed"]:
+                msg = f"The definition is unchanged (still def_{result['version']})."
+            elif preview_only:
+                msg = (
+                    f"Preview only; nothing changed. Applying it would create def_{result['from_version'] + 1}."
+                    f"\n\nDiff:\n{result['diff']}\nEffects:\n{effects}"
+                )
+            else:
+                msg = (
+                    f"Updated {store.name} from def_{result['from_version']} to def_{result['version']}."
+                    f"\n\nDiff:\n{result['diff']}\nEffects:\n{effects}"
+                )
+            return {"text": msg, "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "add_items":
+            store = self._store(req.workflow_name).require()
+            queue = str(p["queue"])
+            texts = list(p["texts"])
+            note = p.get("note")
+            worker_agent = str(p.get("worker_agent") or "")
+            if worker_agent:
+                context = store.agent(worker_agent)
+                allowed = set(context.get("sends_to") or []) | {TRASH}
+                created = [
+                    store.add_item(
+                        queue, text, by=context["id"], note=note,
+                        from_items=agent_items(context), allowed=allowed,
+                    )
+                    for text in texts
+                ]
+                ids = [m["id"] for m in created]
+                record = store.agent(context["id"])
+                store.update_agent(context["id"], outputs=record.get("outputs", []) + ids)
+                msg = f"Added {', '.join(ids)} to {queue}. Keep working, and call finish_task when your task is done."
+                snap = self._build_snapshot(
+                    viewer_session_id=viewer, default_model=default_model,
+                    worker_workflow=store.name, worker_agent=worker_agent,
+                )
+            else:
+                known = set(store.definition()["queues"]) | {TRASH}
+                check_queue_id(queue, known)
+                created = [store.add_item(queue, text, by="user", note=note) for text in texts]
+                msg = f"Added {', '.join(m['id'] for m in created)} to {queue}." + self._taker_hint(store, queue)
+                snap = self._build_snapshot(viewer_session_id=viewer, default_model=default_model)
+            return {"text": msg, "snapshot": snap}
+
+        if op == "move_items":
+            store = self._store(req.workflow_name).require()
+            ids = list(p["item_ids"])
+            to_queue = str(p["to_queue"])
+            note = p.get("note")
+            worker_agent = str(p.get("worker_agent") or "")
+            if worker_agent:
+                context = store.agent(worker_agent)
+                allowed = set(context.get("sends_to") or []) | {TRASH}
+                moved = store.move_items(ids, to_queue, by=context["id"], note=note, allowed=allowed)
+                msg = f"Moved {', '.join(m['id'] for m in moved)} to {to_queue}."
+                snap = self._build_snapshot(
+                    viewer_session_id=viewer, default_model=default_model,
+                    worker_workflow=store.name, worker_agent=worker_agent,
+                )
+            else:
+                known = set(store.definition()["queues"]) | {TRASH} | {i["queue"] for i in store.items()}
+                check_queue_id(to_queue, known)
+                moved = store.move_items(ids, to_queue, by="user", note=note)
+                msg = f"Moved {', '.join(m['id'] for m in moved)} to {to_queue}." + self._taker_hint(store, to_queue)
+                snap = self._build_snapshot(viewer_session_id=viewer, default_model=default_model)
+            return {"text": msg, "snapshot": snap}
+
+        if op == "finish_agent":
+            store = self._store(req.workflow_name).require()
+            agent_id = str(p["agent_id"])
+            summary = str(p.get("summary") or "")
+            pairs = list(p.get("outputs") or [])
+            result = store.finish_agent(agent_id, summary=summary, outputs=pairs)
+            created = ", ".join(f"{m['id']} in {m['queue']}" for m in result["created"])
+            msg = "Task finished" + (f"; created {created}" if created else "") + ". This session is ending."
+            snap = self._build_snapshot(
+                viewer_session_id=viewer, default_model=default_model,
+                worker_workflow=store.name, worker_agent=agent_id,
+            )
+            return {"text": msg, "result": result, "snapshot": snap}
+
+        if op == "run_prepare":
+            store = self._store(req.workflow_name).require()
+            definition = store.definition()
+            group = p.get("group")
+            if group is not None:
+                check_group_id(group, definition["agents"])
+            me = dict(p["me"])
+            launch = dict(p["launch"])
+            previous, epoch, watermark = self._take_control_locked(store, me, launch)
+            with store.lock():
+                control = store.control()
+                if group is None:
+                    store.update_control(state="running", paused_groups=[])
+                else:
+                    paused = set(control.get("paused_groups") or [])
+                    if control.get("state") != "running":
+                        paused = set(definition["agents"])
+                    paused.discard(group)
+                    store.update_control(state="running", paused_groups=sorted(paused))
+                store.log("run", group=group, by=me["session_id"])
+            paused_agents = [a for a in store.agents(group) if a["state"] == "paused"]
+            return {
+                "previous": previous,
+                "epoch": epoch,
+                "watermark": watermark,
+                "version": store.version,
+                "paused_agents": paused_agents,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "idle_reason":
+            store = self._store(req.workflow_name).require()
+            return self._idle_reason(store, p.get("group"))
+
+        if op == "pause_prepare":
+            store = self._store(req.workflow_name).require()
+            definition = store.definition()
+            group = p.get("group")
+            if group is not None:
+                check_group_id(group, definition["agents"])
+            with store.lock():
+                control = store.control()
+                if control.get("state") == "archived":
+                    raise WorkflowError(f"{store.name} is archived")
+                if group is None:
+                    store.update_control(state="paused")
+                else:
+                    paused = set(control.get("paused_groups") or []) | {group}
+                    store.update_control(paused_groups=sorted(paused))
+                store.log("pause", group=group, by=str(p["by"]))
+            return {
+                "agents": store.agents(group),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "update_agent":
+            store = self._store(req.workflow_name)
+            updated = store.update_agent(str(p["agent_id"]), **dict(p["changes"]))
+            return {
+                "agent": updated,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "read_agent":
+            store = self._store(req.workflow_name)
+            return {"agent": store.agent(str(p["agent_id"])), "control": store.control()}
+
+        if op == "archive_check":
+            store = self._store(req.workflow_name).require()
+            if store.control().get("state") == "archived":
+                raise WorkflowError(f"{store.name} is already archived")
+            return {"ok": True}
+
+        if op == "archive_list_agents":
+            store = self._store(req.workflow_name).require()
+            return [a for a in store.agents() if a["state"] in ACTIVE_STATES | {"attention"}]
+
+        if op == "archive_return_agent":
+            store = self._store(req.workflow_name)
+            agent = dict(p["agent"])
+            with store.lock():
+                for item_id in agent_items(agent):
+                    store.return_item(item_id, agent["id"], by="archive")
+            store.update_agent(agent["id"], state="stopped", problem="workflow archived")
+            return {"ok": True}
+
+        if op == "archive_finalize":
+            store = self._store(req.workflow_name)
+            with store.lock():
+                store.update_control(state="archived", controller=None)
+                store.log("archived", by=str(p["by"]))
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "unarchive":
+            store = self._store(req.workflow_name).require()
+            with store.lock():
+                if store.control().get("state") != "archived":
+                    raise WorkflowError(f"{store.name} is not archived")
+                store.update_control(state="paused", paused_groups=[])
+                store.log("unarchived", by=str(p["by"]))
+            return {
+                "text": f"Restored {store.name}. It is paused; start it with /workflow run {store.name}.",
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "rename":
+            store = self._store(req.workflow_name).require()
+            new_name = str(p["new_name"])
+            if self._store(new_name).exists():
+                raise WorkflowError(f'a workflow named "{new_name}" already exists; choose another name')
+            renamed = store.rename(new_name, by=str(p["by"]))
+            return {
+                "new_name": renamed.name,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "set_count":
+            store = self._store(req.workflow_name).require()
+            result = store.set_count(str(p["agent_group"]), int(p["count"]), by=str(p["by"]))
+            return {
+                "result": result,
+                "control": store.control(),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "set_setting":
+            store = self._store(req.workflow_name).require()
+            cfg = p.get("config")
+            check_fn = (lambda prof: check_model(cfg, prof)) if cfg is not None else None
+            change = prepare_setting(
+                store, p["kind"], p.get("target"), p["setting"], p["raw"],
+                check_model=check_fn, default_model=default_model,
+            )
+            if change["unchanged"]:
+                return {
+                    "unchanged": True,
+                    "change": change,
+                    "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+                }
+            result = store.set_setting(
+                change["section"], change["name"], change["key"], change["value"],
+                reason=change["reason"], by="user",
+            )
+            definition = store.definition()
+            active = [a for a in store.agents() if a["state"] in ACTIVE_STATES]
+            return {
+                "unchanged": False,
+                "change": change,
+                "result": result,
+                "definition": definition,
+                "active": active,
+                "control": store.control(),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "render_command_doc":
+            action = str(p["action"])
+            if action in {"list", "archived"}:
+                archived = action == "archived"
+                subtitle, body = render_list(self._root, viewer, archived=archived)
+                title = "Archived workflows" if archived else "Workflows"
+                return {
+                    "title": title, "subtitle": subtitle, "body": body,
+                    "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+                }
+            store = self._store(req.workflow_name).require()
+            kind, target = p["kind"], p.get("target")
+            if action == "show":
+                if kind == "workflow":
+                    subtitle, body = render_overview_md(store, viewer, default_model)
+                elif kind == "group":
+                    subtitle, body = render_group_md(store, target, default_model)
+                else:
+                    subtitle, body = render_queue_md(store, target)
+                title = target_label(store, kind, target)
+            elif action == "settings":
+                body = render_settings(store, kind, target, default_model)
+                title = f"Settings: {target_label(store, kind, target)}"
+                subtitle = ""
+            else:
+                raise WorkflowError(f"unknown document action {action!r}")
+            return {
+                "title": title, "subtitle": subtitle, "body": body,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "tick_read":
+            store = self._store(req.workflow_name)
+            if not store.exists():
+                return {"exists": False}
+            return {
+                "exists": True,
+                "control": store.control(),
+                "definition": store.definition(),
+                "agents": store.agents(),
+            }
+
+        if op == "report_notices":
+            store = self._store(req.workflow_name)
+            if not store.exists():
+                return {"attention": [], "new_items": [], "watermark": p.get("watermark", 0)}
+            definition = store.definition()
+            attention = [
+                {
+                    "text": (
+                        f"Workflow {store.name}: {a['id']} needs attention: {a.get('problem')}. "
+                        f"See wf:{store.name}:{a['id']}."
+                    ),
+                    "key": (store.name, a["id"], a.get("problem")),
+                }
+                for a in store.agents()
+                if a["state"] == "attention"
+            ]
+            watermark = int(p.get("watermark", 0))
+            latest = store.counters().get("item", 0)
+            new_items: list[str] = []
+            if latest > watermark:
+                watched = {q for q, s in definition["queues"].items() if s["notify_on_new"]}
+                if watched:
+                    fresh = [i for i in store.items() if int(i["id"][5:]) > watermark and i["queue"] in watched]
+                    by_queue: dict[str, list[str]] = collections.defaultdict(list)
+                    for item in fresh:
+                        by_queue[item["queue"]].append(f"{item['id']} ({item['title']})")
+                    for queue, entries in by_queue.items():
+                        new_items.append(
+                            f"Workflow {store.name}: new items in {queue}: {', '.join(entries)}. "
+                            f"See wf:{store.name}:{queue}."
+                        )
+            return {
+                "attention": attention,
+                "new_items": new_items,
+                "watermark": max(watermark, latest),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "plan_start_agents":
+            store = self._store(req.workflow_name)
+            expected_epoch = p.get("epoch")
+            expected_iid = p.get("instance_id")
+            default_cwd = str(p.get("cwd") or "") or os.getcwd()
+            planned = []
+            with store.lock():
+                control = store.control()
+                if (
+                    expected_epoch is None
+                    or control.get("epoch") != expected_epoch
+                    or (control.get("controller") or {}).get("instance_id") != expected_iid
+                    or control.get("state") != "running"
+                ):
+                    return {"planned": [], "definition": store.definition()}
+                definition = store.definition()
+                paused_groups = set(control.get("paused_groups") or [])
+                last_started = dict(control.get("last_started") or {})
+                for group, settings in definition["agents"].items():
+                    if group in paused_groups or settings["count"] <= 0:
+                        continue
+                    active = sum(a["state"] in ACTIVE_STATES for a in store.agents(group))
+                    room = settings["count"] - active
+                    while room > 0:
+                        items = []
+                        if settings["takes_from"]:
+                            number = store.counters().get("agents", {}).get(group, 0) + 1
+                            provisional = f"agt_{group_short(group)}_{number}"
+                            items = store.take_batch(settings["takes_from"], provisional)
+                            if not items:
+                                break
+                        elif settings["every"]:
+                            last = float(last_started.get(group) or 0)
+                            if time.time() - last < settings["every"]:
+                                break
+                        folder_template = (
+                            settings["folder"] or definition["folder"]
+                            or control.get("default_folder") or default_cwd
+                        )
+                        agent = store.new_agent(
+                            group, version=store.version, item_ids=[i["id"] for i in items],
+                            sends_to=list(settings["sends_to"]), folder="", model=None,
+                        )
+                        agent["folder"] = render_folder(store, folder_template, agent)
+                        store.save_agent(agent)
+                        last_started[group] = time.time()
+                        planned.append({"agent": agent, "settings": settings, "items": items})
+                        room -= 1
+                store.update_control(last_started=last_started)
+            return {"planned": planned, "definition": definition}
+
+        if op == "prepare_spawn":
+            store = self._store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            if p.get("model"):
+                store.update_agent(agent_id, model=p["model"])
+            agent = store.agent(agent_id)
+            message = str(p.get("message") or "")
+            if p.get("render_instructions"):
+                message = render_instructions(
+                    store, dict(p["settings"]), agent, list(p.get("items") or []),
+                    viewer_session_id=viewer,
+                )
+            folder = agent.get("folder") or ""
+            if folder:
+                Path(folder).mkdir(parents=True, exist_ok=True)
+            session_id = agent.get("session_id") or str(p["session_id"])
+            instance_id = str(p["instance_id"])
+            agent = store.update_agent(
+                agent_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                state="starting",
+                project=str(p["project"]),
+                launch_started=time.time(),
+                websocket_url=None,
+                process_identity=None,
+                release="resume" if p.get("is_resume") else None,
+                recovery_action=p.get("recovery_action"),
+            )
+            return {
+                "agent": agent,
+                "message": message,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "log_agent_started":
+            store = self._store(req.workflow_name)
+            store.log("agent_started", agent=str(p["agent_id"]), items=list(p.get("items") or []))
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "launch_failed":
+            store = self._store(req.workflow_name)
+            agent = dict(p["agent"])
+            items = list(p.get("items") or [])
+            error_text = str(p["error"])
+            group = agent["group"]
+            with store.lock():
+                for item in items:
+                    store.return_item(item["id"], agent["id"], by="scheduler")
+                control = store.control()
+                paused = set(control.get("paused_groups") or []) | {group}
+                store.update_control(paused_groups=sorted(paused))
+            store.update_agent(agent["id"], state="stopped", problem=f"could not start: {error_text}")
+            store.log("agent_start_failed", agent=agent["id"], error=error_text)
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "claim_resume":
+            store = self._store(req.workflow_name)
+            agent = dict(p["agent"])
+            expected_epoch = p.get("epoch")
+            with store.lock():
+                current = store.agent(agent["id"])
+                if expected_epoch is not None and int(store.control().get("epoch", 0)) != expected_epoch:
+                    return {"status": "problem", "problem": f"{store.name} is now controlled by another session"}
+                if current.get("instance_id") != agent.get("instance_id") or current["state"] not in {
+                    "starting", "running", "paused", "attention"
+                }:
+                    return {"status": "skip"}
+                current["state"] = "starting"
+                store.save_agent(current)
+            project = agent.get("project") or str(p["project"])
+            try:
+                saved = saved_checkpoint(project, agent["session_id"])
+            except FileNotFoundError:
+                return {"status": "problem", "problem": f"{agent['id']} has no saved checkpoint to resume from"}
+            except Exception as exc:
+                return {"status": "problem", "problem": f"{agent['id']}'s checkpoint could not be read: {exc}"}
+            action, reason = checkpoint_recovery(saved.document)
+            if action in {"uncertain", "done"}:
+                return {
+                    "status": "problem",
+                    "problem": (
+                        f"{agent['id']} checkpoint {saved.commit_id}: {reason}. "
+                        "External work may already have happened; inspect its transcript and artifacts before retrying"
+                    ),
+                }
+            return {"status": "ready", "commit_id": saved.commit_id, "action": action, "agent": current}
+
+        if op == "mark_attention":
+            store = self._store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            problem = str(p["problem"])
+            store.update_agent(agent_id, state="attention", problem=problem)
+            store.log("agent_needs_attention", agent=agent_id, problem=problem)
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "release_commit":
+            store = self._store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            expected_iid = p.get("instance_id")
+            with store.lock():
+                current = store.agent(agent_id)
+                if current["state"] in ACTIVE_STATES and current.get("instance_id") == expected_iid:
+                    current.update(state="running", release=None)
+                    store.save_agent(current)
+            return {
+                "agent": store.agent(agent_id),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "restart_check":
+            store = self._store(req.workflow_name).require()
+            agent = store.agent(check_agent_id(p["agent_id"]))
+            if agent["state"] in {"finished", "restarted"}:
+                raise WorkflowError(f"{agent['id']} has already {agent['state']}")
+            return {"agent": agent}
+
+        if op == "restart_finalize":
+            store = self._store(req.workflow_name).require()
+            agent_id = str(p["agent_id"])
+            item_ids = list(p.get("item_ids") or [])
+            with store.lock():
+                for item_id in item_ids:
+                    store.return_item(item_id, agent_id, by="restart_agent")
+            store.update_agent(agent_id, state="restarted", problem=None)
+            store.log("agent_restarted", agent=agent_id)
+            first_queue = store.item(item_ids[0])["queue"] if len(item_ids) == 1 else ""
+            return {
+                "first_queue": first_queue,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "message_check":
+            store = self._store(req.workflow_name).require()
+            group = p.get("group")
+            if group is not None:
+                check_group_id(group, {a["group"] for a in store.agents()} | set(store.definition()["agents"]))
+            return {"agents": store.agents(group)}
+
+        if op == "adopt":
+            me = dict(p["me"])
+            launch = dict(p["launch"])
+            adopted: list[str] = []
+            managed_updates: dict[str, dict[str, Any]] = {}
+            notices: list[str] = []
+            for wf_name in list_workflow_names(self._root):
+                store = self._store(wf_name)
+                control = store.control()
+                holder = control.get("controller") or {}
+                if (
+                    control.get("state") != "running"
+                    or holder.get("session_id") != me["session_id"]
+                    or holder.get("instance_id") == me["instance_id"]
+                ):
+                    continue
+                try:
+                    _, epoch, watermark = self._take_control_locked(store, me, launch)
+                    managed_updates[wf_name] = {"epoch": epoch, "watermark": watermark}
+                    adopted.append(wf_name)
+                    notices.append(
+                        f"Workflow {wf_name} is running again under this session after a restart. See wf:{wf_name}."
+                    )
+                except Exception as exc:
+                    notices.append(f"Workflow {wf_name} could not resume after a restart: {exc}")
+            return {
+                "adopted": adopted,
+                "managed_updates": managed_updates,
+                "notices": notices,
+                "snapshot": self._build_snapshot(viewer_session_id=me["session_id"], default_model=default_model),
+            }
+
+        if op == "rediscover_apply":
+            by_session: dict[str, dict[str, Any]] = dict(p.get("by_session") or {})
+            adoptions: list[dict[str, Any]] = []
+            for wf_name in list(p.get("names") or []):
+                store = self._store(wf_name)
+                if not store.exists():
+                    continue
+                for agent in store.agents():
+                    row = by_session.get(agent.get("session_id") or "") if agent["state"] in ACTIVE_STATES else None
+                    if row is None:
+                        continue
+                    store.update_agent(
+                        agent["id"],
+                        instance_id=row["instance_id"],
+                        websocket_url=row.get("websocket_url") or agent.get("websocket_url"),
+                        process_identity=row.get("process_identity") or agent.get("process_identity"),
+                    )
+                    adoptions.append({
+                        "workflow": store.name,
+                        "agent_id": agent["id"],
+                        "session_id": row["session_id"],
+                        "instance_id": row["instance_id"],
+                        "websocket_url": row.get("websocket_url") or "",
+                        "process_identity": row.get("process_identity"),
+                    })
+            return {
+                "adoptions": adoptions,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "session_event_lookup":
+            wf_name = req.workflow_name
+            agent_id = str(p.get("agent_id") or "")
+            session_id = str(p.get("session_id") or "")
+            instance_id = str(p.get("instance_id") or "")
+            if wf_name and agent_id:
+                store = self._store(wf_name)
+                if not store.exists():
+                    return {"found": False}
+                return {
+                    "found": True,
+                    "workflow_name": wf_name,
+                    "agent": store.agent(agent_id),
+                    "control": store.control(),
+                }
+            for candidate in list(p.get("managed_names") or []):
+                store = self._store(candidate)
+                if not store.exists():
+                    continue
+                for agent in store.agents():
+                    if (instance_id and agent.get("instance_id") == instance_id) or (
+                        session_id and agent.get("session_id") == session_id and agent["state"] in ACTIVE_STATES
+                    ):
+                        return {
+                            "found": True,
+                            "workflow_name": candidate,
+                            "agent": agent,
+                            "control": store.control(),
+                        }
+            return {"found": False}
+
+        if op == "worker_remind":
+            store = self._store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            try:
+                context = store.agent(agent_id)
+            except WorkflowError:
+                return {"action": "none", "worker_context": None}
+            context["workflow"] = store.name
+            if context.get("state") in {"finished", "restarted"}:
+                return {"action": "none", "worker_context": context}
+            reminders = int(context.get("reminders", 0))
+            if reminders == 0:
+                updated = store.update_agent(agent_id, reminders=1)
+                updated["workflow"] = store.name
+                return {"action": "remind", "worker_context": updated}
+            updated = store.update_agent(
+                agent_id,
+                reminders=reminders + 1,
+                state="attention",
+                problem="ended its turn again without calling finish_task; message it or use restart_agent",
+            )
+            updated["workflow"] = store.name
+            return {"action": "attention", "worker_context": updated}
+
+        raise ValueError(f"Unsupported WorkflowStoreRequest op: {op!r}")
+
+
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O Controller: control, scheduling, live agents
 # ---------------------------------------------------------------------------
 
 class WorkflowController:
-    """Pure Sans-I/O workflow controller. All external session lifecycle, discovery,
-    liveness observation, and WS transport delegate to ``AgentZooSessionDriver`` via
-    yielded ``SessionRequest``s and unsolicited ``ExternalSession*`` events."""
+    """100% pure Sans-I/O workflow controller.
+
+    All persistence/filesystem/lock/checkpoint I/O is yielded as typed
+    ``WorkflowStoreRequest``s (``WorkflowStoreDriver``). All external session
+    lifecycle, discovery, liveness observation, and WS transport delegate to
+    ``AgentZooSessionDriver`` via yielded ``SessionRequest``s and unsolicited
+    ``ExternalSession*`` events. Per-session state lives in ``state.durable``
+    and ``state.runtime``.
+    """
 
     def __init__(self, config, session=None):
-        self.config, self.session = config, session
-        self.managed: dict[str, dict] = {}
-        self.me: dict | None = None
-        self.launch: dict | None = None
-        self.notices = collections.deque()
-        self.notified: set = set()
-        self.errors: dict[str, str] = {}
-        self.adopted_instance = ""
-        self.worker_record: dict | None = None
-        self.worker_reminded_entry = -1
-        # Map live/spawned instance_id -> (workflow_name, agent_id) for unsolicited events.
-        self.instances_by_id: dict[str, tuple[str, str]] = {}
-        # Guard against concurrent observe/ready/exit handling on the same logical agent.
-        self.in_flight_agents: set[tuple[str, str]] = set()
+        self.config = config
+        self.session = session
+        self._saved_config: dict[str, Any] | None = saved_model_config(config)
+        self._state: Any = getattr(session, "state", None)
+        self._fallback_durable = WorkflowDurableState()
+        self._fallback_runtime = WorkflowRuntimeState()
 
-    # -- identity and launch settings (owner thread) -------------------------
+    def _durable(self, state: Any = None) -> WorkflowDurableState:
+        target = state if state is not None else self._state
+        return _wf_durable(target) if target is not None else self._fallback_durable
+
+    def _runtime(self, state: Any = None) -> WorkflowRuntimeState:
+        target = state if state is not None else self._state
+        return _wf_runtime(target) if target is not None else self._fallback_runtime
+
+    @property
+    def managed(self) -> dict[str, dict[str, Any]]:
+        return self._durable().managed
+
+    @property
+    def me(self) -> dict[str, str] | None:
+        return self._runtime().me
+
+    @me.setter
+    def me(self, value: dict[str, str] | None) -> None:
+        self._runtime().me = value
+
+    @property
+    def launch(self) -> dict[str, Any] | None:
+        return self._runtime().launch
+
+    @launch.setter
+    def launch(self, value: dict[str, Any] | None) -> None:
+        self._runtime().launch = value
+
+    @property
+    def notices(self) -> collections.deque:
+        return self._runtime().notices
+
+    @property
+    def notified(self) -> set:
+        return self._runtime().notified
+
+    @property
+    def errors(self) -> dict[str, str]:
+        return self._runtime().errors
+
+    @property
+    def adopted_instance(self) -> str:
+        return self._runtime().adopted_instance
+
+    @adopted_instance.setter
+    def adopted_instance(self, value: str) -> None:
+        self._runtime().adopted_instance = value
+
+    @property
+    def worker_record(self) -> dict[str, Any] | None:
+        return self._runtime().cached_worker_context
+
+    @worker_record.setter
+    def worker_record(self, value: dict[str, Any] | None) -> None:
+        self._runtime().cached_worker_context = value
+
+    @property
+    def worker_reminded_entry(self) -> int:
+        return self._runtime().worker_reminded_entry
+
+    @worker_reminded_entry.setter
+    def worker_reminded_entry(self, value: int) -> None:
+        self._runtime().worker_reminded_entry = value
+
+    @property
+    def instances_by_id(self) -> dict[str, tuple[str, str]]:
+        return self._runtime().instances_by_id
+
+    @property
+    def in_flight_agents(self) -> set[tuple[str, str]]:
+        return self._runtime().in_flight_agents
+
+    # -- identity and launch settings (pure) ---------------------------------
 
     def bind(self, state) -> None:
-        session_id = str(getattr(state, "_session_id", "") or "")
-        instance_id = str(getattr(state, "_instance_id", "") or "")
+        if state is not None:
+            self._state = state
+        rt = self._runtime(state)
+        smeta = _session_meta(state)
+        session_id = str(smeta.session_id or "")
+        instance_id = str(smeta.instance_id or "")
         if session_id and instance_id:
-            self.me = {"session_id": session_id, "instance_id": instance_id}
+            rt.me = {"session_id": session_id, "instance_id": instance_id}
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
         provenance = (self.config or {}).get("_runtime_launch", {}) or {}
-        project = context.get("project_name") or str(getattr(state, "_project_name", "") or "")
-        store_root = context.get("project_store_root") or ""
+        project = str(context.get("project_name") or smeta.project_name or "")
+        store_root = str(context.get("project_store_root") or "")
         if not store_root and project:
             store_root = str(Path(resolve_state_root()) / "projects" / project / "coordination")
         if project and store_root:
-            local_root = getattr(state, "_persistence_local_root", "") or ""
+            local_root = str(getattr(state, "_persistence_local_root", "") or "")
             if not local_root:
                 try:
                     local_root = str(resolve_local_root(self.config))
                 except Exception:
                     local_root = ""
-            self.launch = {
-                "project": project, "store_root": store_root,
-                "state_root": str(resolve_state_root()), "local_state_root": str(local_root),
+            rt.launch = {
+                "project": project,
+                "store_root": store_root,
+                "state_root": str(resolve_state_root()),
+                "local_state_root": local_root,
                 "config_path": str(provenance.get("config_path") or ""),
                 "config_sets": tuple(provenance.get("config_sets") or ()),
                 "env_name": str(((self.config or {}).get("pilot", {}) or {}).get("_env_name") or ""),
@@ -2213,7 +3353,7 @@ class WorkflowController:
             raise WorkflowError("this session cannot launch agents (it has no project or store root)")
 
     def default_model(self) -> str:
-        return saved_default_model(self.config)
+        return _default_model_from_sources(self._saved_config, self.config)
 
     def check_model(self, profile: str) -> str:
         return check_model(self.config, profile)
@@ -2224,7 +3364,7 @@ class WorkflowController:
             raise WorkflowError("no model is configured; set one with /workflow set NAME model PROFILE")
         return self.check_model(model)
 
-    def spec_for(self, store: WorkflowStore, agent: dict, *, message: str,
+    def spec_for(self, wf_name: str, agent: dict, *, message: str,
                  checkpoint: tuple[str, str] | None = None) -> SessionSpec:
         launch = self.launch
         return SessionSpec(
@@ -2232,10 +3372,10 @@ class WorkflowController:
             env_name=launch["env_name"], config_path=launch["config_path"], config_sets=launch["config_sets"],
             state_root=launch["state_root"], store_root=launch["store_root"],
             local_state_root=launch["local_state_root"], host="127.0.0.1", port=0,
-            parent_session_id=self.me["session_id"], kind=f"wf:{store.name}:{agent['id']}",
-            title=f"{store.name}:{agent['id']}", first_user_message="" if checkpoint else message,
+            parent_session_id=self.me["session_id"], kind=f"wf:{wf_name}:{agent['id']}",
+            title=f"{wf_name}:{agent['id']}", first_user_message="" if checkpoint else message,
             lifetime="independent", startup_mode="paused" if checkpoint else "normal",
-            extra_env=(("AZO_WORKFLOW", store.name), ("AZO_WORKFLOW_AGENT", agent["id"])),
+            extra_env=(("AZO_WORKFLOW", wf_name), ("AZO_WORKFLOW_AGENT", agent["id"])),
         )
 
     def notice(self, text: str, key=None) -> None:
@@ -2245,98 +3385,59 @@ class WorkflowController:
             self.notified.add(key)
         self.notices.append(text)
 
+    def _snap_params(self) -> dict[str, Any]:
+        return {
+            "viewer_session_id": (self.me or {}).get("session_id", ""),
+            "default_model": self.default_model(),
+        }
+
+    def _apply_result_snapshot(self, res: Any) -> None:
+        if isinstance(res, dict) and "snapshot" in res and self._state is not None:
+            _apply_snapshot(self._state, res["snapshot"])
+
     # -- control ----------------------------------------------------------------
 
-    def take_control(self, store: WorkflowStore) -> dict | None:
-        """Record this session as the controller and bump the epoch."""
-        self.require_launch()
-        with store.lock():
-            store.require()
-            control = store.control()
-            if control.get("state") == "archived":
-                raise WorkflowError(f"{store.name} is archived; restore it with /workflow unarchive {store.name} first")
-            previous = control.get("controller")
-            epoch = int(control.get("epoch", 0)) + 1
-            store.update_control(controller=dict(self.me, project=self.launch["project"]), epoch=epoch)
-            if not control.get("default_folder"):
-                store.update_control(default_folder=self.launch["cwd"])
-            store.log("control_taken", by=self.me["session_id"], epoch=epoch)
-        self.managed[store.name] = {"epoch": epoch, "watermark": store.counters().get("item", 0)}
-        return previous
-
     def run(self, name: str, group: str | None = None):
-        store = WorkflowStore(name).require()
-        definition = store.definition()
-        if group is not None:
-            check_group_id(group, definition["agents"])
-        previous = self.take_control(store)
-        with store.lock():
-            control = store.control()
-            if group is None:
-                store.update_control(state="running", paused_groups=[])
-            else:
-                paused = set(control.get("paused_groups") or [])
-                if control.get("state") != "running":
-                    paused = set(definition["agents"])
-                paused.discard(group)
-                store.update_control(state="running", paused_groups=sorted(paused))
-            store.log("run", group=group, by=self.me["session_id"])
-        resumed, problems = yield from self.resume_paused(store, group)
+        self.require_launch()
+        prep = yield WorkflowStoreRequest(
+            op="run_prepare",
+            workflow_name=name,
+            params={**self._snap_params(), "group": group, "me": dict(self.me), "launch": dict(self.launch)},
+        )
+        self._apply_result_snapshot(prep)
+        self.managed[name] = {"epoch": prep["epoch"], "watermark": prep["watermark"]}
+        previous = prep["previous"]
+        resumed, problems = yield from self.resume_paused(name, prep["paused_agents"])
         started = yield from self.tick(name)
         lines = []
         if previous and previous.get("session_id") != self.me["session_id"]:
             lines.append(f"Took control of {name} from session {previous['session_id'][:8]}.")
         scope = f"{group} in {name}" if group else name
-        lines.append(f"Running {scope} from this session (def_{store.version}).")
+        lines.append(f"Running {scope} from this session (def_{prep['version']}).")
         if resumed:
             lines.append("Resumed " + ", ".join(resumed) + " where they left off.")
         if started:
             lines.extend(started)
         if not resumed and not started:
-            lines.append("No agents started yet: " + self.idle_reason(store, group))
+            reason = yield WorkflowStoreRequest(op="idle_reason", workflow_name=name, params={"group": group})
+            lines.append("No agents started yet: " + str(reason))
         lines.extend(problems)
         lines.append(f"See wf:{name} for progress.")
         return "\n".join(lines)
 
-    def idle_reason(self, store: WorkflowStore, group: str | None) -> str:
-        definition = store.definition()
-        reasons = []
-        for name, settings in definition["agents"].items():
-            if group and name != group:
-                continue
-            if settings["count"] == 0:
-                reasons.append(f"{name} has count 0")
-            else:
-                for queue, size in (settings["takes_from"] or {}).items():
-                    waiting = sum(i["state"] == "waiting" for i in store.items(queue))
-                    if size == 1 and not waiting:
-                        reasons.append(f"{queue} is empty, so {name} has nothing to take")
-                    elif waiting < size:
-                        reasons.append(f"{name} takes {size} items from {queue} at a time and "
-                                       f"{queue} has {waiting} waiting")
-        return "; ".join(reasons) + "." if reasons else "all groups are at their count."
-
     def pause(self, name: str, group: str | None = None):
-        store = WorkflowStore(name).require()
-        definition = store.definition()
-        if group is not None:
-            check_group_id(group, definition["agents"])
-        with store.lock():
-            control = store.control()
-            if control.get("state") == "archived":
-                raise WorkflowError(f"{name} is archived")
-            if group is None:
-                store.update_control(state="paused")
-            else:
-                paused = set(control.get("paused_groups") or []) | {group}
-                store.update_control(paused_groups=sorted(paused))
-            store.log("pause", group=group, by=self.me_label())
+        prep = yield WorkflowStoreRequest(
+            op="pause_prepare",
+            workflow_name=name,
+            params={**self._snap_params(), "group": group, "by": self.me_label()},
+        )
+        self._apply_result_snapshot(prep)
         stopped, starting, problems = [], [], []
-        for agent in store.agents(group):
+        for agent in prep["agents"]:
             if agent["state"] == "starting":
                 starting.append(agent["id"])
             elif agent["state"] == "running":
-                problem = yield from self.pause_one(store, agent)
+                problem = yield from self.pause_one(name, agent)
                 (problems if problem else stopped).append(problem or agent["id"])
         scope = f"{group} in {name}" if group else name
         text = f"Paused {scope}. No new agents will start."
@@ -2348,90 +3449,126 @@ class WorkflowController:
             text += f" (That happens in the session that controls {name}.)"
         return "\n".join([text, *problems])
 
-    def pause_one(self, store: WorkflowStore, agent: dict):
+    def pause_one(self, wf_name: str, agent: dict):
         try:
-            yield from self.send(store, agent, "interrupt")
+            yield from self.send(wf_name, agent, "interrupt")
         except Exception as exc:
             return f"Could not interrupt {agent['id']}: {exc}"
-        store.update_agent(agent["id"], state="paused")
+        res = yield WorkflowStoreRequest(
+            op="update_agent",
+            workflow_name=wf_name,
+            params={**self._snap_params(), "agent_id": agent["id"], "changes": {"state": "paused"}},
+        )
+        self._apply_result_snapshot(res)
         return None
 
     def archive(self, name: str):
-        store = WorkflowStore(name).require()
-        if store.control().get("state") == "archived":
-            raise WorkflowError(f"{name} is already archived")
+        yield WorkflowStoreRequest(op="archive_check", workflow_name=name)
         yield from self.pause(name)
+        agents = yield WorkflowStoreRequest(op="archive_list_agents", workflow_name=name)
         ended = []
-        for agent in store.agents():
-            if agent["state"] not in ACTIVE_STATES | {"attention"}:
-                continue
-            yield from self.stop_agent(store, agent, reason="workflow")
-            with store.lock():
-                for item_id in agent_items(agent):
-                    store.return_item(item_id, agent["id"], by="archive")
-            store.update_agent(agent["id"], state="stopped", problem="workflow archived")
+        for agent in agents:
+            yield from self.stop_agent(name, agent, reason="workflow")
+            yield WorkflowStoreRequest(op="archive_return_agent", workflow_name=name, params={"agent": agent})
             ended.append(agent["id"])
-        with store.lock():
-            store.update_control(state="archived", controller=None)
-            store.log("archived", by=self.me_label())
+        fin = yield WorkflowStoreRequest(
+            op="archive_finalize",
+            workflow_name=name,
+            params={**self._snap_params(), "by": self.me_label()},
+        )
+        self._apply_result_snapshot(fin)
         self.managed.pop(name, None)
-        text = (f"Archived {name}. It no longer appears in /workflow; its definition, items and history "
-                f"stay readable at wf:{name}, and /workflow unarchive {name} brings it back.")
+        text = (
+            f"Archived {name}. It no longer appears in /workflow; its definition, items and history "
+            f"stay readable at wf:{name}, and /workflow unarchive {name} brings it back."
+        )
         if ended:
             text += f" Shut down {', '.join(ended)}."
         return text
 
-    def unarchive(self, name: str) -> str:
-        store = WorkflowStore(name).require()
-        with store.lock():
-            if store.control().get("state") != "archived":
-                raise WorkflowError(f"{name} is not archived")
-            store.update_control(state="paused", paused_groups=[])
-            store.log("unarchived", by=self.me_label())
-        return f"Restored {name}. It is paused; start it with /workflow run {name}."
+    def unarchive(self, name: str):
+        res = yield WorkflowStoreRequest(
+            op="unarchive",
+            workflow_name=name,
+            params={**self._snap_params(), "by": self.me_label()},
+        )
+        self._apply_result_snapshot(res)
+        return res["text"]
 
-    def rename(self, name: str, new_name: str) -> str:
-        renamed = WorkflowStore(name).require().rename(new_name, by=self.me_label())
+    def rename(self, name: str, new_name: str):
+        res = yield WorkflowStoreRequest(
+            op="rename",
+            workflow_name=name,
+            params={**self._snap_params(), "new_name": new_name, "by": self.me_label()},
+        )
+        self._apply_result_snapshot(res)
+        target_name = res["new_name"]
         if name in self.managed:
-            self.managed[renamed.name] = self.managed.pop(name)
+            self.managed[target_name] = self.managed.pop(name)
         for iid, pair in list(self.instances_by_id.items()):
             if pair[0] == name:
-                self.instances_by_id[iid] = (renamed.name, pair[1])
+                self.instances_by_id[iid] = (target_name, pair[1])
         self.errors.pop(name, None)
-        return (f"Renamed {name} to {renamed.name}. Open it with /workflow view {renamed.name}; "
-                f"agents read it at wf:{renamed.name}.")
+        return (
+            f"Renamed {name} to {target_name}. Open it with /workflow view {target_name}; "
+            f"agents read it at wf:{target_name}."
+        )
 
-    # -- agents (pure SessionRequests) -----------------------------------------
+    # -- agents (pure SessionRequests + WorkflowStoreRequests) -----------------
 
-    def _owns_control(self, store: WorkflowStore, control: dict | None = None) -> bool:
-        control = store.control() if control is None else control
-        mine = self.managed.get(store.name)
-        return (mine is not None and int(control.get("epoch", 0)) == mine["epoch"]
-                and (control.get("controller") or {}).get("instance_id") == (self.me or {}).get("instance_id"))
+    def _owns_control(self, wf_name: str, control: dict) -> bool:
+        mine = self.managed.get(wf_name)
+        return (
+            mine is not None
+            and int(control.get("epoch", 0)) == mine["epoch"]
+            and (control.get("controller") or {}).get("instance_id") == (self.me or {}).get("instance_id")
+        )
 
-    def _discover_target(self, store: WorkflowStore, agent: dict):
+    def _discover_target(self, wf_name: str, agent: dict):
         session_id = agent.get("session_id") or ""
         if not session_id:
             return None
         disc = yield DiscoverSessions(
-            store_root=(self.launch or {}).get("store_root") or "", session_id=session_id,
-            include_stale=False, probe_local_processes=True,
+            store_root=(self.launch or {}).get("store_root") or "",
+            session_id=session_id,
+            include_stale=False,
+            probe_local_processes=True,
         )
         row = _pick_live_row(disc)
         if row is None:
             return None
         identity = row.process_identity or agent.get("process_identity")
-        store.update_agent(agent["id"], instance_id=row.instance_id, websocket_url=row.websocket_url,
-                           process_identity=identity)
-        self.instances_by_id[row.instance_id] = (store.name, agent["id"])
-        return {"session_id": row.session_id, "instance_id": row.instance_id,
-                "websocket_url": row.websocket_url, "process_identity": identity}
+        res = yield WorkflowStoreRequest(
+            op="update_agent",
+            workflow_name=wf_name,
+            params={
+                **self._snap_params(),
+                "agent_id": agent["id"],
+                "changes": {
+                    "instance_id": row.instance_id,
+                    "websocket_url": row.websocket_url,
+                    "process_identity": identity,
+                },
+            },
+        )
+        self._apply_result_snapshot(res)
+        self.instances_by_id[row.instance_id] = (wf_name, agent["id"])
+        return {
+            "session_id": row.session_id,
+            "instance_id": row.instance_id,
+            "websocket_url": row.websocket_url,
+            "process_identity": identity,
+        }
 
-    def _resolve_target(self, store: WorkflowStore, agent: dict):
+    def _resolve_target(self, wf_name: str, agent: dict):
         if agent.get("websocket_url") and agent.get("session_id"):
-            return {"session_id": agent["session_id"], "instance_id": agent.get("instance_id") or "",
-                    "websocket_url": agent["websocket_url"], "process_identity": agent.get("process_identity")}
-        target = yield from self._discover_target(store, agent)
+            return {
+                "session_id": agent["session_id"],
+                "instance_id": agent.get("instance_id") or "",
+                "websocket_url": agent["websocket_url"],
+                "process_identity": agent.get("process_identity"),
+            }
+        target = yield from self._discover_target(wf_name, agent)
         if target is None:
             raise WorkflowError(f"{agent['id']} is not running")
         return target
@@ -2445,45 +3582,58 @@ class WorkflowController:
         else:
             raise WorkflowError(f"unsupported agent action {action!r}")
         return SendSessionInput(
-            session_id=target["session_id"], instance_id=target.get("instance_id") or "",
-            channel=channel, payload=payload, client_id=uuid.uuid4().hex,
-            websocket_url=target["websocket_url"], expected_process_identity=target.get("process_identity"),
-            verify_loopback=True, timeout_s=30.0,
+            session_id=target["session_id"],
+            instance_id=target.get("instance_id") or "",
+            channel=channel,
+            payload=payload,
+            client_id=uuid.uuid4().hex,
+            websocket_url=target["websocket_url"],
+            expected_process_identity=target.get("process_identity"),
+            verify_loopback=True,
+            timeout_s=30.0,
         )
 
-    def send(self, store: WorkflowStore, agent: dict, action: str, message: str = ""):
+    def send(self, wf_name: Any, agent: dict, action: str, message: str = ""):
         """Deliver one user message or slash command to a live agent via ``SendSessionInput``."""
-        target = yield from self._resolve_target(store, agent)
+        name = wf_name.name if isinstance(wf_name, WorkflowStore) else str(wf_name)
+        target = yield from self._resolve_target(name, agent)
         result = yield self._send_request(target, action, message)
         if isinstance(result, SessionDeliveryResult):
             if result.outcome == "sent":
                 return
             if result.outcome in {"pre_send_race", "unavailable"}:
-                refreshed = yield from self._discover_target(store, agent)
+                refreshed = yield from self._discover_target(name, agent)
                 if refreshed is not None and refreshed["instance_id"] != target["instance_id"]:
                     result = yield self._send_request(refreshed, action, message)
                     if isinstance(result, SessionDeliveryResult) and result.outcome == "sent":
                         return
             raise WorkflowError(result.error or f"could not deliver {action} to {agent['id']} ({result.outcome})")
 
-    def send_data(self, store: WorkflowStore, agent: dict, artifacts: Sequence[SessionArtifact], *,
+    def send_data(self, wf_name: Any, agent: dict, artifacts: Sequence[SessionArtifact], *,
                   channel: str = "workflow", message: str = ""):
         """Push typed ``SessionArtifact`` payloads to a live agent via ``SendSessionData``."""
-        target = yield from self._resolve_target(store, agent)
+        name = wf_name.name if isinstance(wf_name, WorkflowStore) else str(wf_name)
+        target = yield from self._resolve_target(name, agent)
         result = yield SendSessionData(
-            session_id=target["session_id"], instance_id=target.get("instance_id") or "",
-            artifacts=tuple(artifacts), channel=channel, message=message,
+            session_id=target["session_id"],
+            instance_id=target.get("instance_id") or "",
+            artifacts=tuple(artifacts),
+            channel=channel,
+            message=message,
             sender_session_id=(self.me or {}).get("session_id", ""),
-            sender_instance_id=(self.me or {}).get("instance_id", ""), client_id=uuid.uuid4().hex,
-            websocket_url=target["websocket_url"], expected_process_identity=target.get("process_identity"),
-            verify_loopback=True, timeout_s=30.0,
+            sender_instance_id=(self.me or {}).get("instance_id", ""),
+            client_id=uuid.uuid4().hex,
+            websocket_url=target["websocket_url"],
+            expected_process_identity=target.get("process_identity"),
+            verify_loopback=True,
+            timeout_s=30.0,
         )
         if isinstance(result, SessionDeliveryResult) and result.outcome != "sent":
             raise WorkflowError(result.error or f"could not deliver data to {agent['id']} ({result.outcome})")
 
-    def stop_agent(self, store: WorkflowStore, agent: dict, *, reason: str = "workflow"):
+    def stop_agent(self, wf_name: Any, agent: dict, *, reason: str = "workflow"):
         """Request graceful WS shutdown for a live agent via ``StopSession``."""
-        del store
+        del wf_name
         session_id = agent.get("session_id") or ""
         if not session_id:
             return
@@ -2506,33 +3656,72 @@ class WorkflowController:
         except Exception as exc:
             LOG.warning("Could not shut down %s: %s", agent["id"], exc)
 
-    def spawn_agent(self, store: WorkflowStore, agent: dict, message: str, *,
-                    checkpoint: tuple[str, str] | None = None, recovery_action: str | None = None):
-        """Start (or resume) one agent's session via ``SpawnSession``. Persists identity first."""
+    def spawn_agent(
+        self,
+        wf_name: str,
+        agent: dict,
+        message: str = "",
+        *,
+        checkpoint: tuple[str, str] | None = None,
+        recovery_action: str | None = None,
+        model: str | None = None,
+        render_from_settings: dict | None = None,
+        items: list[dict] | None = None,
+    ):
+        """Start (or resume) one agent's session via ``WorkflowStoreRequest`` + ``SpawnSession``."""
         session_id = agent.get("session_id") or str(uuid.uuid4())
         instance_id = str(uuid.uuid4())
-        Path(agent["folder"]).mkdir(parents=True, exist_ok=True)
-        store.update_agent(
-            agent["id"], session_id=session_id, instance_id=instance_id, state="starting",
-            project=self.launch["project"], launch_started=time.time(), websocket_url=None,
-            process_identity=None, release="resume" if checkpoint else None, recovery_action=recovery_action,
+        prep = yield WorkflowStoreRequest(
+            op="prepare_spawn",
+            workflow_name=wf_name,
+            params={
+                **self._snap_params(),
+                "agent_id": agent["id"],
+                "session_id": session_id,
+                "instance_id": instance_id,
+                "project": self.launch["project"],
+                "is_resume": checkpoint is not None,
+                "recovery_action": recovery_action,
+                "model": model,
+                "message": message,
+                "render_instructions": render_from_settings is not None,
+                "settings": render_from_settings,
+                "items": items or [],
+            },
         )
-        source = (SessionSource(kind="resume", session_id=checkpoint[0], revision_id=checkpoint[1])
-                  if checkpoint else SessionSource(kind="fresh"))
+        self._apply_result_snapshot(prep)
+        agent = prep["agent"]
+        rendered_message = prep["message"]
+        source = (
+            SessionSource(kind="resume", session_id=checkpoint[0], revision_id=checkpoint[1])
+            if checkpoint else SessionSource(kind="fresh")
+        )
         try:
             spawn_result = yield SpawnSession(
-                session_id=session_id, instance_id=instance_id, source=source,
-                spec=self.spec_for(store, agent, message=message, checkpoint=checkpoint),
-                wait_ready=False, ready_timeout_s=float(READY_TIMEOUT_SECONDS), watch=False,
-                result_key=f"wf:{store.name}:{agent['id']}:{instance_id}",
-                launch_metadata={"workflow": store.name, "agent_id": agent["id"]},
+                session_id=session_id,
+                instance_id=instance_id,
+                source=source,
+                spec=self.spec_for(wf_name, agent, message=rendered_message, checkpoint=checkpoint),
+                wait_ready=False,
+                ready_timeout_s=float(READY_TIMEOUT_SECONDS),
+                watch=False,
+                result_key=f"wf:{wf_name}:{agent['id']}:{instance_id}",
+                launch_metadata={"workflow": wf_name, "agent_id": agent["id"]},
             )
         except Exception:
-            store.update_agent(agent["id"], process_identity=None, problem="launch did not complete")
+            yield WorkflowStoreRequest(
+                op="update_agent",
+                workflow_name=wf_name,
+                params={
+                    **self._snap_params(),
+                    "agent_id": agent["id"],
+                    "changes": {"process_identity": None, "problem": "launch did not complete"},
+                },
+            )
             raise
         is_res = isinstance(spawn_result, SessionSpawnResult)
         resolved_iid = (spawn_result.instance_id if is_res and spawn_result.instance_id else instance_id)
-        self.instances_by_id[resolved_iid] = (store.name, agent["id"])
+        self.instances_by_id[resolved_iid] = (wf_name, agent["id"])
         updates: dict[str, Any] = {
             "instance_id": resolved_iid,
             "pid": spawn_result.pid if is_res else None,
@@ -2540,53 +3729,60 @@ class WorkflowController:
         }
         if is_res and spawn_result.ready:
             updates["websocket_url"] = spawn_result.ready.get("websocket_url") or spawn_result.websocket_url or None
-        store.update_agent(agent["id"], **updates)
+        upd = yield WorkflowStoreRequest(
+            op="update_agent",
+            workflow_name=wf_name,
+            params={**self._snap_params(), "agent_id": agent["id"], "changes": updates},
+        )
+        self._apply_result_snapshot(upd)
         try:
             yield ConfigureSessionLifecycle(spawned_policy="leave", session_ids=(session_id,))
         except Exception:
             LOG.debug("Could not configure independent lifecycle for %s", session_id, exc_info=True)
 
-    def resume_agent(self, store: WorkflowStore, agent: dict):
+    def resume_agent(self, wf_name: str, agent: dict):
         """Relaunch a stopped agent from its saved checkpoint. Returns a problem or None."""
         if not agent.get("session_id"):
             return f"{agent['id']} never started, so there is nothing to resume"
-        with store.lock():
-            # Claim the relaunch so a second controller (mid-handoff) cannot start a duplicate writer.
-            current = store.agent(agent["id"])
-            mine = self.managed.get(store.name)
-            if mine is not None and int(store.control().get("epoch", 0)) != mine["epoch"]:
-                return f"{store.name} is now controlled by another session"
-            if current.get("instance_id") != agent.get("instance_id") or current["state"] not in {
-                    "starting", "running", "paused", "attention"}:
-                return None  # Someone else already resumed or ended it.
-            current["state"] = "starting"
-            store.save_agent(current)
-        try:
-            saved = saved_checkpoint(agent.get("project") or self.launch["project"], agent["session_id"])
-        except FileNotFoundError:
-            return f"{agent['id']} has no saved checkpoint to resume from"
-        except Exception as exc:
-            return f"{agent['id']}'s checkpoint could not be read: {exc}"
-        action, reason = checkpoint_recovery(saved.document)
-        if action in {"uncertain", "done"}:
-            return (f"{agent['id']} checkpoint {saved.commit_id}: {reason}. "
-                    "External work may already have happened; inspect its transcript and artifacts before retrying")
+        mine = self.managed.get(wf_name)
+        claim = yield WorkflowStoreRequest(
+            op="claim_resume",
+            workflow_name=wf_name,
+            params={
+                "agent": agent,
+                "epoch": mine["epoch"] if mine is not None else None,
+                "project": self.launch["project"],
+            },
+        )
+        if claim["status"] == "skip":
+            return None
+        if claim["status"] == "problem":
+            return claim["problem"]
         try:
             yield from self.spawn_agent(
-                store,
-                agent,
+                wf_name,
+                claim["agent"],
                 "",
-                checkpoint=(agent["session_id"], saved.commit_id),
-                recovery_action=action,
+                checkpoint=(agent["session_id"], claim["commit_id"]),
+                recovery_action=claim["action"],
             )
         except Exception as exc:
             return f"{agent['id']} could not be relaunched: {exc}"
-        store.update_agent(agent["id"], resumes=int(agent.get("resumes", 0)) + 1, last_resume=time.time())
+        upd = yield WorkflowStoreRequest(
+            op="update_agent",
+            workflow_name=wf_name,
+            params={
+                **self._snap_params(),
+                "agent_id": agent["id"],
+                "changes": {"resumes": int(agent.get("resumes", 0)) + 1, "last_resume": time.time()},
+            },
+        )
+        self._apply_result_snapshot(upd)
         return None
 
-    def resume_paused(self, store: WorkflowStore, group: str | None):
+    def resume_paused(self, wf_name: str, paused_agents: list[dict]):
         resumed, problems = [], []
-        for agent in store.agents(group):
+        for agent in paused_agents:
             if agent["state"] != "paused":
                 continue
             obs = yield ObserveSession(
@@ -2597,21 +3793,40 @@ class WorkflowController:
             if alive is True and agent.get("websocket_url"):
                 try:
                     if agent.get("release") in {"resume", "continue"}:
-                        yield from self.release_ready(store, agent, True)
+                        yield from self.release_ready(wf_name, agent, True)
                     else:
-                        yield from self.send(store, agent, "continue")
-                        store.update_agent(agent["id"], state="running")
-                    if store.agent(agent["id"])["state"] == "running":
+                        yield from self.send(wf_name, agent, "continue")
+                        upd = yield WorkflowStoreRequest(
+                            op="update_agent",
+                            workflow_name=wf_name,
+                            params={**self._snap_params(), "agent_id": agent["id"], "changes": {"state": "running"}},
+                        )
+                        self._apply_result_snapshot(upd)
+                    check = yield WorkflowStoreRequest(
+                        op="read_agent", workflow_name=wf_name, params={"agent_id": agent["id"]},
+                    )
+                    if check["agent"]["state"] == "running":
                         resumed.append(agent["id"])
                 except Exception as exc:
                     problems.append(f"Could not resume {agent['id']}: {exc}")
             elif alive is True:
-                store.update_agent(agent["id"], state="starting", release=agent.get("release") or "continue")
+                upd = yield WorkflowStoreRequest(
+                    op="update_agent",
+                    workflow_name=wf_name,
+                    params={
+                        **self._snap_params(),
+                        "agent_id": agent["id"],
+                        "changes": {"state": "starting", "release": agent.get("release") or "continue"},
+                    },
+                )
+                self._apply_result_snapshot(upd)
                 resumed.append(agent["id"])
             elif alive is False:
-                problem = yield from self.resume_agent(store, agent)
+                problem = yield from self.resume_agent(wf_name, agent)
                 if problem:
-                    self.mark_attention(store, agent, problem + "; use restart_agent to give its item to a fresh agent")
+                    yield from self.mark_attention(
+                        wf_name, agent, problem + "; use restart_agent to give its item to a fresh agent"
+                    )
                     problems.append(problem + ".")
                 else:
                     resumed.append(agent["id"])
@@ -2619,172 +3834,267 @@ class WorkflowController:
                 problems.append(f"Could not tell whether {agent['id']} is still running; left it paused.")
         return resumed, problems
 
-    def mark_attention(self, store: WorkflowStore, agent: dict, problem: str) -> None:
-        store.update_agent(agent["id"], state="attention", problem=problem)
-        store.log("agent_needs_attention", agent=agent["id"], problem=problem)
+    def mark_attention(self, wf_name: str, agent: dict, problem: str):
+        res = yield WorkflowStoreRequest(
+            op="mark_attention",
+            workflow_name=wf_name,
+            params={**self._snap_params(), "agent_id": agent["id"], "problem": problem},
+        )
+        self._apply_result_snapshot(res)
 
     # -- scheduling ---------------------------------------------------------------
 
     def tick(self, name: str):
-        """One scheduling pass. Returns descriptions of agents started."""
-        store = WorkflowStore(name)
-        if not store.exists():
-            self.managed.pop(name, None)
-            return []
-        control = store.control()
+        """One pure Sans-I/O scheduling pass. Returns descriptions of agents started."""
         mine = self.managed.get(name)
-        holder = control.get("controller") or {}
         if mine is None:
             return []
-        if (holder.get("instance_id") != (self.me or {}).get("instance_id")
-                or int(control.get("epoch", 0)) != mine["epoch"]):
+        info = yield WorkflowStoreRequest(op="tick_read", workflow_name=name)
+        if not info["exists"]:
+            self.managed.pop(name, None)
+            return []
+        control = info["control"]
+        holder = control.get("controller") or {}
+        if (
+            holder.get("instance_id") != (self.me or {}).get("instance_id")
+            or int(control.get("epoch", 0)) != mine["epoch"]
+        ):
             self.managed.pop(name, None)
             if control.get("state") != "archived":
                 who = holder.get("session_id", "another session")[:8] if holder else "nobody"
                 self.notice(f"Workflow {name} is now controlled by session {who}; this session stopped scheduling it.")
             return []
-        definition = store.definition()
+        definition = info["definition"]
         paused_groups = set(control.get("paused_groups") or [])
         running = control.get("state") == "running"
-        for agent in store.agents():
+        for agent in info["agents"]:
             if agent["state"] in {"starting", "running"}:
-                yield from self.observe(store, agent, definition, running and agent["group"] not in paused_groups)
-        self.report_attention(store)
+                yield from self.observe(name, agent, definition, running and agent["group"] not in paused_groups)
         started = []
         if running:
-            started = yield from self.start_agents(store, definition, paused_groups)
-        self.report_new_items(store, definition)
+            started = yield from self.start_agents(name, definition, paused_groups)
+        yield from self._collect_notices(name)
         return started
 
-    def release_ready(self, store: WorkflowStore, agent: dict, should_run: bool):
+    def _collect_notices(self, wf_name: str):
+        mine = self.managed.get(wf_name)
+        watermark = mine.get("watermark", 0) if mine is not None else 0
+        rep = yield WorkflowStoreRequest(
+            op="report_notices",
+            workflow_name=wf_name,
+            params={**self._snap_params(), "watermark": watermark},
+        )
+        self._apply_result_snapshot(rep)
+        for item in rep.get("attention", []):
+            self.notice(item["text"], key=item["key"])
+        if mine is not None:
+            mine["watermark"] = rep["watermark"]
+            for text in rep.get("new_items", []):
+                self.notice(text)
+
+    def release_ready(self, wf_name: str, agent: dict, should_run: bool):
         """Release a ready process before claiming it is running; pause wins."""
-        agent = store.agent(agent["id"])
-        control = store.control()
-        if agent["state"] not in ACTIVE_STATES or not self._owns_control(store, control):
+        read = yield WorkflowStoreRequest(
+            op="read_agent", workflow_name=wf_name, params={"agent_id": agent["id"]},
+        )
+        agent, control = read["agent"], read["control"]
+        if agent["state"] not in ACTIVE_STATES or not self._owns_control(wf_name, control):
             return
-        should_run = (should_run and control.get("state") == "running"
-                      and agent["group"] not in control.get("paused_groups", []))
+        should_run = (
+            should_run
+            and control.get("state") == "running"
+            and agent["group"] not in control.get("paused_groups", [])
+        )
         try:
             release = agent.get("release")
             if not should_run:
                 if release in {"resume", "continue"}:
-                    store.update_agent(agent["id"], state="paused")
+                    upd = yield WorkflowStoreRequest(
+                        op="update_agent",
+                        workflow_name=wf_name,
+                        params={**self._snap_params(), "agent_id": agent["id"], "changes": {"state": "paused"}},
+                    )
+                    self._apply_result_snapshot(upd)
                 else:
-                    problem = yield from self.pause_one(store, agent)
+                    problem = yield from self.pause_one(wf_name, agent)
                     if problem:
                         raise WorkflowError(problem)
                 return
             if release in {"resume", "continue"}:
                 action = "continue" if release == "continue" else agent.get("recovery_action")
                 if action not in {"continue", "message"}:
-                    self.mark_attention(store, agent, "recovery action is missing; checkpoint must be reviewed")
+                    yield from self.mark_attention(
+                        wf_name, agent, "recovery action is missing; checkpoint must be reviewed"
+                    )
                     return
-                yield from self.send(store, agent, action, RECOVERY_MESSAGE if action == "message" else "")
-            with store.lock():
-                current = store.agent(agent["id"])
-                if current["state"] in ACTIVE_STATES and current.get("instance_id") == agent.get("instance_id"):
-                    current.update(state="running", release=None)
-                    store.save_agent(current)
+                yield from self.send(wf_name, agent, action, RECOVERY_MESSAGE if action == "message" else "")
+            committed = yield WorkflowStoreRequest(
+                op="release_commit",
+                workflow_name=wf_name,
+                params={**self._snap_params(), "agent_id": agent["id"], "instance_id": agent.get("instance_id")},
+            )
+            self._apply_result_snapshot(committed)
         except Exception as exc:
-            self.mark_attention(store, agent,
-                                f"could not confirm recovery release: {exc}; inspect the live session before retrying")
+            yield from self.mark_attention(
+                wf_name, agent,
+                f"could not confirm recovery release: {exc}; inspect the live session before retrying",
+            )
 
-    def _handle_agent_dead(self, store: WorkflowStore, agent: dict, should_run: bool):
-        agent = store.agent(agent["id"])
-        control = store.control()
-        if agent["state"] not in {"starting", "running"} or not self._owns_control(store, control):
+    def _handle_agent_dead(self, wf_name: str, agent: dict, should_run: bool):
+        read = yield WorkflowStoreRequest(
+            op="read_agent", workflow_name=wf_name, params={"agent_id": agent["id"]},
+        )
+        agent, control = read["agent"], read["control"]
+        if agent["state"] not in {"starting", "running"} or not self._owns_control(wf_name, control):
             return
-        should_run = (should_run and control.get("state") == "running"
-                      and agent["group"] not in control.get("paused_groups", []))
+        should_run = (
+            should_run
+            and control.get("state") == "running"
+            and agent["group"] not in control.get("paused_groups", [])
+        )
         if not should_run:
-            store.update_agent(agent["id"], state="paused")
+            upd = yield WorkflowStoreRequest(
+                op="update_agent",
+                workflow_name=wf_name,
+                params={**self._snap_params(), "agent_id": agent["id"], "changes": {"state": "paused"}},
+            )
+            self._apply_result_snapshot(upd)
             return
         recent = time.time() - float(agent.get("last_resume") or 0) < 600
         if recent and int(agent.get("resumes", 0)) >= MAX_QUICK_RESUMES:
-            self.mark_attention(store, agent, f"stopped unexpectedly {agent['resumes']} times in a row; "
-                                              "read its transcript, then use restart_agent")
+            yield from self.mark_attention(
+                wf_name, agent,
+                f"stopped unexpectedly {agent['resumes']} times in a row; "
+                "read its transcript, then use restart_agent",
+            )
             return
-        problem = yield from self.resume_agent(store, agent)
+        problem = yield from self.resume_agent(wf_name, agent)
         if problem:
-            self.mark_attention(store, agent, problem + "; use restart_agent to give its item to a fresh agent")
+            yield from self.mark_attention(
+                wf_name, agent, problem + "; use restart_agent to give its item to a fresh agent"
+            )
 
-    def observe(self, store: WorkflowStore, agent: dict, definition: dict, should_run: bool):
+    def observe(self, wf_name: Any, agent: dict, definition: dict, should_run: bool):
         del definition
-        agent = store.agent(agent["id"])
-        key = (store.name, agent["id"])
+        name = wf_name.name if isinstance(wf_name, WorkflowStore) else str(wf_name)
+        read = yield WorkflowStoreRequest(
+            op="read_agent", workflow_name=name, params={"agent_id": agent["id"]},
+        )
+        agent = read["agent"]
+        key = (name, agent["id"])
         if agent["state"] not in {"starting", "running"} or key in self.in_flight_agents:
             return
         self.in_flight_agents.add(key)
         try:
-            obs = yield ObserveSession(session_id=agent.get("session_id") or "", instance_id=agent.get("instance_id") or "")
+            obs = yield ObserveSession(
+                session_id=agent.get("session_id") or "",
+                instance_id=agent.get("instance_id") or "",
+            )
             alive = obs.alive if isinstance(obs, SessionObservation) else None
             live_info = obs.live_info if isinstance(obs, SessionObservation) else None
             if agent["state"] == "starting":
-                ws_url = (live_info.websocket_url if live_info and not live_info.is_terminal and live_info.process_state != "dead" else "")
+                ws_url = (
+                    live_info.websocket_url
+                    if live_info and not live_info.is_terminal and live_info.process_state != "dead"
+                    else ""
+                )
                 if not ws_url and alive is not False and agent.get("session_id"):
-                    disc = yield DiscoverSessions(store_root=(self.launch or {}).get("store_root") or "",
-                                                  session_id=agent["session_id"], include_stale=False, probe_local_processes=True)
+                    disc = yield DiscoverSessions(
+                        store_root=(self.launch or {}).get("store_root") or "",
+                        session_id=agent["session_id"],
+                        include_stale=False,
+                        probe_local_processes=True,
+                    )
                     discovered = _pick_live_row(disc)
                     if discovered is not None:
                         live_info, ws_url = discovered, discovered.websocket_url
                 if ws_url and alive is not False:
                     new_iid = live_info.instance_id if live_info and live_info.instance_id else agent["instance_id"]
-                    agent = store.update_agent(agent["id"], websocket_url=ws_url, instance_id=new_iid,
-                                               process_identity=(live_info.process_identity if live_info and live_info.process_identity else agent.get("process_identity")))
+                    upd = yield WorkflowStoreRequest(
+                        op="update_agent",
+                        workflow_name=name,
+                        params={
+                            **self._snap_params(),
+                            "agent_id": agent["id"],
+                            "changes": {
+                                "websocket_url": ws_url,
+                                "instance_id": new_iid,
+                                "process_identity": (
+                                    live_info.process_identity
+                                    if live_info and live_info.process_identity
+                                    else agent.get("process_identity")
+                                ),
+                            },
+                        },
+                    )
+                    self._apply_result_snapshot(upd)
+                    agent = upd["agent"]
                     self.instances_by_id[new_iid] = key
-                    yield from self.release_ready(store, agent, should_run)
+                    yield from self.release_ready(name, agent, should_run)
                     return
                 if alive is True:
                     if time.time() - float(agent.get("launch_started") or 0) > READY_TIMEOUT_SECONDS:
-                        self.mark_attention(store, agent, "did not finish starting within two minutes")
+                        yield from self.mark_attention(name, agent, "did not finish starting within two minutes")
                     return
             if alive is False:
-                yield from self._handle_agent_dead(store, agent, should_run)
+                yield from self._handle_agent_dead(name, agent, should_run)
         finally:
             self.in_flight_agents.discard(key)
 
-    def _find_agent_for_instance(self, session_id: str, instance_id: str) -> tuple[str, str] | None:
-        if instance_id and instance_id in self.instances_by_id:
-            return self.instances_by_id[instance_id]
-        for name in list(self.managed):
-            store = WorkflowStore(name)
-            if not store.exists():
-                continue
-            for agent in store.agents():
-                if (instance_id and agent.get("instance_id") == instance_id) or (
-                        session_id and agent.get("session_id") == session_id and agent["state"] in ACTIVE_STATES):
-                    return name, agent["id"]
-        return None
-
     def _handle_session_event(self, event: ExternalSessionReady | ExternalSessionExited):
-        pair = self._find_agent_for_instance(event.session_id, event.instance_id)
+        pair = self.instances_by_id.get(event.instance_id) if event.instance_id else None
         if isinstance(event, ExternalSessionExited) and event.instance_id:
             self.instances_by_id.pop(event.instance_id, None)
-        if pair is None or pair[0] not in self.managed or pair in self.in_flight_agents:
+        if pair is not None and (pair[0] not in self.managed or pair in self.in_flight_agents):
             return
-        name, agent_id = pair
-        store = WorkflowStore(name)
-        if not store.exists():
+        lookup = yield WorkflowStoreRequest(
+            op="session_event_lookup",
+            workflow_name=pair[0] if pair is not None else "",
+            params={
+                "agent_id": pair[1] if pair is not None else "",
+                "session_id": event.session_id,
+                "instance_id": event.instance_id,
+                "managed_names": list(self.managed),
+            },
+        )
+        if not lookup.get("found"):
             return
-        agent = store.agent(agent_id)
+        name = lookup["workflow_name"]
+        agent = lookup["agent"]
+        agent_id = agent["id"]
+        pair = (name, agent_id)
+        if name not in self.managed or pair in self.in_flight_agents:
+            return
         if agent.get("instance_id") and event.instance_id and agent["instance_id"] != event.instance_id:
             return
         if isinstance(event, ExternalSessionReady) and agent["state"] != "starting":
             return
         self.in_flight_agents.add(pair)
         try:
-            control = store.control()
+            control = lookup["control"]
             should_run = control.get("state") == "running" and agent["group"] not in (control.get("paused_groups") or [])
             if isinstance(event, ExternalSessionReady):
-                agent = store.update_agent(agent_id, websocket_url=event.websocket_url or agent.get("websocket_url"),
-                                           instance_id=event.instance_id or agent.get("instance_id"),
-                                           process_identity=event.process_identity or agent.get("process_identity"))
+                upd = yield WorkflowStoreRequest(
+                    op="update_agent",
+                    workflow_name=name,
+                    params={
+                        **self._snap_params(),
+                        "agent_id": agent_id,
+                        "changes": {
+                            "websocket_url": event.websocket_url or agent.get("websocket_url"),
+                            "instance_id": event.instance_id or agent.get("instance_id"),
+                            "process_identity": event.process_identity or agent.get("process_identity"),
+                        },
+                    },
+                )
+                self._apply_result_snapshot(upd)
+                agent = upd["agent"]
                 if event.instance_id:
                     self.instances_by_id[event.instance_id] = pair
-                yield from self.release_ready(store, agent, should_run)
+                yield from self.release_ready(name, agent, should_run)
             else:
-                yield from self._handle_agent_dead(store, agent, should_run)
-                self.report_attention(store)
+                yield from self._handle_agent_dead(name, agent, should_run)
+                yield from self._collect_notices(name)
         finally:
             self.in_flight_agents.discard(pair)
 
@@ -2796,112 +4106,69 @@ class WorkflowController:
         """Handle unsolicited ``ExternalSessionExited`` from ``AgentZooSessionDriver``."""
         return self._handle_session_event(event)
 
-    def start_agents(self, store: WorkflowStore, definition: dict, paused_groups: set):
-        planned = []
-        with store.lock():
-            control = store.control()
-            mine = self.managed.get(store.name)
-            if (mine is None or control.get("epoch") != mine["epoch"]
-                    or (control.get("controller") or {}).get("instance_id") != (self.me or {}).get("instance_id")
-                    or control.get("state") != "running"):
-                return []
-            definition = store.definition()
-            paused_groups = set(control.get("paused_groups") or [])
-            last_started = dict(control.get("last_started") or {})
-            for group, settings in definition["agents"].items():
-                if group in paused_groups or settings["count"] <= 0:
-                    continue
-                active = sum(a["state"] in ACTIVE_STATES for a in store.agents(group))
-                room = settings["count"] - active
-                while room > 0:
-                    items = []
-                    if settings["takes_from"]:
-                        number = store.counters().get("agents", {}).get(group, 0) + 1
-                        provisional = f"agt_{group_short(group)}_{number}"
-                        items = store.take_batch(settings["takes_from"], provisional)
-                        if not items:
-                            break
-                    elif settings["every"]:
-                        last = float(last_started.get(group) or 0)
-                        if time.time() - last < settings["every"]:
-                            break
-                    folder_template = (settings["folder"] or definition["folder"]
-                                       or control.get("default_folder") or self.launch["cwd"])
-                    agent = store.new_agent(group, version=store.version, item_ids=[i["id"] for i in items],
-                                            sends_to=list(settings["sends_to"]), folder="", model=None)
-                    agent["folder"] = render_folder(store, folder_template, agent)
-                    store.save_agent(agent)
-                    last_started[group] = time.time()
-                    planned.append((agent, settings, items))
-                    room -= 1
-            store.update_control(last_started=last_started)
+    def start_agents(self, wf_name: Any, definition: dict, paused_groups: set):
+        del paused_groups
+        name = wf_name.name if isinstance(wf_name, WorkflowStore) else str(wf_name)
+        mine = self.managed.get(name)
+        if mine is None:
+            return []
+        plan = yield WorkflowStoreRequest(
+            op="plan_start_agents",
+            workflow_name=name,
+            params={
+                "epoch": mine["epoch"],
+                "instance_id": (self.me or {}).get("instance_id"),
+                "cwd": (self.launch or {}).get("cwd") or "",
+            },
+        )
+        definition = plan["definition"]
         started = []
-        for agent, settings, items in planned:
+        for entry in plan["planned"]:
+            agent, settings, items = entry["agent"], entry["settings"], entry["items"]
             try:
                 model = self.model_for(definition, settings)
-                agent = store.update_agent(agent["id"], model=model)
-                message = render_instructions(store, settings, agent, items, self.me["session_id"])
-                yield from self.spawn_agent(store, agent, message)
-                store.log("agent_started", agent=agent["id"], items=[i["id"] for i in items])
+                yield from self.spawn_agent(
+                    name, agent, "",
+                    model=model,
+                    render_from_settings=settings,
+                    items=items,
+                )
+                logged = yield WorkflowStoreRequest(
+                    op="log_agent_started",
+                    workflow_name=name,
+                    params={**self._snap_params(), "agent_id": agent["id"], "items": [i["id"] for i in items]},
+                )
+                self._apply_result_snapshot(logged)
                 started.append(f"Started {agent['id']}" + (f" on {batch_text(items)}." if items else "."))
             except Exception as exc:
-                self.launch_failed(store, agent, items, settings, exc)
+                yield from self.launch_failed(name, agent, items, settings, exc)
         return started
 
-    def launch_failed(self, store, agent, items, settings, exc) -> None:
+    def launch_failed(self, wf_name: str, agent: dict, items: list[dict], settings, exc):
         del settings
         group = agent["group"]
-        with store.lock():
-            for item in items:
-                store.return_item(item["id"], agent["id"], by="scheduler")
-            control = store.control()
-            paused = set(control.get("paused_groups") or []) | {group}
-            store.update_control(paused_groups=sorted(paused))
-        store.update_agent(agent["id"], state="stopped", problem=f"could not start: {exc}")
-        store.log("agent_start_failed", agent=agent["id"], error=str(exc))
-        self.notice(f"Workflow {store.name}: could not start an agent in {group}: {exc}. Paused {group}; "
-                    f"fix the problem (see wf:{store.name}:{group}), then run it again.")
-
-    def report_attention(self, store: WorkflowStore) -> None:
-        for agent in store.agents():
-            if agent["state"] == "attention":
-                self.notice(f"Workflow {store.name}: {agent['id']} needs attention: {agent.get('problem')}. "
-                            f"See wf:{store.name}:{agent['id']}.",
-                            key=(store.name, agent["id"], agent.get("problem")))
-
-    def report_new_items(self, store: WorkflowStore, definition: dict) -> None:
-        mine = self.managed.get(store.name)
-        if mine is None:
-            return
-        watermark = mine.get("watermark", 0)
-        latest = store.counters().get("item", 0)
-        if latest <= watermark:
-            return
-        mine["watermark"] = latest
-        watched = {q for q, s in definition["queues"].items() if s["notify_on_new"]}
-        if not watched:
-            return
-        fresh = [i for i in store.items() if int(i["id"][5:]) > watermark and i["queue"] in watched]
-        by_queue = collections.defaultdict(list)
-        for item in fresh:
-            by_queue[item["queue"]].append(f"{item['id']} ({item['title']})")
-        for queue, entries in by_queue.items():
-            self.notice(f"Workflow {store.name}: new items in {queue}: {', '.join(entries)}. "
-                        f"See wf:{store.name}:{queue}.")
+        res = yield WorkflowStoreRequest(
+            op="launch_failed",
+            workflow_name=wf_name,
+            params={**self._snap_params(), "agent": agent, "items": items, "error": str(exc)},
+        )
+        self._apply_result_snapshot(res)
+        self.notice(
+            f"Workflow {wf_name}: could not start an agent in {group}: {exc}. Paused {group}; "
+            f"fix the problem (see wf:{wf_name}:{group}), then run it again."
+        )
 
     # -- other controller operations ---------------------------------------------
 
     def message_agents(self, name: str, message: str, group: str | None):
-        store = WorkflowStore(name).require()
-        if group is not None:
-            check_group_id(group, {a["group"] for a in store.agents()} | set(store.definition()["agents"]))
         if not message.strip():
             raise WorkflowError("message is empty")
+        res = yield WorkflowStoreRequest(op="message_check", workflow_name=name, params={"group": group})
         sent, skipped, problems = [], [], []
-        for agent in store.agents(group):
+        for agent in res["agents"]:
             if agent["state"] == "running":
                 try:
-                    yield from self.send(store, agent, "message", message)
+                    yield from self.send(name, agent, "message", message)
                     sent.append(agent["id"])
                 except Exception as exc:
                     problems.append(f"Could not reach {agent['id']}: {exc}")
@@ -2916,20 +4183,21 @@ class WorkflowController:
         return "\n".join([text, *problems])
 
     def restart_agent(self, name: str, agent_id: str):
-        store = WorkflowStore(name).require()
-        agent = store.agent(check_agent_id(agent_id))
-        if agent["state"] in {"finished", "restarted"}:
-            raise WorkflowError(f"{agent_id} has already {agent['state']}")
-        yield from self.stop_agent(store, agent, reason="workflow")
+        checked = yield WorkflowStoreRequest(
+            op="restart_check", workflow_name=name, params={"agent_id": agent_id},
+        )
+        agent = checked["agent"]
+        yield from self.stop_agent(name, agent, reason="workflow")
         item_ids = agent_items(agent)
-        with store.lock():
-            for item_id in item_ids:
-                store.return_item(item_id, agent_id, by="restart_agent")
-        store.update_agent(agent_id, state="restarted", problem=None)
-        store.log("agent_restarted", agent=agent_id)
+        fin = yield WorkflowStoreRequest(
+            op="restart_finalize",
+            workflow_name=name,
+            params={**self._snap_params(), "agent_id": agent["id"], "item_ids": item_ids},
+        )
+        self._apply_result_snapshot(fin)
         text = f"Stopped {agent_id} and discarded its progress."
         if len(item_ids) == 1:
-            text += f" {item_ids[0]} is back in {store.item(item_ids[0])['queue']} for a fresh agent."
+            text += f" {item_ids[0]} is back in {fin['first_queue']} for a fresh agent."
         elif item_ids:
             text += f" {', '.join(item_ids)} are back in their queues for a fresh agent."
         if name not in self.managed:
@@ -2938,29 +4206,42 @@ class WorkflowController:
 
     def change_setting(self, name: str, kind: str, target: str | None, setting: str, raw: str):
         """Apply one /workflow set change and describe its effect."""
-        store = WorkflowStore(name).require()
-        change = prepare_setting(store, kind, target, setting, raw, check_model=self.check_model,
-                                 default_model=self.default_model())
-        label, setting = change["label"], change["setting"]
-        if change["unchanged"]:
-            return f"{label} {setting} is already {change['new_text']}; nothing changed."
-        result = store.set_setting(change["section"], change["name"], change["key"], change["value"],
-                                   reason=change["reason"], by="user")
-        text = (f"Set {label} {setting} from {change['old_text']} to {change['new_text']} "
-                f"(def_{result['version']}).")
-        definition = store.definition()
-        active = [a for a in store.agents() if a["state"] in ACTIVE_STATES]
-        if setting == "count":
+        res = yield WorkflowStoreRequest(
+            op="set_setting",
+            workflow_name=name,
+            params={
+                **self._snap_params(),
+                "kind": kind,
+                "target": target,
+                "setting": setting,
+                "raw": raw,
+                "config": self.config,
+            },
+        )
+        self._apply_result_snapshot(res)
+        change = res["change"]
+        label, setting_name = change["label"], change["setting"]
+        if res["unchanged"]:
+            return f"{label} {setting_name} is already {change['new_text']}; nothing changed."
+        result = res["result"]
+        text = (
+            f"Set {label} {setting_name} from {change['old_text']} to {change['new_text']} "
+            f"(def_{result['version']})."
+        )
+        definition = res["definition"]
+        active = res["active"]
+        control = res["control"]
+        if setting_name == "count":
             if change["value"] < int(change["old_text"]):
                 text += " Extra running agents finish their current item first."
             elif name in self.managed:
                 started = yield from self.tick(name)
                 text += (" " + " ".join(started)) if started else ""
-            elif store.control().get("state") == "running":
+            elif control.get("state") == "running":
                 text += " The session controlling it will start agents shortly."
             else:
                 text += f" {name} is paused; agents start when it runs."
-        elif setting == "model":
+        elif setting_name == "model":
             stale = []
             for agent in active:
                 group = definition["agents"].get(agent["group"])
@@ -2971,46 +4252,48 @@ class WorkflowController:
                     stale.append(f"{agent['id']} ({agent['model']})")
             text += " New agents use it."
             if stale:
-                text += (f" {', '.join(stale)} keep their current model; restart them with restart_agent "
-                         "or let them finish to switch.")
-        elif setting == "folder":
+                text += (
+                    f" {', '.join(stale)} keep their current model; restart them with restart_agent "
+                    "or let them finish to switch."
+                )
+        elif setting_name == "folder":
             scope = [a["id"] for a in active if kind == "workflow" or a["group"] == target]
             text += " New agents start there."
             if scope:
                 text += f" {', '.join(scope)} keep their current folder."
-        elif setting == "every":
+        elif setting_name == "every":
             text += " It applies from the group's next start."
-        elif setting == "description":
+        elif setting_name == "description":
             text += " It shows in /workflow list."
-        elif setting == "notify":
-            text += (f" The controlling agent will be told about new items in {target}."
-                     if change["value"] else f" New items in {target} no longer notify anyone.")
+        elif setting_name == "notify":
+            text += (
+                f" The controlling agent will be told about new items in {target}."
+                if change["value"] else f" New items in {target} no longer notify anyone."
+            )
         return text
 
-    # -- startup adoption & reload rediscovery ------------------------------------
+    # -- startup adoption & reload rediscovery (pure generators) -----------------
 
-    def adopt(self, state) -> list[str]:
+    def adopt(self, state):
         """After a restart or reload, keep running workflows this session controlled."""
         self.bind(state)
         if not self.me or self.adopted_instance == self.me["instance_id"]:
             return []
         self.adopted_instance = self.me["instance_id"]
-        adopted = []
-        for name in list_workflow_names():
-            store = WorkflowStore(name)
-            control = store.control()
-            holder = control.get("controller") or {}
-            if (control.get("state") != "running" or holder.get("session_id") != self.me["session_id"]
-                    or holder.get("instance_id") == self.me["instance_id"]):
-                continue
-            try:
-                self.take_control(store)
-                adopted.append(name)
-                self.notice(f"Workflow {name} is running again under this session after a restart. "
-                            f"See wf:{name}.")
-            except Exception as exc:
-                self.notice(f"Workflow {name} could not resume after a restart: {exc}")
-        return adopted
+        if self.launch is None:
+            snap = yield WorkflowStoreRequest(op="snapshot", params=self._snap_params())
+            _apply_snapshot(state, snap)
+            return []
+        res = yield WorkflowStoreRequest(
+            op="adopt",
+            params={**self._snap_params(), "me": dict(self.me), "launch": dict(self.launch)},
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        for wf_name, entry in res.get("managed_updates", {}).items():
+            self.managed[wf_name] = entry
+        for text in res.get("notices", []):
+            self.notice(text)
+        return list(res.get("adopted", []))
 
     def rediscover_workflows(self, names: Sequence[str]):
         """Rediscover live worker sessions after parent reload via ``DiscoverSessions`` + ``AdoptSession``."""
@@ -3018,42 +4301,48 @@ class WorkflowController:
         if not names or not root:
             return
         disc = yield DiscoverSessions(store_root=root, include_stale=False, probe_local_processes=True)
-        by_session: dict[str, LiveSessionInfo] = {}
+        by_session: dict[str, dict[str, Any]] = {}
         for row in (disc.rows if isinstance(disc, DiscoverSessionsResult) else ()):
             if row.is_terminal or row.process_state == "dead":
                 continue
             existing = by_session.get(row.session_id)
-            if existing is None or (row.updated_at, row.started_at) >= (existing.updated_at, existing.started_at):
-                by_session[row.session_id] = row
-        for name in names:
-            store = WorkflowStore(name)
-            if not store.exists():
-                continue
-            for agent in store.agents():
-                row = by_session.get(agent.get("session_id") or "") if agent["state"] in ACTIVE_STATES else None
-                if row is None:
-                    continue
-                store.update_agent(agent["id"], instance_id=row.instance_id,
-                                   websocket_url=row.websocket_url or agent.get("websocket_url"),
-                                   process_identity=row.process_identity or agent.get("process_identity"))
-                self.instances_by_id[row.instance_id] = (store.name, agent["id"])
-                try:
-                    yield AdoptSession(
-                        session_id=row.session_id, instance_id=row.instance_id,
-                        process_identity=row.process_identity, websocket_url=row.websocket_url,
-                        result_key=f"wf:{store.name}:{agent['id']}:{row.instance_id}", watch=False,
-                        metadata={"workflow": store.name, "agent_id": agent["id"]},
-                    )
-                except Exception:
-                    LOG.debug("Could not adopt worker %s/%s", store.name, agent["id"], exc_info=True)
+            key_new = (row.updated_at, row.started_at)
+            if existing is None or key_new >= existing["_order"]:
+                by_session[row.session_id] = {
+                    "_order": key_new,
+                    "session_id": row.session_id,
+                    "instance_id": row.instance_id,
+                    "websocket_url": row.websocket_url,
+                    "process_identity": row.process_identity,
+                }
+        for row in by_session.values():
+            row.pop("_order", None)
+        applied = yield WorkflowStoreRequest(
+            op="rediscover_apply",
+            params={**self._snap_params(), "names": list(names), "by_session": by_session},
+        )
+        self._apply_result_snapshot(applied)
+        for item in applied.get("adoptions", []):
+            self.instances_by_id[item["instance_id"]] = (item["workflow"], item["agent_id"])
+            try:
+                yield AdoptSession(
+                    session_id=item["session_id"],
+                    instance_id=item["instance_id"],
+                    process_identity=item["process_identity"],
+                    websocket_url=item["websocket_url"],
+                    result_key=f"wf:{item['workflow']}:{item['agent_id']}:{item['instance_id']}",
+                    watch=False,
+                    metadata={"workflow": item["workflow"], "agent_id": item["agent_id"]},
+                )
+            except Exception:
+                LOG.debug("Could not adopt worker %s/%s", item["workflow"], item["agent_id"], exc_info=True)
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools (100% pure Sans-I/O)
 # ---------------------------------------------------------------------------
 
 def function_schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
-    # Strict providers may require every property. Null preserves omission semantics.
     properties = deepcopy(properties)
     for key, prop in properties.items():
         if key not in required:
@@ -3084,22 +4373,12 @@ def buffer_text(state, buffer_id: str) -> str:
         raise WorkflowError(f"there is no buffer {buffer_id}") from None
 
 
-@dataclass
-class _WorkflowTask:
-    """In-flight Sans-I/O generator task driven via ``state.io.submit``."""
-
-    kind: str  # "command" | "tick" | "event"
-    gen: Any
-    workflow_name: str = ""
-
-
 class WorkflowTool(Tool):
-    """A tool with separate behavior (and schema) for controlling sessions and workers."""
+    """A pure Sans-I/O tool with separate behavior (and schema) for controllers and workers."""
+
     group = WORKER_TOOLS_GROUP
-    optional_reads = {"_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
-                      "buffer_manager", "_persistence_local_root", "cwd", "session_cwd"}
-    writes = {"done", "result", "shutdown", "shutdown_reason", "shutdown_save", "shutdown_registry_status",
-              "shutdown_spawned_policy"}
+    optional_reads = {"_agent_zoo_context", "buffer_manager", "_persistence_local_root", "cwd", "session_cwd"}
+    writes = {"result"}
 
     def __init__(self, name, *, controller_schema=None, worker_schema=None, on_controller=None, on_worker=None,
                  plugin=None):
@@ -3109,7 +4388,7 @@ class WorkflowTool(Tool):
         self.plugin = plugin
         static = controller_schema or worker_schema
         if callable(static):
-            static = static({"sends_to": []})  # Workers see their own queues; this is the generic form.
+            static = static({"sends_to": []})
         self.schema = static
         self.description = static["function"]["description"]
 
@@ -3165,11 +4444,11 @@ class WorkflowTool(Tool):
 
 
 class WorkflowSchemaPublisher:
-    """Publish dynamic controller/worker schemas onto ``state.tool_schemas``."""
+    """Publish dynamic controller/worker schemas onto ``state.tool_schemas`` (pure Sans-I/O)."""
 
     handles = (RenderRequested, TurnSettled)
     reads = {"tool_schemas"}
-    optional_reads = {"_session_kind", "_session_id"}
+    optional_reads = set()
     writes = {"tool_schemas"}
 
     def __init__(self, tools: list[WorkflowTool]):
@@ -3185,27 +4464,26 @@ class WorkflowSchemaPublisher:
 
 
 class WorkflowsPlugin:
-    """Tool handlers, Sans-I/O task driver, and worker context for one pipeline."""
+    """Pure Sans-I/O tool handlers, task driver, and cached worker context for one pipeline."""
 
     def __init__(self, controller: WorkflowController):
         self.controller = controller
-        self.pending_tasks: dict[OpId, _WorkflowTask] = {}
-        self.tick_timer_op: OpId | None = None
-        self.tick_active: bool = False
 
     def ensure_tick_timer(self, state: State) -> OpId | None:
         """Schedule the next periodic scheduling timer when any workflow is managed."""
+        durable = _wf_durable(state)
+        rt = _wf_runtime(state)
         if (
-            not self.controller.managed
-            or self.tick_active
-            or self.tick_timer_op is not None
+            not durable.managed
+            or rt.tick_active
+            or rt.tick_timer_op is not None
             or getattr(state, "shutdown", False)
             or getattr(state, "done", False)
             or not hasattr(state, "io")
         ):
-            return self.tick_timer_op
-        self.tick_timer_op = state.io.submit(StartTimer(delay_s=TICK_SECONDS), tag="workflow_tick")
-        return self.tick_timer_op
+            return rt.tick_timer_op
+        rt.tick_timer_op = state.io.submit(StartTimer(delay_s=TICK_SECONDS), tag="workflow_tick")
+        return rt.tick_timer_op
 
     def advance_task(
         self,
@@ -3236,13 +4514,27 @@ class WorkflowsPlugin:
             return None, False, TypeError(
                 f"Workflow task yielded unsupported object {type(yielded).__name__}; expected IoRequest"
             )
-        tag = "workflow_command" if task.kind == "command" else "workflow_scheduler"
+        tag = "workflow_command" if task.kind in {"command", "command_doc"} else "workflow_scheduler"
         op_id = state.io.submit(yielded, tag=tag)
-        self.pending_tasks[op_id] = task
+        _wf_runtime(state).pending_tasks[op_id] = task
         return op_id, False, None
 
-    def start_event_task(self, state: State, emit: EmitFn, kind: str, gen, workflow_name: str = "") -> OpId | None:
-        task = _WorkflowTask(kind=kind, gen=gen, workflow_name=workflow_name)
+    def start_event_task(
+        self,
+        state: State,
+        emit: EmitFn,
+        kind: str,
+        gen,
+        workflow_name: str = "",
+        *,
+        release_readiness: bool = False,
+    ) -> OpId | None:
+        task = _WorkflowTask(
+            kind=kind,
+            gen=gen,
+            workflow_name=workflow_name,
+            release_readiness=release_readiness,
+        )
         op_id, ok, val = self.advance_task(state, task, first=True)
         if op_id is not None:
             return op_id
@@ -3250,7 +4542,23 @@ class WorkflowsPlugin:
         return None
 
     def finish_task_outcome(self, state: State, emit: EmitFn, task: _WorkflowTask, ok: bool, val: Any) -> None:
+        rt = _wf_runtime(state)
+        if task.release_readiness:
+            _readiness_release(state, emit)
+        if task.kind == "command_doc":
+            if ok and isinstance(val, InspectorDocument):
+                if hasattr(state, "io") and state.io is not None:
+                    state.io.submit(PublishInspector(document=val), tag="frontend")
+                emit(ProjectionRequested())
+            else:
+                emit(EmitNotice(str(val or "Workflow command failed."), level="warning"))
+                emit(ProjectionRequested())
+            return
         if task.kind == "command":
+            if ok and isinstance(val, dict) and val.get("_notice_only"):
+                emit(EmitNotice(str(val["text"]), level="info"))
+                emit(ProjectionRequested())
+                return
             result = (
                 {"ok": True, "text": str(val or "")}
                 if ok
@@ -3260,201 +4568,267 @@ class WorkflowsPlugin:
             self.drain_notices(state, emit, wake=False)
             self.ensure_tick_timer(state)
             return
+        if task.kind == "worker_remind":
+            if ok and isinstance(val, dict) and val.get("action") == "remind":
+                pending = getattr(state, "pending_interrupts", None)
+                if not isinstance(pending, list):
+                    pending = []
+                    state.pending_interrupts = pending
+                pending.append(
+                    "You ended your turn without calling finish_task. If your task is done, call finish_task now "
+                    "with your summary and outputs. If it is not done, keep working."
+                )
+                emit(InterruptQueued(source="workflow_reminder"))
+                emit(ProjectionRequested())
+                emit(PacingCheck(reason="workflow_reminder"))
+            elif not ok:
+                LOG.exception("Workflow finish reminder failed: %s", val)
+            return
         if task.kind == "tick":
-            self.tick_active = False
+            rt.tick_active = False
             if not ok:
                 LOG.exception("Workflow scheduler tick failed: %s", val)
         elif not ok:
-            LOG.warning("Workflow event task failed: %s", val)
-        self.drain_notices(state, emit, wake=True)
+            LOG.warning("Workflow %s task failed: %s", task.kind, val)
+        self.drain_notices(state, emit, wake=(task.kind != "startup"))
+        if task.kind == "startup" and getattr(state, "pending_interrupts", None):
+            emit(InterruptQueued(source="workflow_notices"))
         self.ensure_tick_timer(state)
 
     def drain_notices(self, state: State, emit: EmitFn, *, wake: bool) -> int:
+        rt = _wf_runtime(state)
         drained = 0
-        while self.controller.notices:
+        while rt.notices:
             pending = getattr(state, "pending_interrupts", None)
             if not isinstance(pending, list):
                 pending = []
                 state.pending_interrupts = pending
-            pending.append(self.controller.notices.popleft())
+            pending.append(rt.notices.popleft())
             drained += 1
         if drained and wake:
             emit(InterruptQueued(source="workflow_notices"))
             emit(ProjectionRequested())
-            _wake_idle_session(state, emit)
+            emit(PacingCheck(reason="workflow_notices"))
         return drained
 
-    # -- worker context ---------------------------------------------------------
+    # -- worker context (pure in-memory read) -----------------------------------
 
-    def worker_context(self, state, refresh: bool = False) -> dict:
+    def worker_context(self, state) -> dict:
         identity = worker_identity(state)
-        cached = self.controller.worker_record
-        if cached is None or refresh or cached.get("id") != identity["agent"]:
-            store = WorkflowStore(identity["workflow"])
-            try:
-                cached = store.agent(identity["agent"])
-            except WorkflowError:
-                cached = {"id": identity["agent"], "group": "", "sends_to": [], "items": [], "state": "unknown"}
-            cached["workflow"] = identity["workflow"]
-            self.controller.worker_record = cached
-        return cached
+        rt = _wf_runtime(state)
+        cached = rt.cached_worker_context
+        if cached is not None and (not identity or cached.get("id") == identity["agent"]):
+            return cached
+        if not identity:
+            return {"id": "", "workflow": "", "group": "", "sends_to": [], "items": [], "state": "unknown"}
+        return {
+            "id": identity["agent"],
+            "workflow": identity["workflow"],
+            "group": "",
+            "sends_to": [],
+            "items": [],
+            "state": "unknown",
+        }
 
-    # -- controller handlers -------------------------------------------------------
+    # -- controller handlers (all pure Sans-I/O generators) ---------------------
 
     def create_workflow(self, state, workflow_name, definition_buffer):
-        store = WorkflowStore(workflow_name)
+        self.controller.bind(state)
+        wf_name = check_workflow_name(workflow_name)
         text = buffer_text(state, definition_buffer)
         check_definition_models(parse_definition(split_version(text)[1]), self.controller.config)
-        definition = store.create(text, by=self.controller.me_label())
-        store.update_control(default_folder=get_session_cwd(state))
-        groups = "\n".join(f"  {g}: {describe_group(s)}" for g, s in definition["agents"].items())
-        queues = ", ".join(definition["queues"]) or "none"
-        return (f"Created workflow {store.name} (def_1). Nothing is running yet.\n"
-                f"Queues: {queues}\nAgent groups:\n{groups}\n"
-                f"Add starting items with add_items, then ask the user before running it with "
-                f'command_workflow(workflow_name="{store.name}", command="run"). The user can also type '
-                f"/workflow run {store.name}. See wf:{store.name}.")
+        res = yield WorkflowStoreRequest(
+            op="create_workflow",
+            workflow_name=wf_name,
+            params={
+                **self.controller._snap_params(),
+                "text": text,
+                "by": self.controller.me_label(),
+                "cwd": get_session_cwd(state),
+                "config": self.controller.config,
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return res["text"]
 
     def update_workflow(self, state, workflow_name, definition_buffer, reason, preview_only=False):
-        store = WorkflowStore(workflow_name).require()
+        self.controller.bind(state)
+        wf_name = check_workflow_name(workflow_name)
         if not str(reason or "").strip():
             raise WorkflowError("reason is required: one sentence saying why the definition changed")
         text = buffer_text(state, definition_buffer)
         check_definition_models(parse_definition(split_version(text)[1]), self.controller.config)
-        result = store.update(text, reason=str(reason).strip(), by=self.controller.me_label(),
-                              preview_only=bool(preview_only))
-        effects = "\n".join(f"- {e}" for e in result["effects"])
-        if not result["changed"]:
-            return f"The definition is unchanged (still def_{result['version']})."
-        if preview_only:
-            head = f"Preview only; nothing changed. Applying it would create def_{result['from_version'] + 1}."
-        else:
-            head = f"Updated {store.name} from def_{result['from_version']} to def_{result['version']}."
-        return f"{head}\n\nDiff:\n{result['diff']}\nEffects:\n{effects}"
+        res = yield WorkflowStoreRequest(
+            op="update_workflow",
+            workflow_name=wf_name,
+            params={
+                **self.controller._snap_params(),
+                "text": text,
+                "reason": str(reason).strip(),
+                "by": self.controller.me_label(),
+                "preview_only": bool(preview_only),
+                "config": self.controller.config,
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return res["text"]
 
     def command_workflow(self, state, workflow_name, command, agent_group=None):
-        del state
+        self.controller.bind(state)
+        wf_name = check_workflow_name(workflow_name)
         command = str(command or "").strip().lower()
         agent_group = None if agent_group in (None, "") else agent_group
         if command == "run":
-            return (yield from self.controller.run(workflow_name, agent_group))
+            return (yield from self.controller.run(wf_name, agent_group))
         if command == "pause":
-            return (yield from self.controller.pause(workflow_name, agent_group))
+            return (yield from self.controller.pause(wf_name, agent_group))
         if command == "archive":
             if agent_group:
                 raise WorkflowError("archive applies to the whole workflow; omit agent_group")
-            return (yield from self.controller.archive(workflow_name))
+            return (yield from self.controller.archive(wf_name))
         if command == "unarchive":
             if agent_group:
                 raise WorkflowError("unarchive applies to the whole workflow; omit agent_group")
-            return self.controller.unarchive(workflow_name)
+            return (yield from self.controller.unarchive(wf_name))
         raise WorkflowError(f'unknown command "{command}"; use run, pause, archive or unarchive')
 
     def rename_workflow(self, state, workflow_name, new_name):
-        del state
-        return self.controller.rename(workflow_name, new_name)
+        self.controller.bind(state)
+        return (yield from self.controller.rename(check_workflow_name(workflow_name), check_workflow_name(new_name)))
 
     def set_agent_count(self, state, workflow_name, agent_group, count):
-        del state
-        store = WorkflowStore(workflow_name).require()
-        result = store.set_count(agent_group, int(count), by=self.controller.me_label())
+        self.controller.bind(state)
+        wf_name = check_workflow_name(workflow_name)
+        res = yield WorkflowStoreRequest(
+            op="set_count",
+            workflow_name=wf_name,
+            params={
+                **self.controller._snap_params(),
+                "agent_group": agent_group,
+                "count": int(count),
+                "by": self.controller.me_label(),
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        result = res["result"]
         if not result["changed"]:
             return f"{agent_group} already has count {count}."
         text = f"Set {agent_group} count from {result['old']} to {count} (def_{result['version']})."
         if int(count) < result["old"]:
             text += " Extra running agents finish their current item first."
-        elif workflow_name in self.controller.managed:
-            started = yield from self.controller.tick(store.name)
+        elif wf_name in self.controller.managed:
+            started = yield from self.controller.tick(wf_name)
             if started:
                 text += " " + " ".join(started)
-        elif store.control().get("state") == "running":
+        elif res["control"].get("state") == "running":
             text += " The controlling session will start agents shortly."
         return text
 
     def message_agents(self, state, workflow_name, message, agent_group=None):
-        del state
+        self.controller.bind(state)
         agent_group = None if agent_group in (None, "") else agent_group
-        return (yield from self.controller.message_agents(workflow_name, str(message), agent_group))
+        return (yield from self.controller.message_agents(check_workflow_name(workflow_name), str(message), agent_group))
 
     def restart_agent(self, state, workflow_name, agent):
-        del state
-        return (yield from self.controller.restart_agent(workflow_name, agent))
+        self.controller.bind(state)
+        return (yield from self.controller.restart_agent(check_workflow_name(workflow_name), agent))
 
     def add_items(self, state, workflow_name, queue, from_buffers, note=None):
-        store = WorkflowStore(workflow_name).require()
-        known = set(store.definition()["queues"]) | {TRASH}
-        check_queue_id(queue, known)
+        self.controller.bind(state)
+        wf_name = check_workflow_name(workflow_name)
+        check_queue_id(queue)
         buffers = [from_buffers] if isinstance(from_buffers, str) else list(from_buffers or [])
         if not buffers:
             raise WorkflowError("from_buffers is empty")
         texts = [buffer_text(state, b) for b in buffers]
-        created = [store.add_item(queue, text, by="user", note=note) for text in texts]
-        return (f"Added {', '.join(m['id'] for m in created)} to {queue}."
-                + self.taker_hint(store, queue))
+        res = yield WorkflowStoreRequest(
+            op="add_items",
+            workflow_name=wf_name,
+            params={**self.controller._snap_params(), "queue": queue, "texts": texts, "note": note},
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return res["text"]
 
     def move_items(self, state, workflow_name, item_ids, to_queue, note=None):
-        store = WorkflowStore(workflow_name).require()
-        known = set(store.definition()["queues"]) | {TRASH} | {i["queue"] for i in store.items()}
-        check_queue_id(to_queue, known)
+        self.controller.bind(state)
+        wf_name = check_workflow_name(workflow_name)
+        check_queue_id(to_queue)
         ids = [item_ids] if isinstance(item_ids, str) else list(item_ids or [])
-        moved = store.move_items(ids, to_queue, by="user", note=note)
-        return f"Moved {', '.join(m['id'] for m in moved)} to {to_queue}." + self.taker_hint(store, to_queue)
+        res = yield WorkflowStoreRequest(
+            op="move_items",
+            workflow_name=wf_name,
+            params={**self.controller._snap_params(), "item_ids": ids, "to_queue": to_queue, "note": note},
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return res["text"]
 
-    @staticmethod
-    def taker_hint(store, queue) -> str:
-        if queue == TRASH:
-            return " Move them back out of q_trash to restore them."
-        groups = takers(store.definition(), queue)
-        if not groups:
-            return f" No agent group takes from {queue}."
-        if store.control().get("state") != "running":
-            return f" {', '.join(groups)} will take them when {store.name} runs."
-        return f" {', '.join(groups)} will take them."
-
-    # -- worker handlers ------------------------------------------------------------
-
-    def worker_store(self, state):
-        context = self.worker_context(state, refresh=True)
-        return WorkflowStore(context["workflow"]), context
+    # -- worker handlers (pure Sans-I/O generators) -----------------------------
 
     def finish_task(self, state, summary, outputs=None):
-        store, context = self.worker_store(state)
+        identity = worker_identity(state)
+        if not identity:
+            raise WorkflowError("finish_task is only available to workflow agents")
         pairs = []
         for entry in outputs or []:
             if not isinstance(entry, dict) or "buffer" not in entry or "queue" not in entry:
                 raise WorkflowError('each output must look like {"buffer": "buf_...", "queue": "q_..."}')
             pairs.append((check_queue_id(entry["queue"]), buffer_text(state, entry["buffer"])))
-        result = store.finish_agent(context["id"], summary=str(summary or ""), outputs=pairs)
-        state.done = True
+        res = yield WorkflowStoreRequest(
+            op="finish_agent",
+            workflow_name=identity["workflow"],
+            params={
+                "agent_id": identity["agent"],
+                "summary": str(summary or ""),
+                "outputs": pairs,
+                "viewer_session_id": str(_session_meta(state).session_id or ""),
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
         state.result = str(summary or "")
-        state.shutdown_reason = "suspend"
-        state.shutdown_save = True
-        state.shutdown_registry_status = "completed"
-        state.shutdown_spawned_policy = "terminate"
-        state.shutdown = True
-        created = ", ".join(f"{m['id']} in {m['queue']}" for m in result["created"])
-        return ("Task finished" + (f"; created {created}" if created else "") + ". This session is ending.")
+        return res["text"]
 
     def worker_add_items(self, state, queue, from_buffers, note=None):
-        store, context = self.worker_store(state)
-        allowed = set(context.get("sends_to") or []) | {TRASH}
+        identity = worker_identity(state)
+        if not identity:
+            raise WorkflowError("worker_add_items is only available to workflow agents")
+        check_queue_id(queue)
         buffers = [from_buffers] if isinstance(from_buffers, str) else list(from_buffers or [])
         if not buffers:
             raise WorkflowError("from_buffers is empty")
         texts = [buffer_text(state, b) for b in buffers]
-        created = [store.add_item(queue, text, by=context["id"], note=note, from_items=agent_items(context),
-                                  allowed=allowed) for text in texts]
-        ids = [m["id"] for m in created]
-        record = store.agent(context["id"])
-        store.update_agent(context["id"], outputs=record.get("outputs", []) + ids)
-        return f"Added {', '.join(ids)} to {queue}. Keep working, and call finish_task when your task is done."
+        res = yield WorkflowStoreRequest(
+            op="add_items",
+            workflow_name=identity["workflow"],
+            params={
+                "queue": queue,
+                "texts": texts,
+                "note": note,
+                "worker_agent": identity["agent"],
+                "viewer_session_id": str(_session_meta(state).session_id or ""),
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return res["text"]
 
     def worker_move_items(self, state, item_ids, to_queue, note=None):
-        store, context = self.worker_store(state)
-        allowed = set(context.get("sends_to") or []) | {TRASH}
+        identity = worker_identity(state)
+        if not identity:
+            raise WorkflowError("worker_move_items is only available to workflow agents")
+        check_queue_id(to_queue)
         ids = [item_ids] if isinstance(item_ids, str) else list(item_ids or [])
-        moved = store.move_items(ids, to_queue, by=context["id"], note=note, allowed=allowed)
-        return f"Moved {', '.join(m['id'] for m in moved)} to {to_queue}."
+        res = yield WorkflowStoreRequest(
+            op="move_items",
+            workflow_name=identity["workflow"],
+            params={
+                "item_ids": ids,
+                "to_queue": to_queue,
+                "note": note,
+                "worker_agent": identity["agent"],
+                "viewer_session_id": str(_session_meta(state).session_id or ""),
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return res["text"]
 
 
 def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
@@ -3578,7 +4952,7 @@ def build_tools(plugin: WorkflowsPlugin) -> list[Tool]:
 
 
 # ---------------------------------------------------------------------------
-# Slash command
+# Slash command (100% pure Sans-I/O)
 # ---------------------------------------------------------------------------
 
 USAGE = ("/workflow list [archived]  |  /workflow view NAME[:GROUP|:QUEUE]  |  /workflow run NAME[:GROUP]  |  "
@@ -3601,7 +4975,8 @@ def parse_target(text: str, *, allow_queue: bool = False) -> tuple[str, str, str
     raise WorkflowError(f'"{part}" is not {kinds}; did you mean {name}:{suggest_id("grp_", part)}?')
 
 
-def parse_command(raw_args: str) -> dict:
+def parse_command(raw_args: str, *, known_names: Iterable[str] = ()) -> dict:
+    """Pure command parser — never touches the filesystem."""
     try:
         tokens = shlex.split(raw_args or "")
     except ValueError as exc:
@@ -3645,12 +5020,14 @@ def parse_command(raw_args: str) -> dict:
                                 f"see the settings with /workflow set {tokens[1]}")
         return {"action": "set", "name": name, "kind": kind, "target": target,
                 "setting": tokens[2].lower(), "value": " ".join(tokens[3:])}
-    if len(tokens) == 1 and tokens[0].partition(":")[0] in list_workflow_names():
+    if len(tokens) == 1 and tokens[0].partition(":")[0] in set(known_names):
         raise WorkflowError(f'unknown command "{tokens[0]}"; to open a workflow, use /workflow view {tokens[0]}')
     raise WorkflowError(f'unknown command "{tokens[0]}"; use one of: {COMMAND_VERBS}. Usage: {USAGE}')
 
 
 class WorkflowCommand:
+    """Pure Sans-I/O ``/workflow`` slash command submitting typed ``WorkflowStoreRequest``s."""
+
     def __init__(self, plugin: WorkflowsPlugin):
         self.plugin = plugin
 
@@ -3659,76 +5036,84 @@ class WorkflowCommand:
         return CommandResult(outputs=(InspectorDocument(title=title, subtitle=subtitle, body=body,
                                                         format="markdown"),))
 
+    def _doc_gen(self, state, request: dict):
+        controller = self.plugin.controller
+        res = yield WorkflowStoreRequest(
+            op="render_command_doc",
+            workflow_name=request.get("name", ""),
+            params={
+                **controller._snap_params(),
+                "action": request["action"],
+                "kind": request.get("kind"),
+                "target": request.get("target"),
+            },
+        )
+        _apply_snapshot(state, res.get("snapshot"))
+        return InspectorDocument(
+            title=res["title"],
+            subtitle=res.get("subtitle", ""),
+            body=res["body"],
+            format="markdown",
+        )
+
+    def _set_gen(self, request: dict):
+        controller = self.plugin.controller
+        text = yield from controller.change_setting(
+            request["name"], request["kind"], request["target"], request["setting"], request["value"]
+        )
+        if text.endswith("nothing changed."):
+            return {"_notice_only": True, "text": text}
+        return text
+
     def __call__(self, ctx, *, raw_args=""):
         controller = self.plugin.controller
+        rt = _wf_runtime(ctx.state)
         try:
-            request = parse_command(raw_args)
+            request = parse_command(raw_args, known_names=rt.cached_names)
             if worker_identity(ctx.state):
                 raise WorkflowError("workflow agents cannot control workflows")
             controller.bind(ctx.state)
-            viewer = (controller.me or {}).get("session_id", "")
-            if request["action"] in {"list", "archived"}:
-                archived = request["action"] == "archived"
-                subtitle, body = render_list(None, viewer, archived=archived)
-                return self.document("Archived workflows" if archived else "Workflows", body, subtitle)
-            store = WorkflowStore(request["name"]).require()
-            state = store.control().get("state")
-            if request["action"] == "archive" and state == "archived":
-                raise WorkflowError(f"{store.name} is already archived")
-            if request["action"] == "unarchive" and state != "archived":
-                raise WorkflowError(f"{store.name} is not archived")
-            if request["action"] == "rename" and WorkflowStore(request["new_name"]).exists():
-                raise WorkflowError(f'a workflow named "{request["new_name"]}" already exists; choose another name')
-            if request["action"] == "show":
-                kind, target = request["kind"], request["target"]
-                if kind == "workflow":
-                    subtitle, body = render_overview_md(store, viewer, controller.default_model())
-                elif kind == "group":
-                    subtitle, body = render_group_md(store, target, controller.default_model())
-                else:
-                    subtitle, body = render_queue_md(store, target)
-                return self.document(target_label(store, kind, target), body, subtitle)
-            if request["action"] == "settings":
-                text = render_settings(store, request["kind"], request["target"], controller.default_model())
-                return self.document(f"Settings: {target_label(store, request['kind'], request['target'])}", text)
-            if request["action"] == "set":
-                # Validate now so mistakes are reported without touching the workflow.
-                change = prepare_setting(store, request["kind"], request["target"], request["setting"],
-                                         request["value"], check_model=controller.check_model,
-                                         default_model=controller.default_model())
-                if change["unchanged"]:
-                    return CommandResult.notice(
-                        f"{change['label']} {change['setting']} is already {change['new_text']}; nothing changed.")
             if request["action"] == "run":
                 controller.require_launch()
         except WorkflowError as exc:
             raise CommandError(str(exc)) from exc
 
-        if request["action"] == "set":
-            gen = controller.change_setting(request["name"], request["kind"], request["target"],
-                                            request["setting"], request["value"])
-            receipt = f"Setting {change['label']} {change['setting']} to {change['new_text']}..."
-        elif request["action"] == "rename":
-            def _rename_gen():
-                if False:
-                    yield
-                return controller.rename(request["name"], request["new_name"])
-            gen = _rename_gen()
+        action = request["action"]
+        if action in {"list", "archived", "show", "settings"}:
+            gen = self._doc_gen(ctx.state, request)
+            task = _WorkflowTask(kind="command_doc", gen=gen, workflow_name=request.get("name", ""))
+            op_id, ok, val = self.plugin.advance_task(ctx.state, task, first=True)
+            if op_id is not None:
+                receipt = (
+                    "Loading workflows..." if action in {"list", "archived"}
+                    else f"Loading {request.get('name', 'workflow')}..."
+                )
+                return CommandResult(
+                    outputs=(CommandNotice(text=receipt, level="info"),),
+                    operation_id=op_id,
+                    refresh=False,
+                )
+            if ok and isinstance(val, InspectorDocument):
+                return CommandResult(outputs=(val,), refresh=False)
+            raise CommandError(str(val or "Workflow view failed"))
+
+        if action == "set":
+            label = request["name"] if request["kind"] == "workflow" else f"{request['name']}:{request['target']}"
+            gen = self._set_gen(request)
+            receipt = f"Setting {label} {request['setting']} to {request['value']}..."
+        elif action == "rename":
+            gen = controller.rename(request["name"], request["new_name"])
             receipt = f"Renaming {request['name']} to {request['new_name']}..."
-        elif request["action"] == "archive":
+        elif action == "archive":
             gen = controller.archive(request["name"])
             receipt = f"Archiving {request['name']}..."
-        elif request["action"] == "unarchive":
-            def _unarchive_gen():
-                if False:
-                    yield
-                return controller.unarchive(request["name"])
-            gen = _unarchive_gen()
+        elif action == "unarchive":
+            gen = controller.unarchive(request["name"])
             receipt = f"Restoring {request['name']}..."
         else:
-            method = controller.run if request["action"] == "run" else controller.pause
+            method = controller.run if action == "run" else controller.pause
             gen = method(request["name"], request["group"])
-            verb = "Running" if request["action"] == "run" else "Pausing"
+            verb = "Running" if action == "run" else "Pausing"
             scope = f"{request['name']}:{request['group']}" if request["group"] else request["name"]
             receipt = f"{verb} {scope}..."
 
@@ -3771,43 +5156,24 @@ class WorkflowCommand:
             if emit_notice:
                 emit(EmitNotice(first_line, level="info"))
             emit(ProjectionRequested())
-            _wake_idle_session(state, emit)
+            emit(PacingCheck(reason="workflow_command"))
         else:
             if emit_notice:
                 emit(EmitNotice(str(result.get("text") or "Workflow command failed."), level="warning"))
             emit(ProjectionRequested())
 
 
-def _wake_idle_session(state: State, emit: EmitFn) -> None:
-    """Wake an idle, unpaused session after queuing a workflow interrupt."""
-    if getattr(state, "activity", "active") == "awaiting":
-        await_op = getattr(state, "await_timer_op", None)
-        if await_op is not None and hasattr(state, "io"):
-            state.io.cancel(await_op)
-            state.await_timer_op = None
-        state.activity = "active"
-    if (
-        getattr(state, "pending_tool_calls", None)
-        or getattr(state, "active_llm", None) is not None
-        or getattr(state, "startup_paused", False)
-        or getattr(state, "interrupted", False)
-        or getattr(state, "shutdown", False)
-        or getattr(state, "done", False)
-    ):
-        return
-    emit(RenderRequested())
-    emit(BeforeLLM())
-
-
 # ---------------------------------------------------------------------------
-# Buffers, prompts, notices
+# Buffers, prompts, notices (100% pure Sans-I/O)
 # ---------------------------------------------------------------------------
 
 class WorkflowBuffers:
-    handles = (SessionReady, RenderRequested, TurnSettled)
+    """Pure in-memory ``wf:`` readonly buffer provider backed by cached ``WorkflowStoreDriver`` snapshots."""
+
+    handles = (SessionReady, SessionRestored, RenderRequested, TurnSettled)
     reads = {"buffer_manager"}
     writes = {"buffer_manager"}
-    optional_reads = {"_session_id", "_agent_zoo_context", "_session_kind"}
+    optional_reads = {"_agent_zoo_context"}
 
     def __init__(self, plugin: "WorkflowsPlugin | None" = None):
         self.plugin = plugin
@@ -3824,19 +5190,35 @@ class WorkflowBuffers:
     def render(self, state, buffer_id):
         if not buffer_id.startswith("wf:"):
             return None
-        default_model = ""
-        if self.plugin is not None and not worker_identity(state):
-            default_model = self.plugin.controller.default_model()
-
-        def transcript(session_id):
-            parts = buffer_id.split(":")
-            agent = WorkflowStore(parts[1]).agent(parts[2])
-            return saved_transcript(agent.get("project") or "default", session_id)
-
-        text = render_view(buffer_id, viewer_session_id=str(getattr(state, "_session_id", "") or ""),
-                           transcript=transcript, default_model=default_model)
-        if text is None:
+        parts = buffer_id.split(":")
+        if len(parts) not in (2, 3):
             return None
+        rt = _wf_runtime(state)
+        text = rt.cached_views.get(buffer_id)
+        if text is None:
+            if buffer_id == "wf:index":
+                text = DEFAULT_EMPTY_INDEX
+            else:
+                wf_name = check_workflow_name(parts[1])
+                if wf_name not in set(rt.cached_names):
+                    known = (
+                        f"; existing workflows: {', '.join(rt.cached_names)}"
+                        if rt.cached_names else "; there are no workflows yet"
+                    )
+                    raise WorkflowError(f'there is no workflow named "{wf_name}"{known}')
+                if len(parts) == 3:
+                    view = parts[2]
+                    if view not in {"definition", "history", "log"} and not (
+                        VERSION_ID.fullmatch(view)
+                        or QUEUE_ID.fullmatch(view)
+                        or GROUP_ID.fullmatch(view)
+                        or AGENT_ID.fullmatch(view)
+                        or ITEM_ID.fullmatch(view)
+                    ):
+                        raise WorkflowError(
+                            f'unknown view "{view}"; use definition, history, log, def_N, q_*, grp_*, agt_* or item_N'
+                        )
+                raise WorkflowError(f"view {buffer_id} is not loaded yet; retry shortly")
         return ReadonlyBufferView(id=buffer_id, path=f"workflow://{buffer_id[3:]}", text=text)
 
 
@@ -3851,10 +5233,11 @@ You are {agent} in workflow "{workflow}" (group {group}). Your task is in the fi
 
 
 class WorkflowSystemPrompt(RenderTransformRegistrar):
-    """Durable role guidance on the system entry for workers and controllers."""
+    """Durable role guidance on the system entry for workers and controllers (pure Sans-I/O)."""
+
     handles = (RenderRequested,)
     reads = {"entries"}
-    optional_reads = {"_session_kind", "_session_id"}
+    optional_reads = set()
     transform_name = "workflow role guidance"
 
     def __init__(self, plugin: WorkflowsPlugin):
@@ -3875,16 +5258,22 @@ class WorkflowSystemPrompt(RenderTransformRegistrar):
         if not messages or messages[0].get("role") != "system":
             return messages
         identity = worker_identity(state)
+        managed = _wf_durable(state).managed
         if identity:
             context = self.plugin.worker_context(state)
-            block = WORKER_GUIDANCE.format(agent=identity["agent"], workflow=identity["workflow"],
-                                           group=context.get("group") or "unknown",
-                                           queues=", ".join(list(context.get("sends_to") or []) + [TRASH]))
-        elif self.plugin.controller.managed:
-            names = ", ".join(sorted(self.plugin.controller.managed))
-            block = (f"# Workflows\nThis session controls running workflows: {names}. "
-                     'Activate skill(name="Workflows") before changing them; read view(buffer="wf:<name>") '
-                     "for their state.")
+            block = WORKER_GUIDANCE.format(
+                agent=identity["agent"],
+                workflow=identity["workflow"],
+                group=context.get("group") or "unknown",
+                queues=", ".join(list(context.get("sends_to") or []) + [TRASH]),
+            )
+        elif managed:
+            names = ", ".join(sorted(managed))
+            block = (
+                f"# Workflows\nThis session controls running workflows: {names}. "
+                'Activate skill(name="Workflows") before changing them; read view(buffer="wf:<name>") '
+                "for their state."
+            )
         else:
             return messages
         first = dict(messages[0])
@@ -3897,13 +5286,33 @@ class WorkflowSystemPrompt(RenderTransformRegistrar):
         return [first, *messages[1:]]
 
 
+def _preload_workflow_skill() -> tuple[str | None, str | None]:
+    """Read the bundled/installed Workflows SKILL.md ONCE at build/init time."""
+    relative = Path("skills/workflows/SKILL.md")
+    installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN_NAME / relative
+    bundled = Path(__file__).resolve().parent.parent / relative
+    package = bundled if bundled.is_file() else installed
+    if not package.is_file():
+        return None, None
+    try:
+        return str(package), package.read_text(encoding="utf-8")
+    except Exception:
+        LOG.warning("Could not preload bundled Workflows skill text", exc_info=True)
+        return str(package), None
+
+
 class WorkflowSkillRegistration(RenderTransformRegistrar):
-    """Offer the bundled Workflows skill to controlling sessions only."""
-    handles = (SessionReady, RenderRequested)
-    optional_reads = {"skill_registry", "_session_kind"}
+    """Offer the preloaded bundled Workflows skill to controlling sessions only (pure Sans-I/O)."""
+
+    handles = (SessionReady, SessionRestored, RenderRequested)
+    optional_reads = {"skill_registry"}
     writes = {"skill_registry"}
 
-    def __init__(self):
+    def __init__(self, *, skill_path: str | None = None, skill_text: str | None = None):
+        if skill_path is None and skill_text is None:
+            skill_path, skill_text = _preload_workflow_skill()
+        self._skill_path = skill_path
+        self._skill_text = skill_text
         self.registry = None
 
     def apply(self, state) -> None:
@@ -3933,25 +5342,22 @@ class WorkflowSkillRegistration(RenderTransformRegistrar):
                     rebuild = getattr(registry, "_rebuild", None)
                     if callable(rebuild):
                         rebuild()
-        else:
-            relative = Path("skills/workflows/SKILL.md")
-            installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN_NAME / relative
-            bundled = Path(__file__).resolve().parent.parent / relative
-            package = bundled if bundled.is_file() else installed
-            if package.is_file():
-                source = SkillSource(str(package), kind=PLUGIN_NAME, scope="bundled",
-                                     precedence=-5000, native=True, always_list=True)
-                if callable(getattr(registry, "add_sources", None)):
-                    registry.add_sources([source])
-                if callable(getattr(registry, "register_skill_text", None)):
-                    try:
-                        registry.register_skill_text(
-                            str(package),
-                            package.read_text(encoding="utf-8"),
-                            source=source,
-                        )
-                    except Exception:
-                        LOG.warning("Could not register bundled Workflows skill text", exc_info=True)
+        elif self._skill_path:
+            source = SkillSource(
+                self._skill_path, kind=PLUGIN_NAME, scope="bundled",
+                precedence=-5000, native=True, always_list=True,
+            )
+            if callable(getattr(registry, "add_sources", None)):
+                registry.add_sources([source])
+            if self._skill_text is not None and callable(getattr(registry, "register_skill_text", None)):
+                try:
+                    registry.register_skill_text(
+                        self._skill_path,
+                        self._skill_text,
+                        source=source,
+                    )
+                except Exception:
+                    LOG.warning("Could not register bundled Workflows skill text", exc_info=True)
         self.registry = registry
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
@@ -3960,32 +5366,37 @@ class WorkflowSkillRegistration(RenderTransformRegistrar):
 
 
 class WorkflowNotices(InterruptCheck):
-    """Pure Sans-I/O scheduler & notice hook: timers, session events, adoption, worker reminders."""
+    """Pure Sans-I/O scheduler & notice hook: timers, session events, adoption, restore, worker reminders."""
+
     check_name = "workflow_notices"
     cooldown = 0
     handles = (
         SessionReady,
+        SessionRestored,
         TurnSettled,
         TimerFired,
         IoCompleted,
         IoFailed,
+        IoReattached,
+        IoLost,
         ExternalSessionReady,
         ExternalSessionExited,
         SessionDataReceived,
     )
     reads = {"step"}
     optional_reads = {
-        "_session_kind", "_session_id", "_instance_id", "_agent_zoo_context", "_project_name",
-        "_persistence_local_root", "cwd", "session_cwd", "entries", "buffer_manager", "done", "shutdown",
-        "activity", "await_timer_op", "pending_tool_calls", "active_llm", "startup_paused", "interrupted",
+        "_agent_zoo_context", "_persistence_local_root", "cwd", "session_cwd", "entries",
+        "buffer_manager", "done", "shutdown", "activity", "pending_tool_calls",
+        "active_llm", "startup_paused", "interrupted",
     }
     writes = {"pending_interrupts", "_interrupt_state", "buffer_manager"}
 
     def __init__(self, plugin: WorkflowsPlugin):
         self.plugin = plugin
 
-    def _tick_all_managed(self):
+    def _tick_all_managed(self, state: State):
         controller = self.plugin.controller
+        controller.bind(state)
         for name in list(controller.managed):
             try:
                 yield from controller.tick(name)
@@ -3997,9 +5408,44 @@ class WorkflowNotices(InterruptCheck):
                     controller.errors[name] = message
                     controller.notice(message)
 
+    def _startup_controller_gen(self, state: State):
+        controller = self.plugin.controller
+        controller.bind(state)
+        adopted: list[str] = []
+        if _session_meta(state).instance_id:
+            adopted = yield from controller.adopt(state)
+        else:
+            snap = yield WorkflowStoreRequest(op="snapshot", params=controller._snap_params())
+            _apply_snapshot(state, snap)
+        if adopted:
+            yield from controller.rediscover_workflows(adopted)
+
+    def _startup_worker_gen(self, state: State, identity):
+        snap = yield WorkflowStoreRequest(
+            op="snapshot",
+            params={
+                "viewer_session_id": str(_session_meta(state).session_id or ""),
+                "worker_workflow": identity["workflow"],
+                "worker_agent": identity["agent"],
+            },
+        )
+        _apply_snapshot(state, snap)
+
+    def _worker_remind_gen(self, state: State, identity):
+        res = yield WorkflowStoreRequest(
+            op="worker_remind",
+            workflow_name=identity["workflow"],
+            params={"agent_id": identity["agent"]},
+        )
+        if res.get("worker_context") is not None:
+            _wf_runtime(state).cached_worker_context = dict(res["worker_context"])
+        return res
+
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        rt = _wf_runtime(state)
+
         if isinstance(event, (IoCompleted, IoFailed)):
-            task = self.plugin.pending_tasks.pop(event.op_id, None)
+            task = rt.pending_tasks.pop(event.op_id, None)
             if task is None:
                 return
             event.stop()
@@ -4013,31 +5459,57 @@ class WorkflowNotices(InterruptCheck):
                 self.plugin.finish_task_outcome(state, emit, task, ok, val)
             return
 
+        if isinstance(event, IoReattached):
+            meta = event.handle if isinstance(event.handle, dict) else {}
+            wf_name = str(meta.get("workflow") or "")
+            agent_id = str(meta.get("agent_id") or "")
+            iid = str(meta.get("instance_id") or "")
+            if wf_name and agent_id and iid:
+                rt.instances_by_id[iid] = (wf_name, agent_id)
+            self.plugin.ensure_tick_timer(state)
+            return
+
+        if isinstance(event, IoLost):
+            task = rt.pending_tasks.pop(event.op_id, None)
+            if task is not None:
+                event.stop()
+                self.plugin.finish_task_outcome(
+                    state, emit, task, False, RuntimeError(f"Workflow operation lost: {event.reason}")
+                )
+                return
+            if rt.tick_timer_op is not None and event.op_id == rt.tick_timer_op:
+                event.stop()
+                rt.tick_timer_op = None
+                self.plugin.ensure_tick_timer(state)
+            return
+
         if isinstance(event, TimerFired):
-            if self.plugin.tick_timer_op is None or event.op_id != self.plugin.tick_timer_op:
+            if rt.tick_timer_op is None or event.op_id != rt.tick_timer_op:
                 return
             event.stop()
-            self.plugin.tick_timer_op = None
+            rt.tick_timer_op = None
             if (
                 worker_identity(state)
-                or not self.plugin.controller.managed
+                or not _wf_durable(state).managed
                 or getattr(state, "shutdown", False)
                 or getattr(state, "done", False)
             ):
                 return
-            self.plugin.tick_active = True
-            self.plugin.start_event_task(state, emit, "tick", self._tick_all_managed())
+            rt.tick_active = True
+            self.plugin.start_event_task(state, emit, "tick", self._tick_all_managed(state))
             return
 
         if isinstance(event, ExternalSessionReady):
-            if worker_identity(state) or not self.plugin.controller.managed:
+            if worker_identity(state) or not _wf_durable(state).managed:
                 return
+            self.plugin.controller.bind(state)
             self.plugin.start_event_task(state, emit, "event", self.plugin.controller.on_session_ready(event))
             return
 
         if isinstance(event, ExternalSessionExited):
-            if worker_identity(state) or not self.plugin.controller.managed:
+            if worker_identity(state) or not _wf_durable(state).managed:
                 return
+            self.plugin.controller.bind(state)
             self.plugin.start_event_task(state, emit, "event", self.plugin.controller.on_session_exited(event))
             return
 
@@ -4053,35 +5525,51 @@ class WorkflowNotices(InterruptCheck):
                 state.pending_interrupts.append("\n".join(parts))
                 emit(InterruptQueued(source="workflow_data"))
                 emit(ProjectionRequested())
-                _wake_idle_session(state, emit)
+                emit(PacingCheck(reason="workflow_data"))
             return
 
         if getattr(state, "buffer_manager", None) is not None:
             WorkflowBuffers(self.plugin).register(state)
-        if worker_identity(state):
-            if isinstance(event, SessionReady):
+
+        identity = worker_identity(state)
+        if identity:
+            if isinstance(event, (SessionReady, SessionRestored)):
                 entries = getattr(state, "entries", None) or []
-                if entries and self.plugin.controller.worker_reminded_entry < 0:
-                    self.plugin.controller.worker_reminded_entry = len(entries) - 1
+                if entries and rt.worker_reminded_entry < 0:
+                    rt.worker_reminded_entry = len(entries) - 1
+                if hasattr(state, "io") and state.io is not None:
+                    _readiness_hold(state, "loading workflow worker context")
+                    self.plugin.start_event_task(
+                        state, emit, "startup",
+                        self._startup_worker_gen(state, identity),
+                        release_readiness=True,
+                    )
             elif isinstance(event, TurnSettled):
-                self.remind_worker(state)
+                self._schedule_worker_reminder(state, emit, identity)
             return
 
-        controller = self.plugin.controller
-        adopted: list[str] = []
-        if getattr(state, "_instance_id", ""):
-            try:
-                adopted = controller.adopt(state)
-            except Exception:
-                LOG.exception("Workflow adoption failed")
-        if adopted and hasattr(state, "io"):
-            self.plugin.start_event_task(state, emit, "event", controller.rediscover_workflows(adopted))
-        drained = self.plugin.drain_notices(state, emit, wake=False)
-        if drained and isinstance(event, SessionReady):
-            emit(InterruptQueued(source=self.check_name))
+        if isinstance(event, (SessionReady, SessionRestored)):
+            self.plugin.controller.bind(state)
+            if hasattr(state, "io") and state.io is not None:
+                is_restore = isinstance(event, SessionRestored) or bool(getattr(event, "restored", False))
+                if is_restore:
+                    _readiness_hold(state, "reconciling managed workflows")
+                self.plugin.start_event_task(
+                    state, emit, "startup",
+                    self._startup_controller_gen(state),
+                    release_readiness=is_restore,
+                )
+            else:
+                self.plugin.drain_notices(state, emit, wake=False)
+            self.plugin.ensure_tick_timer(state)
+            return
+
+        # TurnSettled for controller
+        self.plugin.controller.bind(state)
+        self.plugin.drain_notices(state, emit, wake=False)
         self.plugin.ensure_tick_timer(state)
 
-    def remind_worker(self, state):
+    def _schedule_worker_reminder(self, state: State, emit: EmitFn, identity) -> None:
         """A worker that ends its turn without finish_task gets one reminder, then needs attention."""
         if getattr(state, "done", False) or getattr(state, "shutdown", False):
             return
@@ -4090,73 +5578,65 @@ class WorkflowNotices(InterruptCheck):
             return
         last = entries[-1]
         index = len(entries) - 1
-        controller = self.plugin.controller
-        if controller.worker_reminded_entry < 0:
-            # Baseline at startup so a restored session is not reminded about an old reply.
-            controller.worker_reminded_entry = index
+        rt = _wf_runtime(state)
+        if rt.worker_reminded_entry < 0:
+            rt.worker_reminded_entry = index
             return
         if getattr(last, "role", None) != "assistant" or getattr(last, "tool_calls", None):
             return
-        if index <= controller.worker_reminded_entry:
+        if index <= rt.worker_reminded_entry:
             return
-        controller.worker_reminded_entry = index
-        try:
-            context = self.plugin.worker_context(state, refresh=True)
-            store = WorkflowStore(context["workflow"])
-            if context.get("state") in {"finished", "restarted"}:
-                return
-            reminders = int(context.get("reminders", 0))
-            if reminders == 0:
-                store.update_agent(context["id"], reminders=1)
-                self._ensure_interrupt_attrs(state)
-                state.pending_interrupts.append(
-                    "You ended your turn without calling finish_task. If your task is done, call finish_task now "
-                    "with your summary and outputs. If it is not done, keep working.")
-            else:
-                store.update_agent(context["id"], reminders=reminders + 1, state="attention",
-                                   problem="ended its turn again without calling finish_task; message it or use "
-                                           "restart_agent")
-        except Exception:
-            LOG.exception("Workflow finish reminder failed")
+        rt.worker_reminded_entry = index
+        if hasattr(state, "io") and state.io is not None:
+            self.plugin.start_event_task(
+                state, emit, "worker_remind", self._worker_remind_gen(state, identity)
+            )
 
 
 # ---------------------------------------------------------------------------
-# Registration
+# Registration (zero module-global controller dicts!)
 # ---------------------------------------------------------------------------
-
-_CONTROLLERS: dict[int, WorkflowController] = {}
-
 
 def register_features(builder, *, session, config):
     state = getattr(session, "state", None)
-    controller = _CONTROLLERS.get(id(session)) if session is not None else None
-    if controller is None or controller.session is not session:
-        controller = WorkflowController(config, session)
-        if session is not None:
-            _CONTROLLERS[id(session)] = controller
-    controller.config = config
+    controller = WorkflowController(config, session)
     plugin = WorkflowsPlugin(controller)
     if worker_identity(state) and builder.has("rlm"):
-        # Workers do their own work: remove agent-facing RLM tools, keep completion machinery.
         feature = builder._features["rlm"]
         builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
     tools = build_tools(plugin)
-    builder.add(Feature("workflows", components=[
-        WorkflowBuffers(plugin),
-        WorkflowNotices(plugin),
-        *tools,
-        WorkflowSchemaPublisher(tools),
-        Command("/workflow", "List, show, run, pause, rename, archive or change workflows", WorkflowCommand(plugin),
+    builder.add(Feature(
+        "workflows",
+        components=[
+            WorkflowBuffers(plugin),
+            WorkflowNotices(plugin),
+            *tools,
+            WorkflowSchemaPublisher(tools),
+            Command(
+                "/workflow",
+                "List, show, run, pause, rename, archive or change workflows",
+                WorkflowCommand(plugin),
                 raw=True,
-                usage=USAGE, section="Workflows"),
-    ], order=[
-        RegisterSpecialBuffers,
-        WorkflowBuffers,
-        Tool,
-        SchemaPublisher,
-        WorkflowSchemaPublisher,
-        {RenderPlanInitializer, LLMCaller},
-    ]))
-    builder.add(Feature("workflow_guidance", components=[
-        WorkflowSkillRegistration(), WorkflowSystemPrompt(plugin),
-    ], order=[WorkflowSkillRegistration, WorkflowSystemPrompt, SystemPromptSkillList, MessageRenderer]))
+                usage=USAGE,
+                section="Workflows",
+            ),
+        ],
+        order=[
+            RegisterSpecialBuffers,
+            WorkflowBuffers,
+            Tool,
+            SchemaPublisher,
+            WorkflowSchemaPublisher,
+            {RenderPlanInitializer, LLMCaller},
+        ],
+        drivers=[WorkflowStoreDriver],
+        durable_state=WORKFLOWS_DURABLE_SPEC,
+    ))
+    builder.add(Feature(
+        "workflow_guidance",
+        components=[
+            WorkflowSkillRegistration(),
+            WorkflowSystemPrompt(plugin),
+        ],
+        order=[WorkflowSkillRegistration, WorkflowSystemPrompt, SystemPromptSkillList, MessageRenderer],
+    ))
