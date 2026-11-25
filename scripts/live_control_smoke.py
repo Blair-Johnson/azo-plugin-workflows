@@ -73,7 +73,7 @@ async def main():
     handles, clients = [], []
     launcher = RuntimeLauncher()
     settings = RuntimeSettings(project="workflow-plugin-tests", workdir=str(folder),
-                               state_root=str(wf.resolve_state_root()), model="gpt-5.6-luna-max")
+                               state_root=str(wf.state_root()), model="gpt-5.6-luna-max")
     try:
         await exercise(name, folder, store, handles, clients, launcher, settings)
     finally:

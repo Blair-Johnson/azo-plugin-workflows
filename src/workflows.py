@@ -23,6 +23,7 @@ from pathlib import Path
 import yaml
 
 from agent_zoo.durability import (
+    PluginStorage,
     atomic_write_json,
     atomic_write_text,
     file_lock,
@@ -444,11 +445,11 @@ def unified_diff(old: str, new: str, old_label: str, new_label: str) -> str:
 # ---------------------------------------------------------------------------
 
 def state_root() -> Path:
-    return Path(resolve_state_root())  # Imported with the harness section below.
+    return PluginStorage(PLUGIN_NAME).state_root
 
 
 def workflows_root() -> Path:
-    return state_root() / "plugin-configs" / PLUGIN_NAME / "workflows"
+    return PluginStorage(PLUGIN_NAME).config_dir / "workflows"
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -1757,6 +1758,7 @@ import uuid
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 from agent_utils.core.events import (
@@ -1786,8 +1788,13 @@ from agent_utils.features.interrupts import InterruptCheck, InterruptQueued
 from agent_utils.features.skills import SkillSource
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
-from agent_zoo.core.feature_state import ZooState, session_state
-from agent_zoo.durability import QueuedWorkerDriver
+from agent_zoo.core.feature_state import ZooState
+from agent_zoo.durability import (
+    QueuedWorkerDriver,
+    SessionContext,
+    session_context,
+    session_state,
+)
 from agent_zoo.events import (
     AdoptSession,
     ConfigureSessionLifecycle,
@@ -1820,9 +1827,8 @@ from agent_zoo.features.special_buffers import RegisterSpecialBuffers
 from agent_zoo.features.system_prompt import SystemPromptSkillList
 from agent_zoo.features.turn import LLMCaller
 from agent_zoo.llm import enabled_llm_models, require_model_enabled
-from agent_zoo.storage.projects import resolve_state_root
 from agent_zoo.storage.store import resolve_local_root
-from agent_zoo.transport.models import CommandNotice, InspectorDocument
+from agent_zoo.core.models import CommandNotice, InspectorDocument
 
 LOG = logging.getLogger(__name__)
 
@@ -1944,6 +1950,17 @@ def _session_meta(state: Any):
     return meta
 
 
+def _resolve_session_context(state: Any, config: dict[str, Any] | None = None) -> SessionContext:
+    ctx = session_context(state)
+    if config and (not ctx.config_path or not ctx.config_sets):
+        cfg_ctx = session_context(SimpleNamespace(config=config))
+        if not ctx.config_path and cfg_ctx.config_path:
+            ctx.config_path = cfg_ctx.config_path
+        if not ctx.config_sets and cfg_ctx.config_sets:
+            ctx.config_sets = cfg_ctx.config_sets
+    return ctx
+
+
 def get_session_cwd(state) -> str:
     """Resolve the active working directory purely from ``state.cwd`` (with legacy fallbacks)."""
     cwd = (
@@ -1978,7 +1995,7 @@ def _apply_snapshot(state: Any, snapshot: dict[str, Any] | None) -> None:
 def project_sessions_dir(project: str) -> Path:
     if not project or project in {".", ".."} or Path(project).name != project:
         raise WorkflowError(f"invalid project name {project!r}")
-    return Path(resolve_state_root()) / "projects" / project / "sessions"
+    return PluginStorage(PLUGIN_NAME).state_root / "projects" / project / "sessions"
 
 
 def saved_checkpoint(project: str, session_id: str, revision_id: str | None = None):
@@ -2031,11 +2048,11 @@ def checkpoint_recovery(document: dict) -> tuple[str, str]:
 
 def saved_model_config(config) -> dict | None:
     """Saved config layers only: called ONCE at controller build/init time, never in pipeline steps."""
-    path = ((config or {}).get("_runtime_launch", {}) or {}).get("config_path")
+    path = session_context(SimpleNamespace(config=config or {})).config_path
     try:
         if path and Path(path).resolve() == CONFIG_PATH.resolve():
             path = None
-        return load_layered_config(state_root=resolve_state_root(), config_path=path or None)
+        return load_layered_config(state_root=PluginStorage(PLUGIN_NAME).state_root, config_path=path or None)
     except Exception:
         LOG.warning("Cannot read saved Agent Zoo model settings", exc_info=True)
         return None
@@ -3187,19 +3204,19 @@ class WorkflowController:
         if state is not None:
             self._state = state
         rt = self._runtime(state)
+        ctx = _resolve_session_context(state, self.config)
         smeta = _session_meta(state)
-        session_id = str(smeta.session_id or "")
-        instance_id = str(smeta.instance_id or "")
+        session_id = str(smeta.session_id or ctx.session_id or "")
+        instance_id = str(smeta.instance_id or ctx.instance_id or "")
         if session_id and instance_id:
             rt.me = {"session_id": session_id, "instance_id": instance_id}
-        context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-        provenance = (self.config or {}).get("_runtime_launch", {}) or {}
-        project = str(context.get("project_name") or smeta.project_name or "")
-        store_root = str(context.get("project_store_root") or "")
+        storage = PluginStorage(PLUGIN_NAME)
+        project = str(ctx.project_name or smeta.project_name or "")
+        store_root = str(ctx.store_root or "")
         if not store_root and project:
-            store_root = str(Path(resolve_state_root()) / "projects" / project / "coordination")
+            store_root = str(storage.state_root / "projects" / project / "coordination")
         if project and store_root:
-            local_root = str(getattr(state, "_persistence_local_root", "") or "")
+            local_root = str(ctx.local_state_root or "")
             if not local_root:
                 try:
                     local_root = str(resolve_local_root(self.config))
@@ -3208,10 +3225,10 @@ class WorkflowController:
             rt.launch = {
                 "project": project,
                 "store_root": store_root,
-                "state_root": str(resolve_state_root()),
+                "state_root": str(ctx.state_root or storage.state_root),
                 "local_state_root": local_root,
-                "config_path": str(provenance.get("config_path") or ""),
-                "config_sets": tuple(provenance.get("config_sets") or ()),
+                "config_path": str(ctx.config_path or ""),
+                "config_sets": tuple(ctx.config_sets or ()),
                 "env_name": str(((self.config or {}).get("pilot", {}) or {}).get("_env_name") or ""),
                 "cwd": get_session_cwd(state),
             }
@@ -4250,7 +4267,7 @@ class WorkflowTool(Tool):
     """A pure Sans-I/O tool with separate behavior (and schema) for controllers and workers."""
 
     group = WORKER_TOOLS_GROUP
-    optional_reads = {"_agent_zoo_context", "buffer_manager", "_persistence_local_root", "cwd", "session_cwd"}
+    optional_reads = {"buffer_manager", "cwd", "session_cwd"}
     writes = {"result"}
 
     def __init__(self, name, *, controller_schema=None, worker_schema=None, on_controller=None, on_worker=None,
@@ -5046,7 +5063,7 @@ class WorkflowBuffers:
     handles = (SessionReady, SessionRestored, RenderRequested, TurnSettled)
     reads = {"buffer_manager"}
     writes = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context"}
+    optional_reads = set()
 
     def __init__(self, plugin: "WorkflowsPlugin | None" = None):
         self.plugin = plugin
@@ -5162,7 +5179,7 @@ class WorkflowSystemPrompt(RenderTransformRegistrar):
 def _preload_workflow_skill() -> tuple[str | None, str | None]:
     """Read the bundled/installed Workflows SKILL.md ONCE at build/init time."""
     relative = Path("skills/workflows/SKILL.md")
-    installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN_NAME / relative
+    installed = PluginStorage(PLUGIN_NAME).config_dir / relative
     bundled = Path(__file__).resolve().parent.parent / relative
     package = bundled if bundled.is_file() else installed
     if not package.is_file():
@@ -5258,7 +5275,7 @@ class WorkflowNotices(InterruptCheck):
     )
     reads = {"step"}
     optional_reads = {
-        "_agent_zoo_context", "_persistence_local_root", "cwd", "session_cwd", "entries",
+        "cwd", "session_cwd", "entries",
         "buffer_manager", "done", "shutdown", "activity", "pending_tool_calls",
         "active_llm", "startup_paused", "interrupted",
     }

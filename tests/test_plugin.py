@@ -858,7 +858,7 @@ def test_plugin_builds_real_default_pipeline(tmp_path, monkeypatch, kind, is_wor
     root = tmp_path / "plugins"
     (root / "default").mkdir(parents=True)
     (root / "default" / "workflows.py").write_text(Path(wf.__file__).read_text())
-    skill = Path(wf.resolve_state_root()) / "plugin-configs" / wf.PLUGIN_NAME / "skills/workflows/SKILL.md"
+    skill = wf.PluginStorage(wf.PLUGIN_NAME).config_dir / "skills/workflows/SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text((Path(wf.__file__).resolve().parent.parent / "skills/workflows/SKILL.md").read_text())
     monkeypatch.setattr(plugins, "_base_dir", lambda: root)
