@@ -5485,3 +5485,1697 @@ def register_features(builder, *, config):
         ],
         order=[WorkflowSkillRegistration, WorkflowSystemPrompt, SystemPromptSkillList, MessageRenderer],
     ))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) hooks
+# ---------------------------------------------------------------------------
+
+_SIM_BASE_EPOCH = 1735732800  # 2025-01-01T12:00:00+00:00 (fixed UTC anchor)
+
+_SIM_DEMO_DEFINITION = """\
+description: Simulated pipeline for DST fuzzing
+queues:
+  q_inbox: {}
+  q_done: { notify_on_new: true }
+agents:
+  grp_worker:
+    count: 2
+    takes_from: q_inbox
+    sends_to: [q_done]
+    instructions: |
+      Process the item and write output to q_done.
+      {{item}}
+  grp_scout:
+    count: 1
+    sends_to: [q_inbox]
+    instructions: |
+      Find new items for q_inbox.
+"""
+
+_WORKFLOW_TOOL_NAMES = frozenset({
+    "create_workflow",
+    "update_workflow",
+    "command_workflow",
+    "rename_workflow",
+    "set_agent_count",
+    "message_agents",
+    "restart_agent",
+    "add_items",
+    "move_items",
+    "finish_task",
+})
+
+
+def _sim_iso(now_s: float) -> str:
+    return datetime.fromtimestamp(_SIM_BASE_EPOCH + int(max(0.0, now_s)), tz=timezone.utc).isoformat(
+        timespec="seconds"
+    )
+
+
+class _SimWorkflowStore:
+    """Pure in-memory duck-typed ``WorkflowStore`` for deterministic DST simulation."""
+
+    def __init__(self, name: str, registry: "_SimWorkflowRegistry") -> None:
+        self.name = check_workflow_name(name)
+        self._registry = registry
+        self.root = None
+
+    def _data(self) -> dict[str, Any]:
+        return self._registry._data[self.name]
+
+    def _now_iso(self) -> str:
+        return self._registry.now_iso()
+
+    def exists(self) -> bool:
+        return self.name in self._registry._data
+
+    def require(self) -> "_SimWorkflowStore":
+        if not self.exists():
+            names = self._registry.list_names()
+            known = f"; existing workflows: {', '.join(names)}" if names else "; there are no workflows yet"
+            raise WorkflowError(f'there is no workflow named "{self.name}"{known}')
+        return self
+
+    @contextlib.contextmanager
+    def lock(self):
+        yield
+
+    def counters(self) -> dict[str, Any]:
+        if not self.exists():
+            return {"item": 0, "version": 0, "agents": {}}
+        return deepcopy(self._data()["counters"])
+
+    def next_number(self, kind: str, group: str | None = None) -> int:
+        counters = self._data()["counters"]
+        if group is None:
+            counters[kind] = counters.get(kind, 0) + 1
+            return counters[kind]
+        counters.setdefault("agents", {})[group] = counters.get("agents", {}).get(group, 0) + 1
+        return counters["agents"][group]
+
+    def log(self, event: str, **fields: Any) -> None:
+        if not self.exists():
+            return
+        self._data()["logs"].append({"at": self._now_iso(), "event": event, **fields})
+
+    def log_records(self) -> list[dict[str, Any]]:
+        if not self.exists():
+            return []
+        return deepcopy(self._data()["logs"])
+
+    def last_activity(self) -> str:
+        if not self.exists():
+            return ""
+        logs = self._data()["logs"]
+        if logs:
+            return str(logs[-1].get("at", ""))
+        return str(self._data()["control"].get("created_at", ""))
+
+    def control(self) -> dict[str, Any]:
+        if not self.exists():
+            return {}
+        return deepcopy(self._data()["control"])
+
+    def update_control(self, **changes: Any) -> dict[str, Any]:
+        control = self._data()["control"]
+        control.update(changes)
+        return deepcopy(control)
+
+    @property
+    def version(self) -> int:
+        if not self.exists():
+            return 0
+        return int(self._data()["counters"].get("version", 0))
+
+    def definition_body(self, version: int | None = None) -> str:
+        self.require()
+        ver = version or self.version
+        body = self._data()["versions"].get(ver)
+        if body is None:
+            raise WorkflowError(f"{self.name} has no definition version def_{ver}")
+        return body
+
+    def definition_text(self, version: int | None = None) -> str:
+        ver = version or self.version
+        return f"version: {ver}\n" + self.definition_body(ver)
+
+    def definition(self, version: int | None = None) -> dict[str, Any]:
+        return parse_definition(self.definition_body(version))
+
+    def version_meta(self, version: int) -> dict[str, Any]:
+        if not self.exists():
+            return {}
+        return deepcopy(self._data()["version_metas"].get(version, {}))
+
+    def _write_version(self, body: str, reason: str, by: str) -> int:
+        version = self.next_number("version")
+        self._data()["versions"][version] = body
+        self._data()["version_metas"][version] = {
+            "version": version,
+            "reason": reason,
+            "by": by,
+            "at": self._now_iso(),
+        }
+        self.log("definition_changed", version=f"def_{version}", reason=reason, by=by)
+        return version
+
+    def create(self, text: str, *, by: str, controller: dict[str, Any] | None = None) -> dict[str, Any]:
+        _, body = split_version(text)
+        definition = parse_definition(body)
+        if self.exists():
+            raise WorkflowError(
+                f'a workflow named "{self.name}" already exists; use update_workflow to change it'
+            )
+        self._registry._data[self.name] = {
+            "counters": {"item": 0, "version": 0, "agents": {}},
+            "control": {
+                "state": "paused",
+                "paused_groups": [],
+                "epoch": 0,
+                "controller": deepcopy(controller),
+                "created_at": self._now_iso(),
+                "last_started": {},
+            },
+            "versions": {},
+            "version_metas": {},
+            "items": {},
+            "item_texts": {},
+            "agents": {},
+            "logs": [],
+        }
+        self._write_version(body, "Created", by)
+        self.log("created", by=by)
+        return definition
+
+    def rename(self, new_name: str, *, by: str) -> "_SimWorkflowStore":
+        target = self._registry.store(new_name)
+        if target.name == self.name:
+            raise WorkflowError(f"{self.name} already has that name")
+        self.require()
+        if target.exists():
+            raise WorkflowError(f'a workflow named "{target.name}" already exists; choose another name')
+        if self.control().get("state") == "running":
+            raise WorkflowError(f"{self.name} is running; pause it first with /workflow pause {self.name}")
+        unfinished = [a["id"] for a in self.agents() if a["state"] in ACTIVE_STATES | {"attention"}]
+        if unfinished:
+            raise WorkflowError(
+                f"{', '.join(unfinished)} {'is' if len(unfinished) == 1 else 'are'} not finished, and their "
+                f"sessions are tied to the name {self.name}. Run {self.name} until they finish, or use "
+                "restart_agent on them, then rename it"
+            )
+        self.log("renamed", old_name=self.name, new_name=target.name, by=by)
+        self._registry._data[target.name] = self._registry._data.pop(self.name)
+        return target
+
+    def update_effects(self, old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+        return WorkflowStore.update_effects(self, old, new)  # type: ignore[arg-type]
+
+    def update(self, text: str, *, reason: str, by: str, preview_only: bool = False) -> dict[str, Any]:
+        stated, body = split_version(text)
+        new = parse_definition(body)
+        self.require()
+        current = self.version
+        if stated is not None and stated != current:
+            raise StaleDefinition(
+                f"This definition is based on def_{stated}, but {self.name} is now at "
+                f"def_{current}. Copy wf:{self.name}:definition again and reapply your change. "
+                f"Changes since your copy:\n"
+                + unified_diff(
+                    self.definition_body(stated),
+                    self.definition_body(current),
+                    f"def_{stated}",
+                    f"def_{current}",
+                )
+            )
+        old_body = self.definition_body(current)
+        diff = unified_diff(old_body, body, f"def_{current}", "new definition")
+        effects = self.update_effects(self.definition(current), new)
+        result = {
+            "diff": diff,
+            "effects": effects,
+            "from_version": current,
+            "changed": old_body != body,
+            "version": current,
+        }
+        if preview_only or old_body == body:
+            return result
+        result["version"] = self._write_version(body, reason, by)
+        return result
+
+    def set_count(self, group: str, count: int, *, by: str) -> dict[str, Any]:
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 64:
+            raise WorkflowError("count must be a whole number from 0 to 64")
+        definition = self.require().definition()
+        check_group_id(group, definition["agents"])
+        old = definition["agents"][group]["count"]
+        if old == count:
+            return {"version": self.version, "old": old, "changed": False}
+        result = self.set_setting(
+            "agents",
+            group,
+            "count",
+            count,
+            reason=f"Set {group} count from {old} to {count}",
+            by=by,
+        )
+        return {"version": result["version"], "old": old, "changed": result["changed"]}
+
+    def set_setting(
+        self,
+        section: str | None,
+        name: str | None,
+        key: str,
+        value: Any,
+        *,
+        reason: str,
+        by: str,
+    ) -> dict[str, Any]:
+        self.require()
+        body = self.definition_body()
+        new_body = set_setting_text(body, section, name, key, value)
+        if new_body == body:
+            return {"changed": False, "version": self.version}
+        parse_definition(new_body)
+        return {"changed": True, "version": self._write_version(new_body, reason, by)}
+
+    def item(self, item_id: str) -> dict[str, Any]:
+        item_id = check_item_id(item_id)
+        if not self.exists() or item_id not in self._data()["items"]:
+            raise WorkflowError(f"{self.name} has no {item_id}")
+        return deepcopy(self._data()["items"][item_id])
+
+    def item_text(self, item_id: str) -> str:
+        item_id = check_item_id(item_id)
+        if not self.exists() or item_id not in self._data()["item_texts"]:
+            raise WorkflowError(f"{self.name} has no {item_id}")
+        return self._data()["item_texts"][item_id]
+
+    def items(self, queue: str | None = None) -> list[dict[str, Any]]:
+        if not self.exists():
+            return []
+        records = [
+            deepcopy(meta)
+            for meta in self._data()["items"].values()
+            if queue is None or meta["queue"] == queue
+        ]
+        return sorted(records, key=lambda m: int(m["id"][5:]))
+
+    def _save_item(self, meta: dict[str, Any]) -> None:
+        self._data()["items"][meta["id"]] = deepcopy(meta)
+
+    def _add_item_unlocked(
+        self,
+        queue: str,
+        text: str,
+        *,
+        by: str,
+        note: str | None = None,
+        from_items: list[str] | None = None,
+        allowed: set[str] | None = None,
+    ) -> dict[str, Any]:
+        queue = check_queue_id(queue)
+        if allowed is not None and queue not in allowed:
+            raise WorkflowError(f"you can only send to: {', '.join(sorted(allowed))}")
+        if not str(text).strip():
+            raise WorkflowError("an item cannot be empty")
+        self.require()
+        number = self.next_number("item")
+        item_id = f"item_{number}"
+        at = self._now_iso()
+        meta = {
+            "id": item_id,
+            "title": item_title(text),
+            "queue": queue,
+            "state": "waiting",
+            "created_at": at,
+            "created_by": by,
+            "from_items": list(from_items or []),
+            "taken_by": None,
+            "notes": [{"text": note, "by": by, "at": at}] if note else [],
+            "history": [{"at": at, "event": "added", "queue": queue, "by": by}],
+        }
+        self._data()["item_texts"][item_id] = text if text.endswith("\n") else text + "\n"
+        self._save_item(meta)
+        self.log("item_added", item=item_id, queue=queue, by=by)
+        return deepcopy(meta)
+
+    def add_item(
+        self,
+        queue: str,
+        text: str,
+        *,
+        by: str,
+        note: str | None = None,
+        from_items: list[str] | None = None,
+        allowed: set[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._add_item_unlocked(
+            queue, text, by=by, note=note, from_items=from_items, allowed=allowed
+        )
+
+    def move_items(
+        self,
+        item_ids: list[str],
+        to_queue: str,
+        *,
+        by: str,
+        note: str | None = None,
+        allowed: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        to_queue = check_queue_id(to_queue)
+        if allowed is not None and to_queue not in allowed:
+            raise WorkflowError(f"you can only move items into: {', '.join(sorted(allowed))}")
+        ids = [check_item_id(i) for i in item_ids]
+        if not ids:
+            raise WorkflowError("item_ids is empty")
+        self.require()
+        metas = [self.item(i) for i in ids]
+        for meta in metas:
+            if meta["state"] == "taken":
+                raise WorkflowError(
+                    f"{meta['id']} is being worked on by {meta['taken_by']}; "
+                    "use restart_agent to stop that agent and return the item first"
+                )
+        at = self._now_iso()
+        for meta in metas:
+            meta.update(queue=to_queue, state="waiting", taken_by=None)
+            if note:
+                meta["notes"].append({"text": note, "by": by, "at": at})
+            meta["history"].append({"at": at, "event": "moved", "queue": to_queue, "by": by})
+            self._save_item(meta)
+            self.log("item_moved", item=meta["id"], queue=to_queue, by=by)
+        return metas
+
+    def take_batch(self, takes: dict[str, int], agent_id: str) -> list[dict[str, Any]]:
+        batch: list[dict[str, Any]] = []
+        for queue, size in takes.items():
+            waiting = [m for m in self.items(queue) if m["state"] == "waiting"][:size]
+            if len(waiting) < size:
+                return []
+            batch += waiting
+        at = self._now_iso()
+        for meta in batch:
+            meta.update(state="taken", taken_by=agent_id)
+            meta["history"].append({"at": at, "event": "taken", "queue": meta["queue"], "by": agent_id})
+            self._save_item(meta)
+        return batch
+
+    def finish_item(self, item_id: str, agent_id: str) -> None:
+        meta = self.item(item_id)
+        if meta["state"] == "taken" and meta["taken_by"] == agent_id:
+            meta.update(state="done", taken_by=None)
+            meta["history"].append({"at": self._now_iso(), "event": "done", "queue": meta["queue"], "by": agent_id})
+            self._save_item(meta)
+
+    def return_item(self, item_id: str, agent_id: str, *, by: str) -> None:
+        meta = self.item(item_id)
+        if meta["state"] == "taken" and meta["taken_by"] == agent_id:
+            meta.update(state="waiting", taken_by=None)
+            meta["history"].append({"at": self._now_iso(), "event": "returned", "queue": meta["queue"], "by": by})
+            self._save_item(meta)
+
+    def agent(self, agent_id: str) -> dict[str, Any]:
+        agent_id = check_agent_id(agent_id)
+        if not self.exists() or agent_id not in self._data()["agents"]:
+            raise WorkflowError(f"{self.name} has no agent {agent_id}")
+        return deepcopy(self._data()["agents"][agent_id])
+
+    def agents(self, group: str | None = None) -> list[dict[str, Any]]:
+        if not self.exists():
+            return []
+        records = [
+            deepcopy(rec)
+            for rec in self._data()["agents"].values()
+            if group is None or rec["group"] == group
+        ]
+        return sorted(records, key=lambda r: (r["group"], r["number"]))
+
+    def save_agent(self, record: dict[str, Any]) -> None:
+        updated = deepcopy(record)
+        updated["updated_at"] = self._now_iso()
+        self._data()["agents"][updated["id"]] = updated
+
+    def new_agent(
+        self,
+        group: str,
+        *,
+        version: int,
+        item_ids: list[str],
+        sends_to: list[str],
+        folder: str,
+        model: str | None,
+    ) -> dict[str, Any]:
+        number = self.next_number("agent", group)
+        record = {
+            "id": f"agt_{group_short(group)}_{number}",
+            "group": group,
+            "number": number,
+            "version": version,
+            "items": list(item_ids),
+            "sends_to": list(sends_to),
+            "folder": folder,
+            "model": model,
+            "state": "starting",
+            "session_id": None,
+            "instance_id": None,
+            "created_at": self._now_iso(),
+            "finished_at": None,
+            "summary": None,
+            "outputs": [],
+            "problem": None,
+            "reminders": 0,
+            "resumes": 0,
+        }
+        self.save_agent(record)
+        return deepcopy(self._data()["agents"][record["id"]])
+
+    def update_agent(self, agent_id: str, **changes: Any) -> dict[str, Any]:
+        record = self.agent(agent_id)
+        record.update(changes)
+        self.save_agent(record)
+        return deepcopy(self._data()["agents"][record["id"]])
+
+    def finish_agent(
+        self,
+        agent_id: str,
+        *,
+        summary: str,
+        outputs: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        record = self.agent(agent_id)
+        if record["state"] in {"finished", "restarted"}:
+            raise WorkflowError(f"{agent_id} has already {record['state']}")
+        allowed = set(record.get("sends_to", [])) | {TRASH}
+        for queue, text in outputs:
+            check_queue_id(queue)
+            if queue not in allowed:
+                raise WorkflowError(f"you can only send to: {', '.join(sorted(allowed))}")
+            if not str(text or "").strip():
+                raise WorkflowError("an item cannot be empty")
+        input_ids = agent_items(record)
+        created = [
+            self._add_item_unlocked(queue, text, by=agent_id, from_items=input_ids, allowed=allowed)
+            for queue, text in outputs
+        ]
+        for item_id in input_ids:
+            self.finish_item(item_id, agent_id)
+        record.update(
+            state="finished",
+            summary=summary,
+            finished_at=self._now_iso(),
+            outputs=record.get("outputs", []) + [m["id"] for m in created],
+            problem=None,
+        )
+        self.save_agent(record)
+        self.log(
+            "agent_finished",
+            agent=agent_id,
+            items=input_ids,
+            outputs=[m["id"] for m in created],
+            summary=summary,
+        )
+        return {"agent": deepcopy(self._data()["agents"][record["id"]]), "created": created}
+
+
+class _SimWorkflowRegistry:
+    """Pure in-memory, 100% deterministic backend for ``WorkflowStoreRequest`` in DST."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, dict[str, Any]] = {}
+        self._now_s: float = 0.0
+        self._seed_defaults()
+
+    def now_iso(self) -> str:
+        return _sim_iso(self._now_s)
+
+    def list_names(self) -> list[str]:
+        return sorted(self._data)
+
+    def store(self, name: str) -> _SimWorkflowStore:
+        return _SimWorkflowStore(name, self)
+
+    def _seed_defaults(self) -> None:
+        demo = self.store("sim_demo")
+        demo.create(_SIM_DEMO_DEFINITION, by="sim-init")
+        demo.update_control(default_folder="/workspace")
+        demo.add_item("q_inbox", "Seeded task 1\nDetails for simulated task 1.\n", by="user")
+        demo.add_item("q_inbox", "Seeded task 2\nDetails for simulated task 2.\n", by="user")
+        demo.add_item("q_done", "Seeded output 3\nCompleted simulated result.\n", by="agt_worker_1")
+        a1 = demo.new_agent(
+            "grp_worker", version=1, item_ids=[], sends_to=["q_done"], folder="/workspace", model=None
+        )
+        demo.update_agent(a1["id"], state="stopped", problem="simulated stop")
+        a2 = demo.new_agent(
+            "grp_scout", version=1, item_ids=[], sends_to=["q_inbox"], folder="/workspace", model=None
+        )
+        demo.update_agent(a2["id"], state="stopped", problem="simulated stop")
+
+        archived = self.store("sim_archived")
+        archived.create(_SIM_DEMO_DEFINITION, by="sim-init")
+        archived.update_control(default_folder="/workspace", state="archived", controller=None)
+        archived.add_item("q_inbox", "Archived task 1\nDetails for archived item.\n", by="user")
+        aa = archived.new_agent(
+            "grp_worker", version=1, item_ids=[], sends_to=["q_done"], folder="/workspace", model=None
+        )
+        archived.update_agent(aa["id"], state="stopped", problem="workflow archived")
+
+    def _render_index(self, viewer_session_id: str = "") -> str:
+        names = self.list_names()
+        stores = [self.store(name) for name in names]
+        archived = [s.name for s in stores if s.control().get("state") == "archived"]
+        current = [s for s in stores if s.name not in archived]
+        example = current[0].name if current else (names[0] if names else "miner")
+        lines = [f"Workflows. Open one with wf:<name>, e.g. wf:{example}."]
+        if not names:
+            lines.append("There are no workflows yet. Create one with create_workflow.")
+        for store in current:
+            control = store.control()
+            active = sum(a["state"] in ACTIVE_STATES for a in store.agents())
+            waiting = sum(i["state"] == "waiting" for i in store.items() if i["queue"] != TRASH)
+            attention = sum(a["state"] == "attention" for a in store.agents())
+            line = (
+                f"{store.name}: {state_label(control)}, controlled by "
+                f"{controller_label(control, viewer_session_id)}, def_{store.version}; "
+                f"{active} agents active, {waiting} items waiting"
+            )
+            if attention:
+                line += f", {attention} agents need attention"
+            description = store.definition().get("description")
+            lines.append(line + (f". {description}" if description else ""))
+        if archived:
+            lines.append(
+                "Archived (hidden from the user's /workflow list; command_workflow unarchive restores one): "
+                + ", ".join(archived)
+            )
+        return "\n".join(lines) + "\n"
+
+    def _render_list(self, *, archived: bool = False) -> tuple[str, str]:
+        rows = [workflow_row(self.store(name)) for name in self.list_names()]  # type: ignore[arg-type]
+        shelved = [r for r in rows if r["state"] == "archived"]
+        current = [r for r in rows if r["state"] != "archived"]
+        running = sum(r["state"] == "running" for r in current)
+        tally = {"running": running, "paused": len(current) - running, "archived": len(shelved)}
+        subtitle = " · ".join(f"{n} {state}" for state, n in tally.items() if n)
+        if archived:
+            if not shelved:
+                return subtitle, "No archived workflows. Hide a one-off workflow with `/workflow archive NAME`.\n"
+            lines = [*workflow_table(shelved, show_status=False), "", "Bring one back with `/workflow unarchive NAME`."]
+            return subtitle, "\n".join(lines) + "\n"
+        if not rows:
+            return subtitle, (
+                "No workflows yet. Ask the agent to set one up. Nothing runs until you start it with "
+                "`/workflow run NAME`.\n"
+            )
+        lines = workflow_table(current) if current else ["No active workflows."]
+        lines.append("")
+        if any(r["attention"] for r in current):
+            lines.append("⚠ Some agents need attention; `/workflow view NAME` shows what happened.")
+        if any(r["cells"][1] == "—" for r in current):
+            lines.append('Add a description with `/workflow set NAME description "..."`.')
+        lines.append("Open one with `/workflow view NAME`. Other commands: run, pause, set, rename, archive.")
+        if shelved:
+            lines.append(f"{plural(len(shelved), 'archived workflow')} hidden: `/workflow list archived`.")
+        return subtitle, "\n".join(lines) + "\n"
+
+    def _build_snapshot(
+        self,
+        *,
+        viewer_session_id: str = "",
+        default_model: str = "",
+        worker_workflow: str = "",
+        worker_agent: str = "",
+    ) -> dict[str, Any]:
+        names = self.list_names()
+        views: dict[str, str] = {"wf:index": self._render_index(viewer_session_id)}
+        for wf_name in names:
+            store = self.store(wf_name)
+            control = store.control()
+            views[f"wf:{wf_name}"] = render_overview(store, viewer_session_id, default_model)  # type: ignore[arg-type]
+            views[f"wf:{wf_name}:definition"] = store.definition_text()
+            if control.get("state") == "archived" and wf_name != worker_workflow:
+                continue
+            views[f"wf:{wf_name}:history"] = render_history(store)  # type: ignore[arg-type]
+            views[f"wf:{wf_name}:log"] = render_log(store)  # type: ignore[arg-type]
+            for ver in range(1, store.version + 1):
+                try:
+                    views[f"wf:{wf_name}:def_{ver}"] = store.definition_text(ver)
+                except WorkflowError:
+                    pass
+            defn = store.definition()
+            items = store.items()
+            agents = store.agents()
+            queue_ids = set(defn["queues"]) | {TRASH} | {i["queue"] for i in items}
+            for q in sorted(queue_ids):
+                views[f"wf:{wf_name}:{q}"] = render_queue(store, q)  # type: ignore[arg-type]
+            group_ids = set(defn["agents"]) | {a["group"] for a in agents}
+            for g in sorted(group_ids):
+                views[f"wf:{wf_name}:{g}"] = render_group(store, g, default_model)  # type: ignore[arg-type]
+            for item in items:
+                views[f"wf:{wf_name}:{item['id']}"] = render_item(store, item["id"])  # type: ignore[arg-type]
+            for agent in agents:
+                views[f"wf:{wf_name}:{agent['id']}"] = render_agent(store, agent["id"], None)  # type: ignore[arg-type]
+        worker_ctx = None
+        if worker_workflow and worker_agent:
+            store = self.store(worker_workflow)
+            try:
+                worker_ctx = store.agent(worker_agent)
+            except WorkflowError:
+                worker_ctx = {"id": worker_agent, "group": "", "sends_to": [], "items": [], "state": "unknown"}
+            worker_ctx["workflow"] = worker_workflow
+        return {"names": tuple(names), "views": views, "worker_context": worker_ctx}
+
+    def _render_instructions_mem(
+        self,
+        store: _SimWorkflowStore,
+        group: dict[str, Any],
+        agent: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> str:
+        text = group["instructions"]
+        item_text = "\n\n".join(item_block(store, i) for i in items) or "(this agent did not take an item)"  # type: ignore[arg-type]
+        if items and "{{item}}" not in text:
+            text = text.rstrip("\n") + "\n\n{{item}}\n"
+        text = text.replace("{{item}}", item_text)
+        return text.replace("{{agent}}", agent["id"]).replace("{{workflow_name}}", store.name)
+
+    def execute(self, req: WorkflowStoreRequest, *, sim_now: float = 0.0) -> Any:
+        self._now_s = float(sim_now)
+        op = req.op
+        p = req.params
+        viewer = str(p.get("viewer_session_id", "") or "")
+        default_model = str(p.get("default_model", "") or "")
+
+        if op == "snapshot":
+            return self._build_snapshot(
+                viewer_session_id=viewer,
+                default_model=default_model,
+                worker_workflow=str(p.get("worker_workflow", "") or ""),
+                worker_agent=str(p.get("worker_agent", "") or ""),
+            )
+
+        if op == "create_workflow":
+            store = self.store(req.workflow_name)
+            text = str(p["text"])
+            check_definition_models(parse_definition(split_version(text)[1]), p.get("config"))
+            definition = store.create(text, by=str(p["by"]))
+            cwd = str(p.get("cwd") or "") or "/workspace"
+            store.update_control(default_folder=cwd)
+            groups = "\n".join(f"  {g}: {describe_group(s)}" for g, s in definition["agents"].items())
+            queues = ", ".join(definition["queues"]) or "none"
+            msg = (
+                f"Created workflow {store.name} (def_1). Nothing is running yet.\n"
+                f"Queues: {queues}\nAgent groups:\n{groups}\n"
+                f"Add starting items with add_items, then ask the user before running it with "
+                f'command_workflow(workflow_name="{store.name}", command="run"). The user can also type '
+                f"/workflow run {store.name}. See wf:{store.name}."
+            )
+            return {"text": msg, "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "update_workflow":
+            store = self.store(req.workflow_name).require()
+            reason = str(p.get("reason") or "").strip()
+            if not reason:
+                raise WorkflowError("reason is required: one sentence saying why the definition changed")
+            text = str(p["text"])
+            check_definition_models(parse_definition(split_version(text)[1]), p.get("config"))
+            preview_only = bool(p.get("preview_only", False))
+            result = store.update(text, reason=reason, by=str(p["by"]), preview_only=preview_only)
+            effects = "\n".join(f"- {e}" for e in result["effects"])
+            if not result["changed"]:
+                msg = f"The definition is unchanged (still def_{result['version']})."
+            elif preview_only:
+                msg = (
+                    f"Preview only; nothing changed. Applying it would create def_{result['from_version'] + 1}."
+                    f"\n\nDiff:\n{result['diff']}\nEffects:\n{effects}"
+                )
+            else:
+                msg = (
+                    f"Updated {store.name} from def_{result['from_version']} to def_{result['version']}."
+                    f"\n\nDiff:\n{result['diff']}\nEffects:\n{effects}"
+                )
+            return {"text": msg, "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "add_items":
+            store = self.store(req.workflow_name).require()
+            queue = str(p["queue"])
+            texts = list(p["texts"])
+            note = p.get("note")
+            worker_agent = str(p.get("worker_agent") or "")
+            if worker_agent:
+                context = store.agent(worker_agent)
+                allowed = set(context.get("sends_to") or []) | {TRASH}
+                created = [
+                    store.add_item(
+                        queue,
+                        text,
+                        by=context["id"],
+                        note=note,
+                        from_items=agent_items(context),
+                        allowed=allowed,
+                    )
+                    for text in texts
+                ]
+                ids = [m["id"] for m in created]
+                record = store.agent(context["id"])
+                store.update_agent(context["id"], outputs=record.get("outputs", []) + ids)
+                msg = f"Added {', '.join(ids)} to {queue}. Keep working, and call finish_task when your task is done."
+                snap = self._build_snapshot(
+                    viewer_session_id=viewer,
+                    default_model=default_model,
+                    worker_workflow=store.name,
+                    worker_agent=worker_agent,
+                )
+            else:
+                known = set(store.definition()["queues"]) | {TRASH}
+                check_queue_id(queue, known)
+                created = [store.add_item(queue, text, by="user", note=note) for text in texts]
+                msg = f"Added {', '.join(m['id'] for m in created)} to {queue}." + WorkflowStoreDriver._taker_hint(store, queue)  # type: ignore[arg-type]
+                snap = self._build_snapshot(viewer_session_id=viewer, default_model=default_model)
+            return {"text": msg, "snapshot": snap}
+
+        if op == "move_items":
+            store = self.store(req.workflow_name).require()
+            ids = list(p["item_ids"])
+            to_queue = str(p["to_queue"])
+            note = p.get("note")
+            worker_agent = str(p.get("worker_agent") or "")
+            if worker_agent:
+                context = store.agent(worker_agent)
+                allowed = set(context.get("sends_to") or []) | {TRASH}
+                moved = store.move_items(ids, to_queue, by=context["id"], note=note, allowed=allowed)
+                msg = f"Moved {', '.join(m['id'] for m in moved)} to {to_queue}."
+                snap = self._build_snapshot(
+                    viewer_session_id=viewer,
+                    default_model=default_model,
+                    worker_workflow=store.name,
+                    worker_agent=worker_agent,
+                )
+            else:
+                known = set(store.definition()["queues"]) | {TRASH} | {i["queue"] for i in store.items()}
+                check_queue_id(to_queue, known)
+                moved = store.move_items(ids, to_queue, by="user", note=note)
+                msg = f"Moved {', '.join(m['id'] for m in moved)} to {to_queue}." + WorkflowStoreDriver._taker_hint(store, to_queue)  # type: ignore[arg-type]
+                snap = self._build_snapshot(viewer_session_id=viewer, default_model=default_model)
+            return {"text": msg, "snapshot": snap}
+
+        if op == "finish_agent":
+            store = self.store(req.workflow_name).require()
+            agent_id = str(p["agent_id"])
+            summary = str(p.get("summary") or "")
+            pairs = list(p.get("outputs") or [])
+            result = store.finish_agent(agent_id, summary=summary, outputs=pairs)
+            created = ", ".join(f"{m['id']} in {m['queue']}" for m in result["created"])
+            msg = "Task finished" + (f"; created {created}" if created else "") + ". This session is ending."
+            snap = self._build_snapshot(
+                viewer_session_id=viewer,
+                default_model=default_model,
+                worker_workflow=store.name,
+                worker_agent=agent_id,
+            )
+            return {"text": msg, "result": result, "snapshot": snap}
+
+        if op == "run_prepare":
+            store = self.store(req.workflow_name).require()
+            definition = store.definition()
+            group = p.get("group")
+            if group is not None:
+                check_group_id(group, definition["agents"])
+            me = dict(p["me"])
+            launch = dict(p["launch"])
+            previous, epoch, watermark = WorkflowStoreDriver._take_control_locked(store, me, launch)  # type: ignore[arg-type]
+            control = store.control()
+            if group is None:
+                store.update_control(state="running", paused_groups=[])
+            else:
+                paused = set(control.get("paused_groups") or [])
+                if control.get("state") != "running":
+                    paused = set(definition["agents"])
+                paused.discard(group)
+                store.update_control(state="running", paused_groups=sorted(paused))
+            store.log("run", group=group, by=me["session_id"])
+            paused_agents = [a for a in store.agents(group) if a["state"] == "paused"]
+            return {
+                "previous": previous,
+                "epoch": epoch,
+                "watermark": watermark,
+                "version": store.version,
+                "paused_agents": paused_agents,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "idle_reason":
+            store = self.store(req.workflow_name).require()
+            return WorkflowStoreDriver._idle_reason(store, p.get("group"))  # type: ignore[arg-type]
+
+        if op == "pause_prepare":
+            store = self.store(req.workflow_name).require()
+            definition = store.definition()
+            group = p.get("group")
+            if group is not None:
+                check_group_id(group, definition["agents"])
+            control = store.control()
+            if control.get("state") == "archived":
+                raise WorkflowError(f"{store.name} is archived")
+            if group is None:
+                store.update_control(state="paused")
+            else:
+                paused = set(control.get("paused_groups") or []) | {group}
+                store.update_control(paused_groups=sorted(paused))
+            store.log("pause", group=group, by=str(p["by"]))
+            return {
+                "agents": store.agents(group),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "update_agent":
+            store = self.store(req.workflow_name)
+            updated = store.update_agent(str(p["agent_id"]), **dict(p["changes"]))
+            return {
+                "agent": updated,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "read_agent":
+            store = self.store(req.workflow_name)
+            return {"agent": store.agent(str(p["agent_id"])), "control": store.control()}
+
+        if op == "archive_check":
+            store = self.store(req.workflow_name).require()
+            if store.control().get("state") == "archived":
+                raise WorkflowError(f"{store.name} is already archived")
+            return {"ok": True}
+
+        if op == "archive_list_agents":
+            store = self.store(req.workflow_name).require()
+            return [a for a in store.agents() if a["state"] in ACTIVE_STATES | {"attention"}]
+
+        if op == "archive_return_agent":
+            store = self.store(req.workflow_name)
+            agent = dict(p["agent"])
+            for item_id in agent_items(agent):
+                store.return_item(item_id, agent["id"], by="archive")
+            store.update_agent(agent["id"], state="stopped", problem="workflow archived")
+            return {"ok": True}
+
+        if op == "archive_finalize":
+            store = self.store(req.workflow_name)
+            store.update_control(state="archived", controller=None)
+            store.log("archived", by=str(p["by"]))
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "unarchive":
+            store = self.store(req.workflow_name).require()
+            if store.control().get("state") != "archived":
+                raise WorkflowError(f"{store.name} is not archived")
+            store.update_control(state="paused", paused_groups=[])
+            store.log("unarchived", by=str(p["by"]))
+            return {
+                "text": f"Restored {store.name}. It is paused; start it with /workflow run {store.name}.",
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "rename":
+            store = self.store(req.workflow_name).require()
+            new_name = str(p["new_name"])
+            if self.store(new_name).exists():
+                raise WorkflowError(f'a workflow named "{new_name}" already exists; choose another name')
+            renamed = store.rename(new_name, by=str(p["by"]))
+            return {
+                "new_name": renamed.name,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "set_count":
+            store = self.store(req.workflow_name).require()
+            result = store.set_count(str(p["agent_group"]), int(p["count"]), by=str(p["by"]))
+            return {
+                "result": result,
+                "control": store.control(),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "set_setting":
+            store = self.store(req.workflow_name).require()
+            cfg = p.get("config")
+            check_fn = (lambda prof: check_model(cfg, prof)) if cfg is not None else None
+            change = prepare_setting(
+                store,  # type: ignore[arg-type]
+                p["kind"],
+                p.get("target"),
+                p["setting"],
+                p["raw"],
+                check_model=check_fn,
+                default_model=default_model,
+            )
+            if change["unchanged"]:
+                return {
+                    "unchanged": True,
+                    "change": change,
+                    "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+                }
+            result = store.set_setting(
+                change["section"],
+                change["name"],
+                change["key"],
+                change["value"],
+                reason=change["reason"],
+                by="user",
+            )
+            definition = store.definition()
+            active = [a for a in store.agents() if a["state"] in ACTIVE_STATES]
+            return {
+                "unchanged": False,
+                "change": change,
+                "result": result,
+                "definition": definition,
+                "active": active,
+                "control": store.control(),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "render_command_doc":
+            action = str(p["action"])
+            if action in {"list", "archived"}:
+                archived = action == "archived"
+                subtitle, body = self._render_list(archived=archived)
+                title = "Archived workflows" if archived else "Workflows"
+                return {
+                    "title": title,
+                    "subtitle": subtitle,
+                    "body": body,
+                    "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+                }
+            store = self.store(req.workflow_name).require()
+            kind, target = p["kind"], p.get("target")
+            if action == "show":
+                if kind == "workflow":
+                    subtitle, body = render_overview_md(store, viewer, default_model)  # type: ignore[arg-type]
+                elif kind == "group":
+                    subtitle, body = render_group_md(store, target, default_model)  # type: ignore[arg-type]
+                else:
+                    subtitle, body = render_queue_md(store, target)  # type: ignore[arg-type]
+                title = target_label(store, kind, target)  # type: ignore[arg-type]
+            elif action == "settings":
+                body = render_settings(store, kind, target, default_model)  # type: ignore[arg-type]
+                title = f"Settings: {target_label(store, kind, target)}"  # type: ignore[arg-type]
+                subtitle = ""
+            else:
+                raise WorkflowError(f"unknown document action {action!r}")
+            return {
+                "title": title,
+                "subtitle": subtitle,
+                "body": body,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "tick_read":
+            store = self.store(req.workflow_name)
+            if not store.exists():
+                return {"exists": False}
+            return {
+                "exists": True,
+                "control": store.control(),
+                "definition": store.definition(),
+                "agents": store.agents(),
+            }
+
+        if op == "report_notices":
+            store = self.store(req.workflow_name)
+            if not store.exists():
+                return {"attention": [], "new_items": [], "watermark": p.get("watermark", 0)}
+            definition = store.definition()
+            attention = [
+                {
+                    "text": (
+                        f"Workflow {store.name}: {a['id']} needs attention: {a.get('problem')}. "
+                        f"See wf:{store.name}:{a['id']}."
+                    ),
+                    "key": (store.name, a["id"], a.get("problem")),
+                }
+                for a in store.agents()
+                if a["state"] == "attention"
+            ]
+            watermark = int(p.get("watermark", 0))
+            latest = int(store.counters().get("item", 0))
+            new_items: list[str] = []
+            if latest > watermark:
+                watched = {q for q, s in definition["queues"].items() if s["notify_on_new"]}
+                if watched:
+                    fresh = [i for i in store.items() if int(i["id"][5:]) > watermark and i["queue"] in watched]
+                    by_queue: dict[str, list[str]] = collections.defaultdict(list)
+                    for item in fresh:
+                        by_queue[item["queue"]].append(f"{item['id']} ({item['title']})")
+                    for queue, entries in by_queue.items():
+                        new_items.append(
+                            f"Workflow {store.name}: new items in {queue}: {', '.join(entries)}. "
+                            f"See wf:{store.name}:{queue}."
+                        )
+            return {
+                "attention": attention,
+                "new_items": new_items,
+                "watermark": max(watermark, latest),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "plan_start_agents":
+            store = self.store(req.workflow_name)
+            expected_epoch = p.get("epoch")
+            expected_iid = p.get("instance_id")
+            default_cwd = str(p.get("cwd") or "") or "/workspace"
+            planned: list[dict[str, Any]] = []
+            control = store.control()
+            if (
+                not store.exists()
+                or expected_epoch is None
+                or control.get("epoch") != expected_epoch
+                or (control.get("controller") or {}).get("instance_id") != expected_iid
+                or control.get("state") != "running"
+            ):
+                return {"planned": [], "definition": store.definition() if store.exists() else {"agents": {}, "queues": {}}}
+            definition = store.definition()
+            paused_groups = set(control.get("paused_groups") or [])
+            last_started = dict(control.get("last_started") or {})
+            for group, settings in definition["agents"].items():
+                if group in paused_groups or settings["count"] <= 0:
+                    continue
+                active = sum(a["state"] in ACTIVE_STATES for a in store.agents(group))
+                room = settings["count"] - active
+                while room > 0:
+                    items = []
+                    if settings["takes_from"]:
+                        number = store.counters().get("agents", {}).get(group, 0) + 1
+                        provisional = f"agt_{group_short(group)}_{number}"
+                        items = store.take_batch(settings["takes_from"], provisional)
+                        if not items:
+                            break
+                    elif settings["every"]:
+                        last = float(last_started.get(group) or 0)
+                        if self._now_s - last < settings["every"]:
+                            break
+                    folder_template = (
+                        settings["folder"]
+                        or definition["folder"]
+                        or control.get("default_folder")
+                        or default_cwd
+                    )
+                    agent = store.new_agent(
+                        group,
+                        version=store.version,
+                        item_ids=[i["id"] for i in items],
+                        sends_to=list(settings["sends_to"]),
+                        folder="",
+                        model=None,
+                    )
+                    agent["folder"] = folder_template.replace("{{agent}}", agent["id"]).replace(
+                        "{{workflow_name}}", store.name
+                    )
+                    store.save_agent(agent)
+                    last_started[group] = self._now_s
+                    planned.append({"agent": agent, "settings": settings, "items": items})
+                    room -= 1
+            store.update_control(last_started=last_started)
+            return {"planned": planned, "definition": definition}
+
+        if op == "prepare_spawn":
+            store = self.store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            if p.get("model"):
+                store.update_agent(agent_id, model=p["model"])
+            agent = store.agent(agent_id)
+            message = str(p.get("message") or "")
+            if p.get("render_instructions"):
+                message = self._render_instructions_mem(
+                    store, dict(p["settings"]), agent, list(p.get("items") or [])
+                )
+            session_id = agent.get("session_id") or str(p["session_id"])
+            instance_id = str(p["instance_id"])
+            agent = store.update_agent(
+                agent_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                state="starting",
+                project=str(p["project"]),
+                launch_started=self._now_s,
+                websocket_url=None,
+                process_identity=None,
+                release="resume" if p.get("is_resume") else None,
+                recovery_action=p.get("recovery_action"),
+            )
+            return {
+                "agent": agent,
+                "message": message,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "log_agent_started":
+            store = self.store(req.workflow_name)
+            store.log("agent_started", agent=str(p["agent_id"]), items=list(p.get("items") or []))
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "launch_failed":
+            store = self.store(req.workflow_name)
+            agent = dict(p["agent"])
+            items = list(p.get("items") or [])
+            error_text = str(p["error"])
+            group = agent["group"]
+            for item in items:
+                store.return_item(item["id"], agent["id"], by="scheduler")
+            control = store.control()
+            paused = set(control.get("paused_groups") or []) | {group}
+            store.update_control(paused_groups=sorted(paused))
+            store.update_agent(agent["id"], state="stopped", problem=f"could not start: {error_text}")
+            store.log("agent_start_failed", agent=agent["id"], error=error_text)
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "claim_resume":
+            store = self.store(req.workflow_name)
+            agent = dict(p["agent"])
+            expected_epoch = p.get("epoch")
+            current = store.agent(agent["id"])
+            if expected_epoch is not None and int(store.control().get("epoch", 0)) != expected_epoch:
+                return {"status": "problem", "problem": f"{store.name} is now controlled by another session"}
+            if current.get("instance_id") != agent.get("instance_id") or current["state"] not in {
+                "starting",
+                "running",
+                "paused",
+                "attention",
+            }:
+                return {"status": "skip"}
+            return {"status": "problem", "problem": f"{agent['id']} has no saved checkpoint to resume from"}
+
+        if op == "mark_attention":
+            store = self.store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            problem = str(p["problem"])
+            store.update_agent(agent_id, state="attention", problem=problem)
+            store.log("agent_needs_attention", agent=agent_id, problem=problem)
+            return {"snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model)}
+
+        if op == "release_commit":
+            store = self.store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            expected_iid = p.get("instance_id")
+            current = store.agent(agent_id)
+            if current["state"] in ACTIVE_STATES and current.get("instance_id") == expected_iid:
+                current.update(state="running", release=None)
+                store.save_agent(current)
+            return {
+                "agent": store.agent(agent_id),
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "restart_check":
+            store = self.store(req.workflow_name).require()
+            agent = store.agent(check_agent_id(p["agent_id"]))
+            if agent["state"] in {"finished", "restarted"}:
+                raise WorkflowError(f"{agent['id']} has already {agent['state']}")
+            return {"agent": agent}
+
+        if op == "restart_finalize":
+            store = self.store(req.workflow_name).require()
+            agent_id = str(p["agent_id"])
+            item_ids = list(p.get("item_ids") or [])
+            for item_id in item_ids:
+                store.return_item(item_id, agent_id, by="restart_agent")
+            store.update_agent(agent_id, state="restarted", problem=None)
+            store.log("agent_restarted", agent=agent_id)
+            first_queue = store.item(item_ids[0])["queue"] if len(item_ids) == 1 else ""
+            return {
+                "first_queue": first_queue,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "message_check":
+            store = self.store(req.workflow_name).require()
+            group = p.get("group")
+            if group is not None:
+                check_group_id(group, {a["group"] for a in store.agents()} | set(store.definition()["agents"]))
+            return {"agents": store.agents(group)}
+
+        if op == "adopt":
+            me = dict(p["me"])
+            launch = dict(p["launch"])
+            adopted: list[str] = []
+            managed_updates: dict[str, dict[str, Any]] = {}
+            notices: list[str] = []
+            for wf_name in self.list_names():
+                store = self.store(wf_name)
+                control = store.control()
+                holder = control.get("controller") or {}
+                if (
+                    control.get("state") != "running"
+                    or holder.get("session_id") != me["session_id"]
+                    or holder.get("instance_id") == me["instance_id"]
+                ):
+                    continue
+                try:
+                    _, epoch, watermark = WorkflowStoreDriver._take_control_locked(store, me, launch)  # type: ignore[arg-type]
+                    managed_updates[wf_name] = {"epoch": epoch, "watermark": watermark}
+                    adopted.append(wf_name)
+                    notices.append(
+                        f"Workflow {wf_name} is running again under this session after a restart. See wf:{wf_name}."
+                    )
+                except Exception as exc:
+                    notices.append(f"Workflow {wf_name} could not resume after a restart: {exc}")
+            return {
+                "adopted": adopted,
+                "managed_updates": managed_updates,
+                "notices": notices,
+                "snapshot": self._build_snapshot(viewer_session_id=me["session_id"], default_model=default_model),
+            }
+
+        if op == "rediscover_apply":
+            by_session: dict[str, dict[str, Any]] = dict(p.get("by_session") or {})
+            adoptions: list[dict[str, Any]] = []
+            for wf_name in list(p.get("names") or []):
+                store = self.store(wf_name)
+                if not store.exists():
+                    continue
+                for agent in store.agents():
+                    row = by_session.get(agent.get("session_id") or "") if agent["state"] in ACTIVE_STATES else None
+                    if row is None:
+                        continue
+                    store.update_agent(
+                        agent["id"],
+                        instance_id=row["instance_id"],
+                        websocket_url=row.get("websocket_url") or agent.get("websocket_url"),
+                        process_identity=row.get("process_identity") or agent.get("process_identity"),
+                    )
+                    adoptions.append({
+                        "workflow": store.name,
+                        "agent_id": agent["id"],
+                        "session_id": row["session_id"],
+                        "instance_id": row["instance_id"],
+                        "websocket_url": row.get("websocket_url") or "",
+                        "process_identity": row.get("process_identity"),
+                    })
+            return {
+                "adoptions": adoptions,
+                "snapshot": self._build_snapshot(viewer_session_id=viewer, default_model=default_model),
+            }
+
+        if op == "session_event_lookup":
+            wf_name = req.workflow_name
+            agent_id = str(p.get("agent_id") or "")
+            session_id = str(p.get("session_id") or "")
+            instance_id = str(p.get("instance_id") or "")
+            if wf_name and agent_id:
+                store = self.store(wf_name)
+                if not store.exists():
+                    return {"found": False}
+                return {
+                    "found": True,
+                    "workflow_name": wf_name,
+                    "agent": store.agent(agent_id),
+                    "control": store.control(),
+                }
+            for candidate in list(p.get("managed_names") or []):
+                store = self.store(candidate)
+                if not store.exists():
+                    continue
+                for agent in store.agents():
+                    if (instance_id and agent.get("instance_id") == instance_id) or (
+                        session_id and agent.get("session_id") == session_id and agent["state"] in ACTIVE_STATES
+                    ):
+                        return {
+                            "found": True,
+                            "workflow_name": candidate,
+                            "agent": agent,
+                            "control": store.control(),
+                        }
+            return {"found": False}
+
+        if op == "worker_remind":
+            store = self.store(req.workflow_name)
+            agent_id = str(p["agent_id"])
+            try:
+                context = store.agent(agent_id)
+            except WorkflowError:
+                return {"action": "none", "worker_context": None}
+            context["workflow"] = store.name
+            if context.get("state") in {"finished", "restarted"}:
+                return {"action": "none", "worker_context": context}
+            reminders = int(context.get("reminders", 0))
+            if reminders == 0:
+                updated = store.update_agent(agent_id, reminders=1)
+                updated["workflow"] = store.name
+                return {"action": "remind", "worker_context": updated}
+            updated = store.update_agent(
+                agent_id,
+                reminders=reminders + 1,
+                state="attention",
+                problem="ended its turn again without calling finish_task; message it or use restart_agent",
+            )
+            updated["workflow"] = store.name
+            return {"action": "attention", "worker_context": updated}
+
+        raise ValueError(f"Unsupported WorkflowStoreRequest op: {op!r}")
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register a deterministic, pure in-memory handler for ``WorkflowStoreRequest``."""
+    from agent_utils.runtime.simulation import SimOutcome
+
+    registry = _SimWorkflowRegistry()
+    req_types: list[type] = [WorkflowStoreRequest]
+    wf_error_cls: type[Exception] = WorkflowError
+    pipeline = getattr(getattr(sim, "session", None), "pipeline", None)
+    for comp in getattr(pipeline, "components", ()) or ():
+        if type(comp).__name__ == "WorkflowNotices":
+            comp_globals = getattr(getattr(comp, "handle", None), "__globals__", None)
+            if isinstance(comp_globals, dict):
+                live_req = comp_globals.get("WorkflowStoreRequest")
+                if isinstance(live_req, type) and live_req not in req_types:
+                    req_types.append(live_req)
+                live_err = comp_globals.get("WorkflowError")
+                if isinstance(live_err, type) and issubclass(live_err, Exception):
+                    wf_error_cls = live_err
+            break
+
+    def _handle_workflow_store(_op_id: Any, req: WorkflowStoreRequest, runtime: Any) -> SimOutcome:
+        delay = rng.uniform(0.005, 0.03)
+        try:
+            value = registry.execute(req, sim_now=float(getattr(runtime, "now", 0.0) or 0.0))
+        except WorkflowError as exc:
+            err: Exception = exc if isinstance(exc, wf_error_cls) else wf_error_cls(str(exc))
+            return SimOutcome(error=err, delay=delay)
+        return SimOutcome(value=value, delay=delay)
+
+    for rtype in req_types:
+        sim.register_handler(rtype, _handle_workflow_store)
+
+
+def _get_workflow_runtime(state: Any) -> Any:
+    runtime_fn = getattr(state, "runtime", None)
+    rt = runtime_fn("workflows") if callable(runtime_fn) else None
+    if rt is not None and type(rt).__name__ == "WorkflowRuntimeState":
+        return rt
+    return None
+
+
+def _sim_workflow_info(state: State) -> dict[str, dict[str, Any]]:
+    """Inspect cached workflow snapshot on ``state`` without mutating ``state``."""
+    rt = _get_workflow_runtime(state)
+    if rt is None:
+        return {}
+    views = rt.cached_views
+    info: dict[str, dict[str, Any]] = {}
+    for wf_name in rt.cached_names:
+        overview = views.get(f"wf:{wf_name}", "")
+        archived = overview.startswith(f"Workflow {wf_name}: archived")
+        running = overview.startswith(f"Workflow {wf_name}: running")
+        queues: list[str] = []
+        groups: list[str] = []
+        defn_text = views.get(f"wf:{wf_name}:definition")
+        if defn_text:
+            try:
+                parsed = parse_definition(split_version(defn_text)[1])
+                queues = sorted(parsed["queues"])
+                groups = sorted(parsed["agents"])
+            except WorkflowError:
+                pass
+        prefix = f"wf:{wf_name}:"
+        movable_items: list[str] = []
+        all_items: list[str] = []
+        restartable_agents: list[str] = []
+        all_agents: list[str] = []
+        has_unfinished_agent = False
+        for key in sorted(views):
+            if not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix):]
+            body = views[key]
+            if ITEM_ID.fullmatch(suffix):
+                all_items.append(suffix)
+                if "being worked on by" not in body:
+                    movable_items.append(suffix)
+            elif AGENT_ID.fullmatch(suffix):
+                all_agents.append(suffix)
+                first_line = body.splitlines()[0] if body else ""
+                if not (first_line.endswith(": finished.") or first_line.endswith(": restarted.")):
+                    restartable_agents.append(suffix)
+                if any(first_line.endswith(f": {st}.") for st in ("starting", "running", "paused", "attention")):
+                    has_unfinished_agent = True
+        info[wf_name] = {
+            "archived": archived,
+            "running": running,
+            "renameable": (not running) and (not has_unfinished_agent),
+            "queues": queues,
+            "groups": groups,
+            "movable_items": movable_items,
+            "all_items": all_items,
+            "restartable_agents": restartable_agents,
+            "all_agents": all_agents,
+            "has_definition": bool(defn_text),
+        }
+    return info
+
+
+def _sim_non_empty_buffers(state: State, fallback_views: list[str]) -> list[str]:
+    out: list[str] = []
+    bm = getattr(state, "buffer_manager", None)
+    if bm is not None and callable(getattr(bm, "buffers", None)):
+        for bid in bm.buffers():
+            buf = bm.get(bid)
+            if buf is not None and str(getattr(buf, "text", "") or "").strip():
+                out.append(bid)
+    for vid in fallback_views:
+        if vid not in out:
+            out.append(vid)
+    return out
+
+
+def fuzz_tool_args(tool_name: str, rng: Any, state: State) -> dict[str, Any] | None:
+    """Generate valid, state-aware arguments for workflow tools during DST fuzzing."""
+    if tool_name not in _WORKFLOW_TOOL_NAMES:
+        return None
+
+    info = _sim_workflow_info(state)
+    all_names = sorted(info)
+    active_names = [n for n in all_names if not info[n]["archived"]]
+    archived_names = [n for n in all_names if info[n]["archived"]]
+    preferred_names = active_names or all_names
+    worker = worker_identity(state)
+
+    def _fresh_name(prefix: str) -> str:
+        taken = set(all_names) | RESERVED_NAMES
+        for _ in range(32):
+            cand = f"{prefix}_{rng.randint(100, 999999)}"
+            if cand not in taken:
+                return cand
+        return f"{prefix}_fallback"
+
+    if tool_name == "create_workflow":
+        def_sources = [f"wf:{n}:definition" for n in preferred_names if info[n]["has_definition"]]
+        def_buf = rng.choice(def_sources) if def_sources else "wf:sim_demo:definition"
+        return {
+            "workflow_name": _fresh_name("wf_sim"),
+            "definition_buffer": def_buf,
+        }
+
+    if tool_name == "update_workflow":
+        wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+        return {
+            "workflow_name": wf_name,
+            "definition_buffer": f"wf:{wf_name}:definition",
+            "reason": f"Simulated workflow validation {rng.randint(1, 999)}",
+            "preview_only": bool(rng.choice([True, False])),
+        }
+
+    if tool_name == "command_workflow":
+        if archived_names and rng.random() < 0.35:
+            wf_name = rng.choice(archived_names)
+            return {"workflow_name": wf_name, "command": "unarchive"}
+        wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+        meta = info.get(wf_name)
+        if meta and meta["archived"]:
+            return {"workflow_name": wf_name, "command": "unarchive"}
+        # Archive only when more than one active workflow remains so other tools keep active targets.
+        if len(active_names) > 1 and rng.random() < 0.30:
+            return {"workflow_name": wf_name, "command": "archive"}
+        cmd_args: dict[str, Any] = {"workflow_name": wf_name, "command": "pause"}
+        groups = meta["groups"] if meta else ["grp_worker"]
+        if groups and rng.random() < 0.45:
+            cmd_args["agent_group"] = rng.choice(groups)
+        return cmd_args
+
+    if tool_name == "rename_workflow":
+        renameable = [n for n in preferred_names if info[n]["renameable"]] or [
+            n for n in all_names if info[n]["renameable"]
+        ]
+        wf_name = rng.choice(renameable) if renameable else (preferred_names[0] if preferred_names else "sim_demo")
+        return {
+            "workflow_name": wf_name,
+            "new_name": _fresh_name("wf_ren"),
+        }
+
+    if tool_name == "set_agent_count":
+        wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+        groups = info[wf_name]["groups"] if wf_name in info and info[wf_name]["groups"] else ["grp_worker"]
+        return {
+            "workflow_name": wf_name,
+            "agent_group": rng.choice(groups),
+            "count": rng.randint(0, 6),
+        }
+
+    if tool_name == "message_agents":
+        wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+        msg_args: dict[str, Any] = {
+            "workflow_name": wf_name,
+            "message": f"Simulated status ping {rng.randint(1, 999)}",
+        }
+        groups = info[wf_name]["groups"] if wf_name in info else []
+        if groups and rng.random() < 0.45:
+            msg_args["agent_group"] = rng.choice(groups)
+        return msg_args
+
+    if tool_name == "restart_agent":
+        candidates = [
+            (n, agt)
+            for n in preferred_names
+            for agt in info[n]["restartable_agents"]
+        ]
+        if candidates:
+            wf_name, agent_id = rng.choice(candidates)
+        else:
+            wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+            agents = info[wf_name]["all_agents"] if wf_name in info else []
+            agent_id = rng.choice(agents) if agents else "agt_worker_1"
+        return {"workflow_name": wf_name, "agent": agent_id}
+
+    if tool_name == "add_items":
+        wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+        fallback_bufs = [f"wf:{wf_name}", "wf:index"]
+        buf_pool = _sim_non_empty_buffers(state, fallback_bufs)
+        chosen_bufs = [rng.choice(buf_pool)]
+        if worker:
+            rt = _get_workflow_runtime(state)
+            wctx = rt.cached_worker_context if rt is not None and rt.cached_worker_context else {}
+            allowed = list(wctx.get("sends_to") or []) + [TRASH]
+            return {
+                "queue": rng.choice(allowed),
+                "from_buffers": chosen_bufs,
+                "note": f"sim worker note {rng.randint(1, 99)}",
+            }
+        queues = info[wf_name]["queues"] if wf_name in info and info[wf_name]["queues"] else ["q_inbox"]
+        return {
+            "workflow_name": wf_name,
+            "queue": rng.choice(queues),
+            "from_buffers": chosen_bufs,
+            "note": f"sim note {rng.randint(1, 99)}",
+        }
+
+    if tool_name == "move_items":
+        item_candidates = [
+            (n, info[n]["movable_items"])
+            for n in preferred_names
+            if info[n]["movable_items"]
+        ]
+        if item_candidates:
+            wf_name, items = rng.choice(item_candidates)
+            item_ids = [rng.choice(items)]
+        else:
+            wf_name = rng.choice(preferred_names) if preferred_names else "sim_demo"
+            item_ids = ["item_1"]
+        queues = (info[wf_name]["queues"] if wf_name in info and info[wf_name]["queues"] else ["q_inbox", "q_done"]) + [TRASH]
+        to_queue = rng.choice(queues)
+        if worker:
+            rt = _get_workflow_runtime(state)
+            wctx = rt.cached_worker_context if rt is not None and rt.cached_worker_context else {}
+            allowed = list(wctx.get("sends_to") or []) + [TRASH]
+            return {
+                "item_ids": item_ids,
+                "to_queue": rng.choice(allowed),
+                "note": f"sim move {rng.randint(1, 99)}",
+            }
+        return {
+            "workflow_name": wf_name,
+            "item_ids": item_ids,
+            "to_queue": to_queue,
+            "note": f"sim move {rng.randint(1, 99)}",
+        }
+
+    if tool_name == "finish_task":
+        return {
+            "summary": f"Simulated worker completion {rng.randint(1, 999)}",
+            "outputs": [],
+        }
+
+    return None
+
+
+def check_invariants(session: Any) -> None:
+    """Verify structural integrity of workflow durable and runtime state on ``session.state``."""
+    state = getattr(session, "state", None)
+    if state is None:
+        return
+
+    features = getattr(state, "features", None)
+    if isinstance(features, dict) and "workflows" in features:
+        durable = features["workflows"]
+        assert type(durable).__name__ == "WorkflowDurableState", (
+            f"state.features['workflows'] must be WorkflowDurableState, got {type(durable).__name__}"
+        )
+        assert isinstance(durable.managed, dict), (
+            f"WorkflowDurableState.managed must be dict, got {type(durable.managed).__name__}"
+        )
+        for wf_name, entry in durable.managed.items():
+            assert isinstance(wf_name, str) and WORKFLOW_NAME.fullmatch(wf_name), (
+                f"Invalid managed workflow name in durable state: {wf_name!r}"
+            )
+            assert isinstance(entry, dict), f"Managed entry for {wf_name!r} must be dict"
+            epoch = entry.get("epoch")
+            assert isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0, (
+                f"Invalid epoch for managed workflow {wf_name!r}: {epoch!r}"
+            )
+            watermark = entry.get("watermark", 0)
+            assert isinstance(watermark, int) and not isinstance(watermark, bool) and watermark >= 0, (
+                f"Invalid watermark for managed workflow {wf_name!r}: {watermark!r}"
+            )
+
+    runtime_fn = getattr(state, "runtime", None)
+    rt = runtime_fn("workflows") if callable(runtime_fn) else None
+    if rt is None:
+        return
+    assert type(rt).__name__ == "WorkflowRuntimeState", (
+        f"state.runtime('workflows') must be WorkflowRuntimeState, got {type(rt).__name__}"
+    )
+    assert isinstance(rt.cached_names, tuple), f"cached_names must be tuple, got {type(rt.cached_names).__name__}"
+    for wf_name in rt.cached_names:
+        assert isinstance(wf_name, str) and WORKFLOW_NAME.fullmatch(wf_name), (
+            f"Invalid cached workflow name: {wf_name!r}"
+        )
+    assert isinstance(rt.cached_views, dict), f"cached_views must be dict, got {type(rt.cached_views).__name__}"
+    for key, val in rt.cached_views.items():
+        assert isinstance(key, str) and key.startswith("wf:"), f"Invalid cached view key: {key!r}"
+        assert isinstance(val, str), f"Cached view {key!r} value must be str, got {type(val).__name__}"
+
+    io_table = getattr(state, "io", None)
+    assert isinstance(rt.pending_tasks, dict), "pending_tasks must be dict"
+    for op_id, task in rt.pending_tasks.items():
+        assert type(task).__name__ == "_WorkflowTask", f"pending_tasks[{op_id!r}] must be _WorkflowTask"
+        if io_table is not None:
+            assert io_table.is_active(op_id), (
+                f"WorkflowRuntimeState.pending_tasks retains non-active op_id {op_id!r} (kind={task.kind!r})"
+            )
+    if rt.tick_timer_op is not None and io_table is not None:
+        assert io_table.is_active(rt.tick_timer_op), (
+            f"WorkflowRuntimeState.tick_timer_op {rt.tick_timer_op!r} is not active in state.io"
+        )
+    assert isinstance(rt.tick_active, bool), "tick_active must be bool"
+    assert isinstance(rt.instances_by_id, dict), "instances_by_id must be dict"
+    for iid, pair in rt.instances_by_id.items():
+        assert isinstance(iid, str) and isinstance(pair, tuple) and len(pair) == 2, (
+            f"Invalid instances_by_id entry: {iid!r} -> {pair!r}"
+        )
+    assert isinstance(rt.in_flight_agents, set), "in_flight_agents must be set"
+    assert isinstance(rt.notices, collections.deque), "notices must be deque"
+    assert isinstance(rt.errors, dict), "errors must be dict"
+    if rt.cached_worker_context is not None:
+        assert isinstance(rt.cached_worker_context, dict), "cached_worker_context must be dict"
+    if rt.me is not None:
+        assert isinstance(rt.me, dict) and "session_id" in rt.me and "instance_id" in rt.me, (
+            f"Invalid runtime me identity: {rt.me!r}"
+        )
+
