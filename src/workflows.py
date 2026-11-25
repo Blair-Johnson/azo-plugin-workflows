@@ -1757,8 +1757,7 @@ import shlex
 import uuid
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
-from types import SimpleNamespace
+from dataclasses import dataclass, field
 from typing import Any
 
 from agent_utils.core.events import (
@@ -1768,7 +1767,9 @@ from agent_utils.core.events import (
     IoLost,
     IoReattached,
     RenderRequested,
+    RunToolCall,
     SessionRestored,
+    SessionStarted,
     TimerFired,
     ToolCallFinished,
     TurnSettled,
@@ -1783,16 +1784,18 @@ from agent_utils.features.core import (
     RenderPlanInitializer,
     RenderTransformRegistrar,
     SchemaPublisher,
+    ToolRunner,
 )
 from agent_utils.features.interrupts import InterruptCheck, InterruptQueued
-from agent_utils.features.skills import SkillSource
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
 from agent_zoo.core.feature_state import ZooState
 from agent_zoo.durability import (
+    BundledSkillRegistrar,
     QueuedWorkerDriver,
-    SessionContext,
+    preload_bundled_skill,
     session_context,
+    session_cwd,
     session_state,
 )
 from agent_zoo.events import (
@@ -1950,27 +1953,6 @@ def _session_meta(state: Any):
     return meta
 
 
-def _resolve_session_context(state: Any, config: dict[str, Any] | None = None) -> SessionContext:
-    ctx = session_context(state)
-    if config and (not ctx.config_path or not ctx.config_sets):
-        cfg_ctx = session_context(SimpleNamespace(config=config))
-        if not ctx.config_path and cfg_ctx.config_path:
-            ctx.config_path = cfg_ctx.config_path
-        if not ctx.config_sets and cfg_ctx.config_sets:
-            ctx.config_sets = cfg_ctx.config_sets
-    return ctx
-
-
-def get_session_cwd(state) -> str:
-    """Resolve the active working directory purely from ``state.cwd`` (with legacy fallbacks)."""
-    cwd = (
-        getattr(state, "cwd", "")
-        or getattr(state, "session_cwd", "")
-        or getattr(state, "terminal_cwd", "")
-    )
-    return str(cwd) if cwd else ""
-
-
 def worker_identity(state):
     """Workers are identified by their durable session kind, never by environment."""
     return WORKER_KIND.fullmatch(str(_session_meta(state).kind or ""))
@@ -2048,7 +2030,7 @@ def checkpoint_recovery(document: dict) -> tuple[str, str]:
 
 def saved_model_config(config) -> dict | None:
     """Saved config layers only: called ONCE at controller build/init time, never in pipeline steps."""
-    path = session_context(SimpleNamespace(config=config or {})).config_path
+    path = session_context(None, config=config or {}).config_path
     try:
         if path and Path(path).resolve() == CONFIG_PATH.resolve():
             path = None
@@ -2310,19 +2292,6 @@ class WorkflowStoreDriver(QueuedWorkerDriver):
     def __init__(self, *, root: Path | None = None) -> None:
         super().__init__()
         self._root = root
-
-    def register_sim(self, sim, *, delay: float = 0.0):
-        """Register deterministic simulation handler on a ``SimulationRuntime``."""
-        from agent_utils.runtime.simulation import SimOutcome
-
-        def _handler(_op_id, req, _sim):
-            try:
-                return SimOutcome(value=self.execute(req), delay=delay)
-            except Exception as exc:
-                return SimOutcome(error=exc, delay=delay)
-
-        sim.register_handler(WorkflowStoreRequest, _handler)
-        return self
 
     def _store(self, name: str) -> WorkflowStore:
         return WorkflowStore(name, self._root)
@@ -3118,11 +3087,10 @@ class WorkflowController:
     and ``state.runtime``.
     """
 
-    def __init__(self, config, session=None):
+    def __init__(self, config):
         self.config = config
-        self.session = session
         self._saved_config: dict[str, Any] | None = saved_model_config(config)
-        self._state: Any = getattr(session, "state", None)
+        self._state: Any = None
         self._fallback_durable = WorkflowDurableState()
         self._fallback_runtime = WorkflowRuntimeState()
 
@@ -3204,7 +3172,7 @@ class WorkflowController:
         if state is not None:
             self._state = state
         rt = self._runtime(state)
-        ctx = _resolve_session_context(state, self.config)
+        ctx = session_context(state, config=self.config)
         smeta = _session_meta(state)
         session_id = str(smeta.session_id or ctx.session_id or "")
         instance_id = str(smeta.instance_id or ctx.instance_id or "")
@@ -3230,7 +3198,7 @@ class WorkflowController:
                 "config_path": str(ctx.config_path or ""),
                 "config_sets": tuple(ctx.config_sets or ()),
                 "env_name": str(((self.config or {}).get("pilot", {}) or {}).get("_env_name") or ""),
-                "cwd": get_session_cwd(state),
+                "cwd": session_cwd(state),
             }
 
     def me_label(self) -> str:
@@ -4333,8 +4301,31 @@ class WorkflowTool(Tool):
         emit(ToolCallFinished(tc))
 
 
+_RLM_PARENT_TOOLS = frozenset({"submit_rlm", "rlm_status", "cancel_rlm"})
+
+
+class WorkflowRlmToolGuard:
+    """Block parent RLM tool execution inside workflow worker sessions (pure Sans-I/O)."""
+
+    handles = (RunToolCall,)
+    optional_reads = {"pending_tool_calls"}
+    writes: set[str] = set()
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        assert isinstance(event, RunToolCall)
+        if not worker_identity(state):
+            return
+        tc = event.tool_call
+        if tc.result is None and tc.name in _RLM_PARENT_TOOLS:
+            tc.result = f"ERROR: '{tc.name}' is not available to workflow agents."
+            tc.error = True
+            tc.finished_at = event.ts
+            event.stop()
+            emit(ToolCallFinished(tc))
+
+
 class WorkflowSchemaPublisher:
-    """Publish dynamic controller/worker schemas onto ``state.tool_schemas`` (pure Sans-I/O)."""
+    """Publish dynamic controller/worker schemas and gate parent RLM tools for workers (pure Sans-I/O)."""
 
     handles = (RenderRequested, TurnSettled)
     reads = {"tool_schemas"}
@@ -4349,8 +4340,15 @@ class WorkflowSchemaPublisher:
         schemas = getattr(state, "tool_schemas", None)
         if not isinstance(schemas, dict):
             state.tool_schemas = {}
+            schemas = state.tool_schemas
         for tool in self._tools:
             tool._publish(state)
+        if worker_identity(state):
+            for tool_name in _RLM_PARENT_TOOLS:
+                if tool_name in schemas:
+                    entry = dict(schemas[tool_name])
+                    entry["available"] = False
+                    schemas[tool_name] = entry
 
 
 class WorkflowsPlugin:
@@ -4534,7 +4532,7 @@ class WorkflowsPlugin:
                 **self.controller._snap_params(),
                 "text": text,
                 "by": self.controller.me_label(),
-                "cwd": get_session_cwd(state),
+                "cwd": session_cwd(state),
                 "config": self.controller.config,
             },
         )
@@ -5176,83 +5174,33 @@ class WorkflowSystemPrompt(RenderTransformRegistrar):
         return [first, *messages[1:]]
 
 
-def _preload_workflow_skill() -> tuple[str | None, str | None]:
-    """Read the bundled/installed Workflows SKILL.md ONCE at build/init time."""
-    relative = Path("skills/workflows/SKILL.md")
-    installed = PluginStorage(PLUGIN_NAME).config_dir / relative
+def _preload_workflow_skill():
+    """Read the bundled/installed Workflows SKILL.md ONCE at build/init time via ``preload_bundled_skill``."""
+    relative = Path("skills/workflows")
     bundled = Path(__file__).resolve().parent.parent / relative
-    package = bundled if bundled.is_file() else installed
-    if not package.is_file():
-        return None, None
-    try:
-        return str(package), package.read_text(encoding="utf-8")
-    except Exception:
-        LOG.warning("Could not preload bundled Workflows skill text", exc_info=True)
-        return str(package), None
+    installed = PluginStorage(PLUGIN_NAME).config_dir / relative
+    skill_dir = bundled if (bundled / "SKILL.md").is_file() else installed
+    return preload_bundled_skill(
+        skill_dir,
+        kind=PLUGIN_NAME,
+        precedence=-5000,
+        scope="bundled",
+        native=True,
+        always_list=True,
+    )
 
 
-class WorkflowSkillRegistration(RenderTransformRegistrar):
+class WorkflowSkillRegistration(BundledSkillRegistrar):
     """Offer the preloaded bundled Workflows skill to controlling sessions only (pure Sans-I/O)."""
 
-    handles = (SessionReady, SessionRestored, RenderRequested)
-    optional_reads = {"skill_registry"}
-    writes = {"skill_registry"}
-
-    def __init__(self, *, skill_path: str | None = None, skill_text: str | None = None):
-        if skill_path is None and skill_text is None:
-            skill_path, skill_text = _preload_workflow_skill()
-        self._skill_path = skill_path
-        self._skill_text = skill_text
-        self.registry = None
-
-    def apply(self, state) -> None:
-        registry = getattr(state, "skill_registry", None)
-        if registry is None or registry is self.registry:
-            return
-        if worker_identity(state):
-            existing = registry.get("Workflows") if callable(getattr(registry, "get", None)) else None
-            if existing is not None:
-                if callable(getattr(registry, "add_exclusions", None)):
-                    registry.add_exclusions(existing.root)
-                else:
-                    file_skills = getattr(registry, "_file_skills", None)
-                    if isinstance(file_skills, list):
-                        registry._file_skills = [
-                            s for s in file_skills if s.name.lower() != "workflows"
-                        ]
-                    dynamic_skills = getattr(registry, "_dynamic_skills", None)
-                    if isinstance(dynamic_skills, dict):
-                        for key in [k for k in dynamic_skills if k.lower() == "workflows"]:
-                            dynamic_skills.pop(key, None)
-                    sources = getattr(registry, "_sources", None)
-                    if isinstance(sources, list):
-                        registry._sources = [
-                            s for s in sources if getattr(s, "kind", "") != PLUGIN_NAME
-                        ]
-                    rebuild = getattr(registry, "_rebuild", None)
-                    if callable(rebuild):
-                        rebuild()
-        elif self._skill_path:
-            source = SkillSource(
-                self._skill_path, kind=PLUGIN_NAME, scope="bundled",
-                precedence=-5000, native=True, always_list=True,
-            )
-            if callable(getattr(registry, "add_sources", None)):
-                registry.add_sources([source])
-            if self._skill_text is not None and callable(getattr(registry, "register_skill_text", None)):
-                try:
-                    registry.register_skill_text(
-                        self._skill_path,
-                        self._skill_text,
-                        source=source,
-                    )
-                except Exception:
-                    LOG.warning("Could not register bundled Workflows skill text", exc_info=True)
-        self.registry = registry
-
-    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        del event, emit
-        self.apply(state)
+    def __init__(self, *, preloaded=None):
+        super().__init__(
+            preloaded=preloaded if preloaded is not None else _preload_workflow_skill(),
+            skill_name="Workflows",
+            runtime_key="workflows.bundled_skill",
+            exclude_when=lambda state: bool(worker_identity(state)),
+            handles=(SessionStarted, SessionReady, SessionRestored, RenderRequested),
+        )
 
 
 class WorkflowNotices(InterruptCheck):
@@ -5495,19 +5443,16 @@ class WorkflowNotices(InterruptCheck):
 # Registration (zero module-global controller dicts!)
 # ---------------------------------------------------------------------------
 
-def register_features(builder, *, session, config):
-    state = getattr(session, "state", None)
-    controller = WorkflowController(config, session)
+def register_features(builder, *, config):
+    controller = WorkflowController(config)
     plugin = WorkflowsPlugin(controller)
-    if worker_identity(state) and builder.has("rlm"):
-        feature = builder._features["rlm"]
-        builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
     tools = build_tools(plugin)
     builder.add(Feature(
         "workflows",
         components=[
             WorkflowBuffers(plugin),
             WorkflowNotices(plugin),
+            WorkflowRlmToolGuard(),
             *tools,
             WorkflowSchemaPublisher(tools),
             Command(
@@ -5522,6 +5467,8 @@ def register_features(builder, *, session, config):
         order=[
             RegisterSpecialBuffers,
             WorkflowBuffers,
+            ToolRunner,
+            WorkflowRlmToolGuard,
             Tool,
             SchemaPublisher,
             WorkflowSchemaPublisher,

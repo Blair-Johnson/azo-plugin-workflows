@@ -142,14 +142,17 @@ def test_second_controller_adopts_live_pool_without_duplicates(runtime):
 
 
 def test_bundled_skill_precedes_preserved_config(runtime):
-    registry = SimpleNamespace(add_sources=Mock())
-    wf.WorkflowSkillRegistration().handle(
-        SessionReady(),
-        SimpleNamespace(skill_registry=registry, _session_kind="default"),
-        lambda _ev: None,
-    )
-    sources = registry.add_sources.call_args.args[0]
-    assert Path(sources[0].path).resolve() == Path(wf.__file__).resolve().parents[1] / "skills/workflows/SKILL.md"
+    from agent_utils import State
+    from agent_utils.features.skills import SkillRegistry
+
+    registry = SkillRegistry([])
+    state = State(token_budget=1000)
+    state.skill_registry = registry
+    state._session_kind = "default"
+    wf.WorkflowSkillRegistration().handle(SessionReady(), state, lambda _ev: None)
+    entry = registry.get("Workflows")
+    assert entry is not None
+    assert Path(entry.skill_file).resolve() == Path(wf.__file__).resolve().parents[1] / "skills/workflows/SKILL.md"
 
 
 def test_session_driver_reaps_a_real_child_process(tmp_path):

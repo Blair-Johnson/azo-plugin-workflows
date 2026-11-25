@@ -128,7 +128,7 @@ def runtime(tmp_path, monkeypatch):
     state = SimpleNamespace(
         _session_id="parent", _instance_id="parent-a", _session_kind="default",
         _agent_zoo_context={"project_name": "test", "project_store_root": str(tmp_path / "registry")},
-        session_cwd=str(tmp_path / "work"), _persistence_local_root=str(tmp_path / "local"),
+        cwd=str(tmp_path / "work"), _persistence_local_root=str(tmp_path / "local"),
         buffer_manager=Buffers(buf_def=DEFINITION, buf_a="# ResNet50\nhttps://a", buf_b="BERT", buf_c="GPT-2"),
         pending_interrupts=[],
         io=IoTable(),
@@ -875,7 +875,13 @@ def test_plugin_builds_real_default_pipeline(tmp_path, monkeypatch, kind, is_wor
     assert {"create_workflow", "update_workflow", "command_workflow", "rename_workflow", "set_agent_count",
             "message_agents",
             "restart_agent", "add_items", "move_items", "finish_task"} <= tools
-    assert bool(tools & {"submit_rlm", "rlm_status", "cancel_rlm"}) == (not is_worker)
+    available_tools = {name for name, entry in session.state.tool_schemas.items() if entry.get("available")}
+    assert bool(available_tools & {"submit_rlm", "rlm_status", "cancel_rlm"}) == (not is_worker)
+    if is_worker:
+        tc = ToolCall(id="rlm-block-1", name="submit_rlm", raw_args="{}", parsed_args={"prompt": "nope"})
+        session.state.pending_tool_calls.append(tc)
+        session.step(RunToolCall(tc))
+        assert tc.error and "not available to workflow agents" in str(tc.result)
     assert any(type(c).__name__ == "WorkflowNotices" for c in pipeline)
     rendered = session.messages[0]["content"]
     assert ("# Workflow agent" in rendered) == is_worker
@@ -898,7 +904,7 @@ def test_register_features_composes_cleanly_on_default_builder():
     builder = build_default_builder(
         session, config={}, include_plugins=False, include_llm_drivers=False,
     )
-    wf.register_features(builder, session=session, config={})
+    wf.register_features(builder, config={})
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         pipeline = builder.build()
@@ -937,7 +943,7 @@ def test_workflow_store_driver_lifecycle_and_restore_events(tmp_path):
 
     # Verify SessionRestored holds readiness until startup store op completes, and IoLost cleans up.
     session = Session(system_prompt="base", token_budget=120000, cwd=str(tmp_path))
-    controller = wf.WorkflowController({}, session)
+    controller = wf.WorkflowController({})
     plugin = wf.WorkflowsPlugin(controller)
     notices = wf.WorkflowNotices(plugin)
     emitted = []
@@ -973,7 +979,7 @@ def test_event_driven_tool_and_slash_command_pipeline_with_sim_session_driver(tm
     builder = build_default_builder(
         session, config=cfg, include_plugins=False, include_llm_drivers=False,
     )
-    wf.register_features(builder, session=session, config=cfg)
+    wf.register_features(builder, config=cfg)
     session.pipeline = builder.build()
 
     sim = SimulationRuntime(session)
@@ -1045,7 +1051,7 @@ def test_event_driven_tool_and_slash_command_pipeline_with_sim_session_driver(tm
     worker_builder = build_default_builder(
         worker_session, config=cfg, include_plugins=False, include_llm_drivers=False,
     )
-    wf.register_features(worker_builder, session=worker_session, config=cfg)
+    wf.register_features(worker_builder, config=cfg)
     worker_session.pipeline = worker_builder.build()
     init_effs = worker_session.step(SessionReady())
     for eff in init_effs:
